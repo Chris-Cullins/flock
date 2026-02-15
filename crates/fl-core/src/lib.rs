@@ -12,5 +12,6 @@ pub use repo::{
     ShadowSafetyReport, UndoRequest, UndoResult,
 };
 pub use semantic::{
-    SemanticChange, SemanticChangeKind, SemanticFileDiff, SemanticImpact, SemanticRisk,
+    SemanticChange, SemanticChangeKind, SemanticCompatibility, SemanticCompatibilityStatus,
+    SemanticFileDiff, SemanticImpact, SemanticRisk,
 };

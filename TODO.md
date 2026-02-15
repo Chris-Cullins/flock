@@ -54,7 +54,7 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [x] Added, Removed, Modified, Renamed, Moved, StyleOnly
 - [x] Add risk scoring (Low/Medium/High)
 - [x] Add impact tracking (affected symbols/files/modules)
-- [ ] Add compatibility checks for signature changes
+- [x] Add compatibility checks for signature changes
 - [ ] Implement semantic merge for TS/JS with text fallback
 - [ ] Implement semantic conflict classification and explanation
 - [x] Add machine-readable semantic diff output (`--json`)

@@ -3,7 +3,10 @@ use std::env;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fl_core::repo::parse_duration_spec;
-use fl_core::{EventKind, RefKind, Repo, SemanticChangeKind, SemanticRisk, UndoRequest};
+use fl_core::{
+    EventKind, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus, SemanticRisk,
+    UndoRequest,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -258,6 +261,24 @@ fn main() -> Result<()> {
                     }
                     if !impact_fields.is_empty() {
                         println!("    impact: {}", impact_fields.join(" | "));
+                    }
+                    if change.compatibility.status != SemanticCompatibilityStatus::Compatible {
+                        let status = match change.compatibility.status {
+                            SemanticCompatibilityStatus::Compatible => "compatible",
+                            SemanticCompatibilityStatus::PotentiallyBreaking => {
+                                "potentially-breaking"
+                            }
+                            SemanticCompatibilityStatus::Breaking => "breaking",
+                        };
+                        if change.compatibility.notes.is_empty() {
+                            println!("    compatibility: {}", status);
+                        } else {
+                            println!(
+                                "    compatibility: {} ({})",
+                                status,
+                                change.compatibility.notes.join("; ")
+                            );
+                        }
                     }
                 }
                 if diff.parse_fallback {

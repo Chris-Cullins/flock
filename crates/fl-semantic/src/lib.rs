@@ -20,6 +20,8 @@ pub struct SemanticChange {
     pub risk: SemanticRisk,
     #[serde(default)]
     pub impact: SemanticImpact,
+    #[serde(default)]
+    pub compatibility: SemanticCompatibility,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -30,6 +32,22 @@ pub struct SemanticImpact {
     pub files: Vec<String>,
     #[serde(default)]
     pub modules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SemanticCompatibility {
+    #[serde(default)]
+    pub status: SemanticCompatibilityStatus,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SemanticCompatibilityStatus {
+    #[default]
+    Compatible,
+    PotentiallyBreaking,
+    Breaking,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +87,22 @@ struct SymbolInfo {
     name: String,
     body_hash: String,
     match_hash: String,
+    signature: Option<CallableSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallableSignature {
+    parameters: Vec<ParameterSignature>,
+    return_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParameterSignature {
+    name: String,
+    type_hint: Option<String>,
+    optional: bool,
+    has_default: bool,
+    is_rest: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -142,11 +176,13 @@ pub fn diff(
                     removed_candidates.insert(key);
                 }
                 (Some(old), Some(new)) if old.body_hash != new.body_hash => {
+                    let compatibility = check_symbol_compatibility(old, new);
                     changes.push(SemanticChange {
                         kind: SemanticChangeKind::Modified,
                         symbol: key.clone(),
-                        risk: score_risk(SemanticChangeKind::Modified, &key),
+                        risk: score_modified_risk(&key, compatibility.status),
                         impact: base_impact(&key),
+                        compatibility,
                     })
                 }
                 _ => {}
@@ -207,6 +243,7 @@ pub fn diff(
                     symbol: format!("{old_key} -> {key}"),
                     risk: score_relocation_risk(&old_key, key),
                     impact: base_impact(&format!("{old_key} -> {key}")),
+                    compatibility: SemanticCompatibility::default(),
                 });
             }
         }
@@ -217,6 +254,7 @@ pub fn diff(
                 symbol: key.clone(),
                 risk: score_risk(SemanticChangeKind::Removed, key),
                 impact: base_impact(key),
+                compatibility: SemanticCompatibility::default(),
             });
         }
 
@@ -226,6 +264,7 @@ pub fn diff(
                 symbol: key.clone(),
                 risk: score_risk(SemanticChangeKind::Added, key),
                 impact: base_impact(key),
+                compatibility: SemanticCompatibility::default(),
             });
         }
 
@@ -235,6 +274,7 @@ pub fn diff(
                 symbol: "(style-only change)".to_string(),
                 risk: SemanticRisk::Low,
                 impact: base_impact("(style-only change)"),
+                compatibility: SemanticCompatibility::default(),
             });
         }
 
@@ -255,6 +295,7 @@ pub fn diff(
             symbol: "(parser fallback)".to_string(),
             risk: SemanticRisk::High,
             impact: base_impact("(parser fallback)"),
+            compatibility: SemanticCompatibility::default(),
         }],
     }))
 }
@@ -308,6 +349,17 @@ fn score_relocation_risk(old_key: &str, new_key: &str) -> SemanticRisk {
     std::cmp::max(score_risk(kind, old_key), score_risk(kind, new_key))
 }
 
+fn score_modified_risk(symbol: &str, compatibility: SemanticCompatibilityStatus) -> SemanticRisk {
+    let baseline = score_risk(SemanticChangeKind::Modified, symbol);
+    match compatibility {
+        SemanticCompatibilityStatus::Breaking => SemanticRisk::High,
+        SemanticCompatibilityStatus::PotentiallyBreaking => {
+            std::cmp::max(baseline, SemanticRisk::Medium)
+        }
+        SemanticCompatibilityStatus::Compatible => baseline,
+    }
+}
+
 fn score_risk(kind: SemanticChangeKind, symbol: &str) -> SemanticRisk {
     let symbol_kind = symbol_kind_from_key(symbol);
     match kind {
@@ -351,6 +403,147 @@ fn score_risk(kind: SemanticChangeKind, symbol: &str) -> SemanticRisk {
             None => SemanticRisk::Medium,
         },
     }
+}
+
+fn check_symbol_compatibility(old: &SymbolInfo, new: &SymbolInfo) -> SemanticCompatibility {
+    let (Some(old_signature), Some(new_signature)) = (&old.signature, &new.signature) else {
+        return SemanticCompatibility::default();
+    };
+
+    check_callable_compatibility(old_signature, new_signature)
+}
+
+fn check_callable_compatibility(
+    old_signature: &CallableSignature,
+    new_signature: &CallableSignature,
+) -> SemanticCompatibility {
+    if old_signature == new_signature {
+        return SemanticCompatibility::default();
+    }
+
+    let mut breaking_notes = Vec::new();
+    let mut potential_notes = Vec::new();
+
+    let old_required = required_parameter_count(&old_signature.parameters);
+    let new_required = required_parameter_count(&new_signature.parameters);
+    if new_required > old_required {
+        breaking_notes.push(format!(
+            "required parameter count increased ({} -> {})",
+            old_required, new_required
+        ));
+    }
+
+    if new_signature.parameters.len() < old_signature.parameters.len() {
+        breaking_notes.push(format!(
+            "parameter count decreased ({} -> {})",
+            old_signature.parameters.len(),
+            new_signature.parameters.len()
+        ));
+    }
+
+    let shared = std::cmp::min(
+        old_signature.parameters.len(),
+        new_signature.parameters.len(),
+    );
+    for index in 0..shared {
+        let old_param = &old_signature.parameters[index];
+        let new_param = &new_signature.parameters[index];
+
+        if old_param.is_rest != new_param.is_rest {
+            breaking_notes.push(format!(
+                "parameter {} rest marker changed ({} -> {})",
+                index + 1,
+                old_param.is_rest,
+                new_param.is_rest
+            ));
+        }
+
+        if old_param.optional && !new_param.optional && !new_param.has_default {
+            breaking_notes.push(format!("parameter {} became required", index + 1));
+        }
+
+        if old_param.type_hint != new_param.type_hint
+            && old_param.type_hint.is_some()
+            && new_param.type_hint.is_some()
+        {
+            potential_notes.push(format!(
+                "parameter {} type changed ({} -> {})",
+                index + 1,
+                old_param.type_hint.clone().unwrap_or_default(),
+                new_param.type_hint.clone().unwrap_or_default()
+            ));
+        }
+    }
+
+    if old_signature.return_type != new_signature.return_type
+        && old_signature.return_type.is_some()
+        && new_signature.return_type.is_some()
+    {
+        potential_notes.push(format!(
+            "return type changed ({} -> {})",
+            old_signature.return_type.clone().unwrap_or_default(),
+            new_signature.return_type.clone().unwrap_or_default()
+        ));
+    }
+
+    if !breaking_notes.is_empty() {
+        breaking_notes.extend(potential_notes);
+        return SemanticCompatibility {
+            status: SemanticCompatibilityStatus::Breaking,
+            notes: breaking_notes,
+        };
+    }
+
+    if !potential_notes.is_empty() {
+        return SemanticCompatibility {
+            status: SemanticCompatibilityStatus::PotentiallyBreaking,
+            notes: potential_notes,
+        };
+    }
+
+    if is_backward_compatible_extension(old_signature, new_signature) {
+        return SemanticCompatibility::default();
+    }
+
+    SemanticCompatibility {
+        status: SemanticCompatibilityStatus::PotentiallyBreaking,
+        notes: vec!["callable signature changed".to_string()],
+    }
+}
+
+fn required_parameter_count(parameters: &[ParameterSignature]) -> usize {
+    parameters
+        .iter()
+        .filter(|param| !param.optional && !param.has_default && !param.is_rest)
+        .count()
+}
+
+fn is_backward_compatible_extension(
+    old_signature: &CallableSignature,
+    new_signature: &CallableSignature,
+) -> bool {
+    if old_signature.return_type != new_signature.return_type {
+        return false;
+    }
+
+    if new_signature.parameters.len() < old_signature.parameters.len() {
+        return false;
+    }
+
+    for (index, old_param) in old_signature.parameters.iter().enumerate() {
+        let Some(new_param) = new_signature.parameters.get(index) else {
+            return false;
+        };
+        if old_param != new_param {
+            return false;
+        }
+    }
+
+    new_signature
+        .parameters
+        .iter()
+        .skip(old_signature.parameters.len())
+        .all(|param| param.optional || param.has_default || param.is_rest)
 }
 
 fn symbol_kind_from_key(symbol: &str) -> Option<SymbolKind> {
@@ -437,6 +630,7 @@ fn extract_symbols(
                     name,
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
+                    signature: extract_callable_signature(node, source),
                 });
             }
         }
@@ -449,6 +643,7 @@ fn extract_symbols(
                             name,
                             body_hash: node_hash(node, source)?,
                             match_hash: node_match_hash(node, source)?,
+                            signature: extract_callable_signature(value, source),
                         });
                     }
                 }
@@ -461,6 +656,7 @@ fn extract_symbols(
                     name: class_name.clone(),
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
+                    signature: None,
                 });
 
                 let mut cursor = node.walk();
@@ -482,6 +678,7 @@ fn extract_symbols(
                         name: scoped_name,
                         body_hash: node_hash(node, source)?,
                         match_hash: node_match_hash(node, source)?,
+                        signature: extract_callable_signature(node, source),
                     });
                 } else {
                     let scoped_name = match enclosing_class {
@@ -494,6 +691,7 @@ fn extract_symbols(
                         name: scoped_name,
                         body_hash: node_hash(node, source)?,
                         match_hash: node_match_hash(node, source)?,
+                        signature: extract_callable_signature(node, source),
                     });
                 }
             }
@@ -509,6 +707,7 @@ fn extract_symbols(
                     name: scoped_name,
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
+                    signature: None,
                 });
             }
         }
@@ -519,6 +718,7 @@ fn extract_symbols(
                     name,
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
+                    signature: None,
                 });
             }
         }
@@ -529,6 +729,7 @@ fn extract_symbols(
                     name,
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
+                    signature: None,
                 });
             }
         }
@@ -539,6 +740,7 @@ fn extract_symbols(
                     name,
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
+                    signature: None,
                 });
             }
         }
@@ -549,6 +751,7 @@ fn extract_symbols(
                     name,
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
+                    signature: None,
                 });
             }
         }
@@ -600,6 +803,75 @@ fn export_symbol_name(node: Node, source: &[u8]) -> Option<String> {
     }
 
     Some(compact_text(node, source))
+}
+
+fn extract_callable_signature(node: Node, source: &[u8]) -> Option<CallableSignature> {
+    let parameters = node.child_by_field_name("parameters")?;
+    let mut parsed_parameters = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() == "comment" {
+            continue;
+        }
+
+        parsed_parameters.push(parse_parameter_signature(parameter, source));
+    }
+
+    let return_type = node
+        .child_by_field_name("return_type")
+        .map(|annotation| compact_text(annotation, source))
+        .filter(|text| !text.is_empty());
+
+    Some(CallableSignature {
+        parameters: parsed_parameters,
+        return_type,
+    })
+}
+
+fn parse_parameter_signature(node: Node, source: &[u8]) -> ParameterSignature {
+    let kind = node.kind();
+    let is_rest = kind == "rest_parameter";
+    let has_default = kind == "assignment_pattern";
+    let optional =
+        kind == "optional_parameter" || has_default || compact_text(node, source).contains('?');
+    let type_hint = node
+        .child_by_field_name("type")
+        .or_else(|| node.child_by_field_name("type_annotation"))
+        .map(|annotation| compact_text(annotation, source))
+        .filter(|text| !text.is_empty());
+
+    ParameterSignature {
+        name: parameter_name(node, source),
+        type_hint,
+        optional,
+        has_default,
+        is_rest,
+    }
+}
+
+fn parameter_name(node: Node, source: &[u8]) -> String {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        let text = compact_text(name_node, source);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+
+    if let Some(pattern_node) = node.child_by_field_name("pattern") {
+        let text = compact_text(pattern_node, source);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+
+    if let Some(left_node) = node.child_by_field_name("left") {
+        let text = compact_text(left_node, source);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+
+    compact_text(node, source)
 }
 
 fn compact_text(node: Node, source: &[u8]) -> String {
@@ -769,6 +1041,65 @@ mod tests {
             c.kind == SemanticChangeKind::StyleOnly
                 && c.symbol == "(style-only change)"
                 && c.risk == SemanticRisk::Low
+        }));
+    }
+
+    #[test]
+    fn flags_added_required_parameter_as_breaking_signature_change() {
+        let old = b"function calculate(amount: number): number { return amount; }";
+        let new =
+            b"function calculate(amount: number, currency: string): number { return amount; }";
+
+        let diff = diff(Path::new("signature.ts"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| {
+            c.kind == SemanticChangeKind::Modified
+                && c.symbol == "function:calculate"
+                && c.risk == SemanticRisk::High
+                && c.compatibility.status == SemanticCompatibilityStatus::Breaking
+                && c.compatibility
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("required parameter count increased"))
+        }));
+    }
+
+    #[test]
+    fn treats_added_optional_parameter_as_compatible() {
+        let old = b"function calculate(amount: number): number { return amount; }";
+        let new =
+            b"function calculate(amount: number, currency?: string): number { return amount; }";
+
+        let diff = diff(Path::new("optional-signature.ts"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| {
+            c.kind == SemanticChangeKind::Modified
+                && c.symbol == "function:calculate"
+                && c.compatibility.status == SemanticCompatibilityStatus::Compatible
+        }));
+    }
+
+    #[test]
+    fn marks_return_type_change_as_potentially_breaking() {
+        let old = b"function lookup(id: string): string { return id; }";
+        let new = b"function lookup(id: string): number { return Number(id); }";
+
+        let diff = diff(Path::new("return-type.ts"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| {
+            c.kind == SemanticChangeKind::Modified
+                && c.symbol == "function:lookup"
+                && c.compatibility.status == SemanticCompatibilityStatus::PotentiallyBreaking
+                && c.compatibility
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("return type changed"))
         }));
     }
 
