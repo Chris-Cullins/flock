@@ -10,6 +10,15 @@ Initial Rust implementation of `fl` with:
 - undo variants on the event timeline
 - git bridge command stubs (`commit/push/pull`)
 
+Workspace crates:
+
+- `fl-core`: repo orchestration and public API used by CLI
+- `fl-storage`: event schema, metadata layout constants, event log IO
+- `fl-semantic`: TS/JS semantic analyzer and diff engine
+- `fl-workflow`: exploration/undo workflow domain types + timeline logic
+- `fl-bridge-git`: git command execution utilities for bridge operations
+- `fl-collab`: collaboration domain contracts (presence/locks) for upcoming phases
+
 ## Build
 
 ```bash

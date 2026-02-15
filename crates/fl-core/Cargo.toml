@@ -6,12 +6,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-blake3.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tree-sitter.workspace = true
-tree-sitter-javascript.workspace = true
-tree-sitter-typescript.workspace = true
+fl-bridge-git = { path = "../fl-bridge-git" }
+fl-semantic = { path = "../fl-semantic" }
+fl-storage = { path = "../fl-storage" }
+fl-workflow = { path = "../fl-workflow" }
 uuid.workspace = true
 walkdir.workspace = true
 

@@ -1,72 +1,29 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
-use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use fl_storage::{CONFIG_FILE, FLOCK_DIR, SNAPSHOT_DIR};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::event::{
     CheckpointEvent, Event, EventKind, ExplorationAction, ExplorationEvent, GitBridgeAction,
-    GitBridgeEvent, UndoEvent, UndoMode,
+    GitBridgeEvent, UndoEvent,
 };
 use crate::semantic::{SemanticFileDiff, diff as semantic_diff, supported_source};
+use fl_workflow::{
+    previous_checkpoint_before, replay_explorations, resolve_target_event, to_undo_mode,
+};
 
-const FLOCK_DIR: &str = ".flock";
-const EVENT_LOG_DIR: &str = ".flock/event-log";
-const EVENT_LOG_FILE: &str = ".flock/event-log/events.jsonl";
-const SNAPSHOT_DIR: &str = ".flock/snapshots";
-const CONFIG_FILE: &str = ".flock/config.toml";
+pub use fl_workflow::parse_duration_spec;
+pub use fl_workflow::{ExplorationStatus, ExplorationSummary, UndoRequest, UndoResult};
 
 #[derive(Debug, Clone)]
 pub struct Repo {
     root: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExplorationStatus {
-    Active,
-    Promoted,
-    Abandoned,
-}
-
-impl fmt::Display for ExplorationStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Active => f.write_str("active"),
-            Self::Promoted => f.write_str("promoted"),
-            Self::Abandoned => f.write_str("abandoned"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ExplorationSummary {
-    pub id: Uuid,
-    pub title: String,
-    pub status: ExplorationStatus,
-    pub base_checkpoint_event: Option<Uuid>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum UndoRequest {
-    Last,
-    N(usize),
-    To(String),
-    Since(Duration),
-}
-
-#[derive(Debug, Clone)]
-pub struct UndoResult {
-    pub target_event_id: Uuid,
-    pub restored_checkpoint_event: Option<Uuid>,
 }
 
 impl Repo {
@@ -100,16 +57,10 @@ impl Repo {
     }
 
     pub fn init(&self) -> Result<()> {
-        fs::create_dir_all(self.root.join(EVENT_LOG_DIR))
-            .context("failed to create event-log directory")?;
         fs::create_dir_all(self.root.join(SNAPSHOT_DIR))
             .context("failed to create snapshots directory")?;
 
-        let event_log = self.root.join(EVENT_LOG_FILE);
-        if !event_log.exists() {
-            File::create(&event_log)
-                .with_context(|| format!("failed to create {}", event_log.display()))?;
-        }
+        fl_storage::EventLog::for_root(self.root()).ensure_exists()?;
 
         let config = self.root.join(CONFIG_FILE);
         if !config.exists() {
@@ -139,26 +90,7 @@ impl Repo {
 
     pub fn list_events(&self) -> Result<Vec<Event>> {
         self.assert_initialized()?;
-
-        let path = self.root.join(EVENT_LOG_FILE);
-        let file =
-            File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
-        let reader = BufReader::new(file);
-
-        let mut events = Vec::new();
-        for line in reader.lines() {
-            let line =
-                line.with_context(|| format!("failed to read line in {}", path.display()))?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let event = serde_json::from_str::<Event>(trimmed)
-                .with_context(|| format!("failed to parse event JSON: {}", trimmed))?;
-            events.push(event);
-        }
-
-        Ok(events)
+        fl_storage::EventLog::for_root(self.root()).read_all()
     }
 
     pub fn semantic_diff_from_latest_checkpoint(&self) -> Result<Vec<SemanticFileDiff>> {
@@ -583,15 +515,7 @@ impl Repo {
     }
 
     fn append_event(&self, event: &Event) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join(EVENT_LOG_FILE))
-            .context("failed to open event log for append")?;
-
-        let line = serde_json::to_string(event).context("failed to serialize event")?;
-        writeln!(file, "{}", line).context("failed to append event to log")?;
-        Ok(())
+        fl_storage::EventLog::for_root(self.root()).append(event)
     }
 
     fn latest_checkpoint(&self) -> Option<Event> {
@@ -650,35 +574,7 @@ impl Repo {
     }
 
     fn run_git(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.root)
-            .output()
-            .with_context(|| format!("failed to run git {}", args.join(" ")))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let detail = if stdout.is_empty() {
-            stderr.clone()
-        } else if stderr.is_empty() {
-            stdout.clone()
-        } else {
-            format!("{}\n{}", stdout, stderr)
-        };
-
-        if !output.status.success() {
-            bail!(
-                "git {} failed: {}",
-                args.join(" "),
-                if detail.is_empty() {
-                    "(no output)"
-                } else {
-                    detail.as_str()
-                }
-            )
-        }
-
-        Ok(detail)
+        fl_bridge_git::run_git(&self.root, args)
     }
 }
 
@@ -752,162 +648,8 @@ fn unix_timestamp_nanos() -> Result<String> {
     Ok(nanos.to_string())
 }
 
-fn parse_nanos(value: &str) -> Result<u128> {
-    value
-        .parse::<u128>()
-        .with_context(|| format!("invalid nanosecond timestamp: {}", value))
-}
-
 fn current_actor() -> String {
     env::var("USER").unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn replay_explorations(events: &[Event]) -> BTreeMap<Uuid, ExplorationSummary> {
-    let mut map = BTreeMap::new();
-
-    for event in events {
-        let EventKind::Exploration(exploration) = &event.kind else {
-            continue;
-        };
-
-        match exploration.action {
-            ExplorationAction::Start => {
-                map.insert(
-                    exploration.exploration_id,
-                    ExplorationSummary {
-                        id: exploration.exploration_id,
-                        title: exploration.title.clone(),
-                        status: ExplorationStatus::Active,
-                        base_checkpoint_event: exploration.base_checkpoint_event,
-                        created_at: event.timestamp.clone(),
-                        updated_at: event.timestamp.clone(),
-                    },
-                );
-            }
-            ExplorationAction::Promote => {
-                if let Some(entry) = map.get_mut(&exploration.exploration_id) {
-                    entry.status = ExplorationStatus::Promoted;
-                    entry.updated_at = event.timestamp.clone();
-                }
-            }
-            ExplorationAction::Abandon => {
-                if let Some(entry) = map.get_mut(&exploration.exploration_id) {
-                    entry.status = ExplorationStatus::Abandoned;
-                    entry.updated_at = event.timestamp.clone();
-                }
-            }
-        }
-    }
-
-    map
-}
-
-fn resolve_target_event<'a>(events: &'a [Event], request: &UndoRequest) -> Result<&'a Event> {
-    match request {
-        UndoRequest::Last => events.last().ok_or_else(|| anyhow!("event log is empty")),
-        UndoRequest::N(n) => {
-            if *n == 0 {
-                bail!("--n must be >= 1")
-            }
-            if *n > events.len() {
-                bail!(
-                    "cannot undo {} events: only {} events exist",
-                    n,
-                    events.len()
-                )
-            }
-            let idx = events.len() - *n;
-            Ok(&events[idx])
-        }
-        UndoRequest::To(raw_id) => {
-            let matches: Vec<&Event> = events
-                .iter()
-                .filter(|event| event.id.to_string().starts_with(raw_id))
-                .collect();
-
-            match matches.as_slice() {
-                [] => bail!("no event id matches `{}`", raw_id),
-                [event] => Ok(*event),
-                _ => bail!("event id prefix `{}` is ambiguous", raw_id),
-            }
-        }
-        UndoRequest::Since(duration) => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .context("system clock is before unix epoch")?
-                .as_nanos();
-            let cutoff = now.saturating_sub(duration.as_nanos());
-
-            events
-                .iter()
-                .find(|event| {
-                    parse_nanos(&event.timestamp)
-                        .map(|ts| ts >= cutoff)
-                        .unwrap_or(false)
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no events found in the last {} seconds",
-                        duration.as_secs_f64()
-                    )
-                })
-        }
-    }
-}
-
-fn to_undo_mode(request: &UndoRequest, resolved_target_id: Uuid) -> UndoMode {
-    match request {
-        UndoRequest::Last => UndoMode::Last,
-        UndoRequest::N(n) => UndoMode::N(*n),
-        UndoRequest::To(_) => UndoMode::To(resolved_target_id),
-        UndoRequest::Since(duration) => UndoMode::SinceNanos(duration.as_nanos()),
-    }
-}
-
-fn previous_checkpoint_before(events: &[Event], target_event_id: Uuid) -> Option<Event> {
-    let mut previous = None;
-
-    for event in events {
-        if event.id == target_event_id {
-            break;
-        }
-
-        if matches!(event.kind, EventKind::Checkpoint(_)) {
-            previous = Some(event.clone());
-        }
-    }
-
-    previous
-}
-
-pub fn parse_duration_spec(input: &str) -> Result<Duration> {
-    let value = input.trim();
-    if value.is_empty() {
-        bail!("duration cannot be empty")
-    }
-
-    let split_at = value
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(value.len());
-    let (digits, unit) = value.split_at(split_at);
-
-    if digits.is_empty() {
-        bail!("invalid duration `{}`", input)
-    }
-
-    let amount = digits
-        .parse::<u64>()
-        .with_context(|| format!("invalid duration amount `{}`", digits))?;
-
-    let duration = match unit {
-        "" | "s" => Duration::from_secs(amount),
-        "m" => Duration::from_secs(amount.saturating_mul(60)),
-        "h" => Duration::from_secs(amount.saturating_mul(60 * 60)),
-        "d" => Duration::from_secs(amount.saturating_mul(60 * 60 * 24)),
-        _ => bail!("unsupported duration unit `{}` (use s, m, h, d)", unit),
-    };
-
-    Ok(duration)
 }
 
 #[cfg(test)]

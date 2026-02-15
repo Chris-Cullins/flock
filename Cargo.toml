@@ -1,5 +1,10 @@
 [workspace]
 members = [
+  "crates/fl-storage",
+  "crates/fl-semantic",
+  "crates/fl-workflow",
+  "crates/fl-collab",
+  "crates/fl-bridge-git",
   "crates/fl-core",
   "crates/fl-cli",
 ]

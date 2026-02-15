@@ -211,6 +211,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "fl-bridge-git"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "fl-cli"
 version = "0.1.0"
 dependencies = [
@@ -222,19 +229,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "fl-collab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "fl-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fl-bridge-git",
+ "fl-semantic",
+ "fl-storage",
+ "fl-workflow",
+ "tempfile",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "fl-semantic"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
  "serde",
- "serde_json",
- "tempfile",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "fl-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
  "uuid",
- "walkdir",
+]
+
+[[package]]
+name = "fl-workflow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fl-storage",
+ "uuid",
 ]
 
 [[package]]

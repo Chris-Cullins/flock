@@ -8,12 +8,12 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Add `fl init`, `fl checkpoint`, `fl log`, `fl diff --semantic` commands
 - [x] Add initial `.flock` metadata layout (`event-log`, `snapshots`, `config.toml`)
 - [x] Add first semantic analyzer for TS/JS via tree-sitter
-- [ ] Define crate boundaries for long-term architecture:
-  - [ ] `fl-storage` (event log + content store)
-  - [ ] `fl-semantic` (language analyzers + semantic merge)
-  - [ ] `fl-workflow` (explorations, sessions, work queue)
-  - [ ] `fl-collab` (presence, locks, subscriptions, gates)
-  - [ ] `fl-bridge-git` (colocated mode + import/export)
+- [x] Define crate boundaries for long-term architecture:
+  - [x] `fl-storage` (event log + content store)
+  - [x] `fl-semantic` (language analyzers + semantic merge)
+  - [x] `fl-workflow` (explorations, sessions, work queue)
+  - [x] `fl-collab` (presence, locks, subscriptions, gates)
+  - [x] `fl-bridge-git` (colocated mode + import/export)
 
 ## 1. Core Storage Engine (Git-Compatible First)
 
