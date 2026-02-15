@@ -499,6 +499,7 @@ impl Repo {
         })?;
 
         self.copy_workspace_to_snapshot(&snapshot_path)?;
+        let snapshot_merkle_root = compute_snapshot_merkle_root(&snapshot_path)?;
 
         let parent_checkpoint_event =
             parent_checkpoint_event.or_else(|| self.latest_checkpoint().map(|event| event.id));
@@ -508,6 +509,7 @@ impl Repo {
             message,
             snapshot_id,
             parent_checkpoint_event,
+            snapshot_merkle_root: Some(snapshot_merkle_root),
         }))?;
         self.advance_main_ref(event.id)?;
         Ok(event)
@@ -931,6 +933,90 @@ fn collect_source_files(root: &Path, apply_skip: bool) -> Result<BTreeSet<PathBu
     Ok(files)
 }
 
+fn compute_snapshot_merkle_root(snapshot_root: &Path) -> Result<String> {
+    let mut leaves: Vec<(String, [u8; 32])> = Vec::new();
+
+    for entry in WalkDir::new(snapshot_root) {
+        let entry = entry.context("failed while walking snapshot for merkle hashing")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let rel = entry
+            .path()
+            .strip_prefix(snapshot_root)
+            .context("failed to compute relative snapshot path for merkle hashing")?;
+        let rel_key = merkle_path_key(rel)?;
+
+        let contents = fs::read(entry.path()).with_context(|| {
+            format!(
+                "failed to read snapshot file for merkle hashing: {}",
+                entry.path().display()
+            )
+        })?;
+
+        let mut leaf_hasher = blake3::Hasher::new();
+        leaf_hasher.update(b"flock:merkle:leaf:v1");
+        leaf_hasher.update(&(rel_key.len() as u64).to_le_bytes());
+        leaf_hasher.update(rel_key.as_bytes());
+        leaf_hasher.update(blake3::hash(&contents).as_bytes());
+        leaves.push((rel_key, *leaf_hasher.finalize().as_bytes()));
+    }
+
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut nodes: Vec<[u8; 32]> = leaves.into_iter().map(|(_, hash)| hash).collect();
+    if nodes.is_empty() {
+        return Ok(hex::encode(
+            blake3::hash(b"flock:merkle:empty:v1").as_bytes(),
+        ));
+    }
+
+    while nodes.len() > 1 {
+        let mut next = Vec::with_capacity(nodes.len().div_ceil(2));
+        for chunk in nodes.chunks(2) {
+            let left = chunk[0];
+            let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+
+            let mut node_hasher = blake3::Hasher::new();
+            node_hasher.update(b"flock:merkle:node:v1");
+            node_hasher.update(&left);
+            node_hasher.update(&right);
+            next.push(*node_hasher.finalize().as_bytes());
+        }
+        nodes = next;
+    }
+
+    Ok(hex::encode(nodes[0]))
+}
+
+fn merkle_path_key(rel_path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(|| {
+                    anyhow!("snapshot path {} is not valid UTF-8", rel_path.display())
+                })?;
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            _ => {
+                bail!(
+                    "snapshot path {} has unsupported path components",
+                    rel_path.display()
+                )
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        bail!("snapshot path cannot be empty");
+    }
+
+    Ok(parts.join("/"))
+}
+
 fn normalize_label(message: &str) -> String {
     message
         .trim()
@@ -1075,6 +1161,73 @@ mod tests {
 
         assert_eq!(cp1_payload.parent_checkpoint_event, None);
         assert_eq!(cp2_payload.parent_checkpoint_event, Some(cp1.id));
+    }
+
+    #[test]
+    fn checkpoints_include_snapshot_merkle_root() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("hash.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+
+        let checkpoint = repo
+            .create_checkpoint(Some("cp".to_string()))
+            .expect("checkpoint should succeed");
+        let EventKind::Checkpoint(payload) = checkpoint.kind else {
+            panic!("checkpoint payload expected");
+        };
+        let root = payload
+            .snapshot_merkle_root
+            .expect("checkpoint should include snapshot merkle root");
+        assert_eq!(root.len(), 64);
+        assert!(root.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn snapshot_merkle_root_is_content_deterministic() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("stable.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+
+        let first = repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        let EventKind::Checkpoint(first_payload) = first.kind else {
+            panic!("checkpoint payload expected");
+        };
+        let first_root = first_payload
+            .snapshot_merkle_root
+            .expect("checkpoint should include snapshot merkle root");
+
+        let second = repo
+            .create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+        let EventKind::Checkpoint(second_payload) = second.kind else {
+            panic!("checkpoint payload expected");
+        };
+        let second_root = second_payload
+            .snapshot_merkle_root
+            .expect("checkpoint should include snapshot merkle root");
+
+        assert_eq!(first_root, second_root);
+
+        fs::write(&file, "export const value = 2;").expect("write should succeed");
+        let changed = repo
+            .create_checkpoint(Some("cp3".to_string()))
+            .expect("checkpoint should succeed");
+        let EventKind::Checkpoint(changed_payload) = changed.kind else {
+            panic!("checkpoint payload expected");
+        };
+        let changed_root = changed_payload
+            .snapshot_merkle_root
+            .expect("checkpoint should include snapshot merkle root");
+
+        assert_ne!(second_root, changed_root);
     }
 
     #[test]

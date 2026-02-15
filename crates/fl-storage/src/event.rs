@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -34,6 +34,8 @@ pub struct CheckpointEvent {
     pub snapshot_id: Uuid,
     #[serde(default)]
     pub parent_checkpoint_event: Option<Uuid>,
+    #[serde(default)]
+    pub snapshot_merkle_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

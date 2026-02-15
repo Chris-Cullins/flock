@@ -56,6 +56,7 @@ impl EventLog {
 
         validate_causal_chain(&parsed_events)?;
         validate_signatures(&parsed_events)?;
+        validate_checkpoint_metadata(&parsed_events)?;
 
         let events = parsed_events
             .into_iter()
@@ -69,6 +70,7 @@ impl EventLog {
         let expected_parent = self.read_all()?.last().map(|entry| entry.id);
         validate_next_parent(event, expected_parent)?;
         verify_event_signature(event, true)?;
+        verify_checkpoint_merkle_root(event, true)?;
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -180,6 +182,49 @@ fn validate_signatures(events: &[ParsedEvent]) -> Result<()> {
         verify_event_signature(&parsed.event, require_signature)?;
     }
     Ok(())
+}
+
+fn validate_checkpoint_metadata(events: &[ParsedEvent]) -> Result<()> {
+    for parsed in events {
+        let require_merkle_root = parsed.schema_version.unwrap_or(1) >= 5;
+        verify_checkpoint_merkle_root(&parsed.event, require_merkle_root)?;
+    }
+    Ok(())
+}
+
+fn verify_checkpoint_merkle_root(event: &Event, require_merkle_root: bool) -> Result<()> {
+    let crate::event::EventKind::Checkpoint(checkpoint) = &event.kind else {
+        return Ok(());
+    };
+
+    match checkpoint.snapshot_merkle_root.as_deref() {
+        Some(root) => {
+            if root.len() != 64 {
+                bail!(
+                    "event {} has invalid checkpoint merkle root length (expected 64 hex chars)",
+                    event.id
+                );
+            }
+            let decoded = hex::decode(root).with_context(|| {
+                format!(
+                    "event {} has invalid checkpoint merkle root encoding",
+                    event.id
+                )
+            })?;
+            if decoded.len() != 32 {
+                bail!(
+                    "event {} has invalid checkpoint merkle root byte length (expected 32)",
+                    event.id
+                );
+            }
+            Ok(())
+        }
+        None if require_merkle_root => bail!(
+            "event {} is missing checkpoint merkle root metadata",
+            event.id
+        ),
+        None => Ok(()),
+    }
 }
 
 fn verify_event_signature(event: &Event, require_signature: bool) -> Result<()> {
@@ -405,6 +450,23 @@ mod tests {
     }
 
     #[test]
+    fn append_rejects_missing_checkpoint_merkle_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let event_log = EventLog::for_root(dir.path());
+        event_log.ensure_exists().expect("ensure event log");
+
+        let mut event = sample_checkpoint_event(None);
+        sign_event(&mut event);
+        let err = event_log
+            .append(&event)
+            .expect_err("should reject checkpoint without merkle root");
+        assert!(
+            format!("{:#}", err).contains("missing checkpoint merkle root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn read_all_rejects_invalid_signature() {
         let dir = tempfile::tempdir().expect("tempdir");
         let event_log = EventLog::for_root(dir.path());
@@ -438,12 +500,16 @@ mod tests {
                 message: Some("baseline".to_string()),
                 snapshot_id: Uuid::new_v4(),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         }
     }
 
     fn signed_checkpoint_event(parent_id: Option<Uuid>) -> Event {
         let mut event = sample_checkpoint_event(parent_id);
+        if let EventKind::Checkpoint(checkpoint) = &mut event.kind {
+            checkpoint.snapshot_merkle_root = Some("0".repeat(64));
+        }
         sign_event(&mut event);
         event
     }

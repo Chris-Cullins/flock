@@ -309,6 +309,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(10),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         );
         let exploration_start = make_event(
@@ -355,6 +356,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(11),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         );
         let cp2 = make_event(
@@ -365,6 +367,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(12),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         );
         let restored = make_event(
@@ -375,6 +378,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(13),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         );
         let undo = make_event(
@@ -406,6 +410,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(11),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         );
         let cp2 = make_event(
@@ -416,6 +421,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(12),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         );
 
@@ -435,6 +441,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(11),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         );
         let cp2 = make_event(
@@ -445,6 +452,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(12),
                 parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
             }),
         );
         let exploration_start = make_event(
@@ -465,6 +473,7 @@ mod tests {
                 message: None,
                 snapshot_id: Uuid::from_u128(13),
                 parent_checkpoint_event: Some(cp2.id),
+                snapshot_merkle_root: None,
             }),
         );
         let undo = make_event(

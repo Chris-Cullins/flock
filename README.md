@@ -5,6 +5,7 @@ Initial Rust implementation of `fl` with:
 - `.flock` repository initialization
 - append-only event log (`events.jsonl`)
 - checkpoint snapshots
+- checkpoint metadata includes deterministic snapshot Merkle roots
 - semantic diff for JavaScript/TypeScript (`.js`, `.jsx`, `.ts`, `.tsx`)
 - exploration lifecycle commands (`start/list/promote/abandon`)
 - undo variants on the event timeline

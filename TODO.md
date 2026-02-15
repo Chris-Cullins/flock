@@ -22,14 +22,14 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Add event signatures (ed25519)
 - [x] Add event replay and deterministic state reconstruction
 - [x] Add checkpoints as first-class events (commit-equivalent)
-- [ ] Add undo events:
+- [x] Add undo events:
   - [x] `undo last`
   - [x] `undo --n`
   - [x] `undo --to`
   - [x] `undo --since`
 - [x] Add file-scoped undo semantics in colocated mode (best-effort fallback)
 - [x] Add repository refs abstraction (branches/tags/workspaces)
-- [ ] Add Merkle snapshot hash generation for checkpoints
+- [x] Add Merkle snapshot hash generation for checkpoints
 - [ ] Add storage integrity verifier command (`fl fsck`)
 
 ## 2. Git/JJ Compatibility Layer

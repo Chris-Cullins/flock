@@ -136,14 +136,15 @@ fn main() -> Result<()> {
                 bail!("unexpected event payload for checkpoint")
             };
             println!(
-                "checkpoint {} ({}) id={} parent={}",
+                "checkpoint {} ({}) id={} parent={} merkle={}",
                 payload.label,
                 payload.snapshot_id,
                 checkpoint_id,
                 payload
                     .parent_checkpoint_event
                     .map(|id| id.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                payload.snapshot_merkle_root.as_deref().unwrap_or("none")
             );
         }
         Command::Log => {
