@@ -15,7 +15,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init,
+    Init {
+        #[arg(long)]
+        colocated: bool,
+    },
     Checkpoint {
         #[arg(short = 'm', long = "message")]
         message: Option<String>,
@@ -121,9 +124,13 @@ fn main() -> Result<()> {
     let cwd = env::current_dir()?;
 
     match cli.command {
-        Command::Init => {
+        Command::Init { colocated } => {
             let repo = Repo::at(cwd);
-            repo.init()?;
+            if colocated {
+                repo.init_colocated()?;
+            } else {
+                repo.init()?;
+            }
             println!(
                 "Initialized Flock repository in {}/.flock",
                 repo.root().display()

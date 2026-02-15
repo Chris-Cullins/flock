@@ -10,6 +10,7 @@ Initial Rust implementation of `fl` with:
 - exploration lifecycle commands (`start/list/promote/abandon`)
 - undo variants on the event timeline
 - git bridge command stubs (`commit/push/pull`)
+- optional git-colocated mode (`--colocated`) with checkpoint-to-git commit mapping
 - repository refs abstraction (`branch`, `tag`, `workspace`)
 
 Workspace crates:
@@ -32,6 +33,9 @@ cargo build
 ```bash
 # initialize metadata in current project
 cargo run -p fl-cli -- init
+
+# initialize colocated mode (.git + .flock sidecar)
+cargo run -p fl-cli -- init --colocated
 
 # create a checkpoint snapshot
 cargo run -p fl-cli -- checkpoint -m "base"

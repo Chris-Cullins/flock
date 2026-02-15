@@ -34,8 +34,8 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## 2. Git/JJ Compatibility Layer
 
-- [ ] Implement git-colocated mode (`.git` + `.flock` sidecar)
-- [ ] Map checkpoint operations to git commits
+- [x] Implement git-colocated mode (`.git` + `.flock` sidecar)
+- [x] Map checkpoint operations to git commits
 - [ ] Map Flock refs to git refs/bookmarks strategy
 - [ ] Implement push/pull bridge to git remotes
 - [ ] Implement git import and export commands

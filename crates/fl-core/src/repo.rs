@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,6 +39,21 @@ pub struct Repo {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoMode {
+    GitCompatible,
+    GitColocated,
+}
+
+impl RepoMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            RepoMode::GitCompatible => "git-compatible",
+            RepoMode::GitColocated => "git-colocated",
+        }
+    }
+}
+
 impl Repo {
     pub fn at(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -69,6 +85,14 @@ impl Repo {
     }
 
     pub fn init(&self) -> Result<()> {
+        self.init_with_mode(RepoMode::GitCompatible)
+    }
+
+    pub fn init_colocated(&self) -> Result<()> {
+        self.init_with_mode(RepoMode::GitColocated)
+    }
+
+    fn init_with_mode(&self, mode: RepoMode) -> Result<()> {
         fs::create_dir_all(self.root.join(SNAPSHOT_DIR))
             .context("failed to create snapshots directory")?;
 
@@ -79,13 +103,18 @@ impl Repo {
         let config = self.root.join(CONFIG_FILE);
         if !config.exists() {
             let contents = [
-                "mode = \"git-compatible\"",
-                "semantic_default = \"typescript\"",
-                "analyzers = [\"typescript\", \"javascript\"]",
+                format!("mode = \"{}\"", mode.as_str()),
+                "semantic_default = \"typescript\"".to_string(),
+                "analyzers = [\"typescript\", \"javascript\"]".to_string(),
             ]
             .join("\n");
             fs::write(&config, format!("{}\n", contents))
                 .with_context(|| format!("failed to write {}", config.display()))?;
+        }
+
+        if mode == RepoMode::GitColocated {
+            self.ensure_git_repository()?;
+            self.ensure_git_exclude_entry(".flock/")?;
         }
 
         Ok(())
@@ -701,13 +730,28 @@ impl Repo {
         let parent_checkpoint_event =
             parent_checkpoint_event.or_else(|| self.latest_checkpoint().map(|event| event.id));
 
+        let git_commit_sha = if self.repo_mode()? == RepoMode::GitColocated {
+            Some(self.commit_checkpoint_to_git(message.as_deref(), &label)?)
+        } else {
+            None
+        };
+
         let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
             label,
-            message,
+            message: message.clone(),
             snapshot_id,
             parent_checkpoint_event,
             snapshot_merkle_root: Some(snapshot_merkle_root),
         }))?;
+
+        if let Some(git_commit_sha) = git_commit_sha {
+            self.append_event(EventKind::GitBridge(GitBridgeEvent {
+                action: GitBridgeAction::Commit,
+                success: true,
+                detail: format!("checkpoint={} git_commit={}", event.id, git_commit_sha),
+            }))?;
+        }
+
         self.advance_main_ref(event.id)?;
         Ok(event)
     }
@@ -998,6 +1042,75 @@ impl Repo {
         fl_bridge_git::run_git(&self.root, args)
     }
 
+    fn ensure_git_repository(&self) -> Result<()> {
+        if self.root.join(".git").is_dir() {
+            return Ok(());
+        }
+
+        self.run_git(&["init"])?;
+        Ok(())
+    }
+
+    fn repo_mode(&self) -> Result<RepoMode> {
+        let config_path = self.root.join(CONFIG_FILE);
+        if !config_path.is_file() {
+            return Ok(RepoMode::GitCompatible);
+        }
+
+        let raw = fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        Ok(parse_repo_mode(&raw))
+    }
+
+    fn commit_checkpoint_to_git(&self, message: Option<&str>, label: &str) -> Result<String> {
+        self.assert_git_initialized()?;
+        self.run_git(&["add", "-A"])?;
+
+        let commit_message = message
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("fl checkpoint {}", label));
+        self.run_git(&[
+            "-c",
+            "user.name=Flock",
+            "-c",
+            "user.email=flock@local",
+            "commit",
+            "--allow-empty",
+            "-m",
+            &commit_message,
+        ])?;
+
+        let commit_sha = self.run_git(&["rev-parse", "HEAD"])?;
+        Ok(commit_sha.trim().to_string())
+    }
+
+    fn ensure_git_exclude_entry(&self, entry: &str) -> Result<()> {
+        let exclude_path = self.root.join(".git").join("info").join("exclude");
+        let existing = fs::read_to_string(&exclude_path).unwrap_or_default();
+        if existing
+            .lines()
+            .map(str::trim)
+            .any(|line| line == entry || line == entry.trim_end_matches('/'))
+        {
+            return Ok(());
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude_path)
+            .with_context(|| format!("failed to open {}", exclude_path.display()))?;
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            file.write_all(b"\n")
+                .with_context(|| format!("failed to write {}", exclude_path.display()))?;
+        }
+        file.write_all(format!("{entry}\n").as_bytes())
+            .with_context(|| format!("failed to write {}", exclude_path.display()))?;
+        Ok(())
+    }
+
     fn event_by_id(&self, event_id: Uuid) -> Result<Event> {
         self.list_events()?
             .into_iter()
@@ -1245,6 +1358,30 @@ fn normalize_ref_name(raw_name: &str) -> Result<String> {
     }
 
     Ok(name.to_string())
+}
+
+fn parse_repo_mode(raw_config: &str) -> RepoMode {
+    for line in raw_config.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "mode" {
+            continue;
+        }
+
+        let value = value.trim().trim_matches('"');
+        return match value {
+            "git-colocated" => RepoMode::GitColocated,
+            _ => RepoMode::GitCompatible,
+        };
+    }
+
+    RepoMode::GitCompatible
 }
 
 fn unix_timestamp_nanos() -> Result<String> {
@@ -1704,6 +1841,52 @@ mod tests {
                 .into_iter()
                 .all(|entry| !(entry.kind == RefKind::Workspace && entry.name == "agent/a"))
         );
+    }
+
+    #[test]
+    fn init_colocated_creates_git_repository() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        assert!(dir.path().join(".git").is_dir());
+        let config = fs::read_to_string(dir.path().join(CONFIG_FILE)).expect("config should read");
+        assert!(config.contains("mode = \"git-colocated\""));
+        let exclude =
+            fs::read_to_string(dir.path().join(".git/info/exclude")).expect("exclude should read");
+        assert!(exclude.lines().any(|line| line.trim() == ".flock/"));
+    }
+
+    #[test]
+    fn colocated_checkpoint_creates_git_commit_and_mapping_event() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = dir.path().join("colocated.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        let checkpoint = repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        let head = repo
+            .run_git(&["rev-parse", "HEAD"])
+            .expect("head should resolve");
+        let head = head.trim().to_string();
+
+        let events = repo.list_events().expect("events should load");
+        let mapping = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                EventKind::GitBridge(bridge) if bridge.action == GitBridgeAction::Commit => {
+                    Some(bridge.detail.clone())
+                }
+                _ => None,
+            })
+            .expect("commit mapping event should exist");
+        assert!(mapping.contains(&checkpoint.id.to_string()));
+        assert!(mapping.contains(&head));
     }
 
     #[test]
