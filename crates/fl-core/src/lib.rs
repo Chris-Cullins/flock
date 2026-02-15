@@ -13,5 +13,5 @@ pub use repo::{
 };
 pub use semantic::{
     SemanticChange, SemanticChangeKind, SemanticCompatibility, SemanticCompatibilityStatus,
-    SemanticFileDiff, SemanticImpact, SemanticRisk,
+    SemanticFileDiff, SemanticImpact, SemanticMergeConflict, SemanticMergeResult, SemanticRisk,
 };

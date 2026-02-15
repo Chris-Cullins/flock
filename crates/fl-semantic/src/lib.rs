@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
@@ -11,6 +11,22 @@ pub struct SemanticFileDiff {
     pub language: String,
     pub parse_fallback: bool,
     pub changes: Vec<SemanticChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticMergeResult {
+    pub path: String,
+    pub language: String,
+    pub parse_fallback: bool,
+    pub merged_source: String,
+    #[serde(default)]
+    pub conflicts: Vec<SemanticMergeConflict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticMergeConflict {
+    pub symbol: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +314,163 @@ pub fn diff(
             compatibility: SemanticCompatibility::default(),
         }],
     }))
+}
+
+pub fn merge(
+    path: &Path,
+    base_source: Option<&[u8]>,
+    left_source: Option<&[u8]>,
+    right_source: Option<&[u8]>,
+) -> Result<Option<SemanticMergeResult>> {
+    let Some(language) = SourceLanguage::from_path(path) else {
+        return Ok(None);
+    };
+
+    let base_source = base_source.unwrap_or_default();
+    let left_source = left_source.unwrap_or_default();
+    let right_source = right_source.unwrap_or_default();
+
+    if left_source == right_source {
+        return Ok(Some(SemanticMergeResult {
+            path: path.to_string_lossy().to_string(),
+            language: language.name().to_string(),
+            parse_fallback: false,
+            merged_source: String::from_utf8_lossy(left_source).to_string(),
+            conflicts: Vec::new(),
+        }));
+    }
+
+    if left_source == base_source {
+        return Ok(Some(SemanticMergeResult {
+            path: path.to_string_lossy().to_string(),
+            language: language.name().to_string(),
+            parse_fallback: false,
+            merged_source: String::from_utf8_lossy(right_source).to_string(),
+            conflicts: Vec::new(),
+        }));
+    }
+
+    if right_source == base_source {
+        return Ok(Some(SemanticMergeResult {
+            path: path.to_string_lossy().to_string(),
+            language: language.name().to_string(),
+            parse_fallback: false,
+            merged_source: String::from_utf8_lossy(left_source).to_string(),
+            conflicts: Vec::new(),
+        }));
+    }
+
+    let left_diff = diff(path, Some(base_source), Some(left_source))?;
+    let right_diff = diff(path, Some(base_source), Some(right_source))?;
+    let parse_fallback =
+        parse_fallback_used(left_diff.as_ref()) || parse_fallback_used(right_diff.as_ref());
+
+    if parse_fallback {
+        let (merged_source, has_text_conflict) = text_merge(base_source, left_source, right_source);
+        let mut conflicts = Vec::new();
+        if has_text_conflict {
+            conflicts.push(SemanticMergeConflict {
+                symbol: "(text-merge)".to_string(),
+                detail: "text fallback produced conflict markers".to_string(),
+            });
+        }
+
+        return Ok(Some(SemanticMergeResult {
+            path: path.to_string_lossy().to_string(),
+            language: language.name().to_string(),
+            parse_fallback: true,
+            merged_source,
+            conflicts,
+        }));
+    }
+
+    let base_map = to_symbol_map(parse_symbols(language, base_source)?);
+    let left_map = to_symbol_map(parse_symbols(language, left_source)?);
+    let right_map = to_symbol_map(parse_symbols(language, right_source)?);
+    let mut conflicts = detect_symbol_conflicts(&base_map, &left_map, &right_map);
+
+    let (mut merged_source, has_text_conflict) = text_merge(base_source, left_source, right_source);
+    if has_text_conflict {
+        if is_style_only(left_diff.as_ref()) && !is_style_only(right_diff.as_ref()) {
+            merged_source = String::from_utf8_lossy(right_source).to_string();
+        } else if is_style_only(right_diff.as_ref()) && !is_style_only(left_diff.as_ref()) {
+            merged_source = String::from_utf8_lossy(left_source).to_string();
+        } else {
+            conflicts.push(SemanticMergeConflict {
+                symbol: "(text-merge)".to_string(),
+                detail: "text merge produced unresolved conflicts".to_string(),
+            });
+        }
+    }
+
+    Ok(Some(SemanticMergeResult {
+        path: path.to_string_lossy().to_string(),
+        language: language.name().to_string(),
+        parse_fallback: false,
+        merged_source,
+        conflicts,
+    }))
+}
+
+fn parse_fallback_used(diff: Option<&SemanticFileDiff>) -> bool {
+    diff.map(|value| value.parse_fallback).unwrap_or(false)
+}
+
+fn is_style_only(diff: Option<&SemanticFileDiff>) -> bool {
+    let Some(diff) = diff else {
+        return false;
+    };
+
+    !diff.parse_fallback
+        && !diff.changes.is_empty()
+        && diff
+            .changes
+            .iter()
+            .all(|change| change.kind == SemanticChangeKind::StyleOnly)
+}
+
+fn text_merge(base_source: &[u8], left_source: &[u8], right_source: &[u8]) -> (String, bool) {
+    match diffy::merge_bytes(base_source, left_source, right_source) {
+        Ok(merged) => (String::from_utf8_lossy(&merged).to_string(), false),
+        Err(conflicted) => (String::from_utf8_lossy(&conflicted).to_string(), true),
+    }
+}
+
+fn detect_symbol_conflicts(
+    base_map: &BTreeMap<String, SymbolInfo>,
+    left_map: &BTreeMap<String, SymbolInfo>,
+    right_map: &BTreeMap<String, SymbolInfo>,
+) -> Vec<SemanticMergeConflict> {
+    let keys: BTreeSet<String> = base_map
+        .keys()
+        .chain(left_map.keys())
+        .chain(right_map.keys())
+        .cloned()
+        .collect();
+
+    let mut conflicts = Vec::new();
+    for key in keys {
+        let base_state = base_map
+            .get(&key)
+            .map(|symbol| (symbol.kind, symbol.body_hash.as_str()));
+        let left_state = left_map
+            .get(&key)
+            .map(|symbol| (symbol.kind, symbol.body_hash.as_str()));
+        let right_state = right_map
+            .get(&key)
+            .map(|symbol| (symbol.kind, symbol.body_hash.as_str()));
+
+        let left_changed = left_state != base_state;
+        let right_changed = right_state != base_state;
+        if left_changed && right_changed && left_state != right_state {
+            conflicts.push(SemanticMergeConflict {
+                symbol: key.clone(),
+                detail: "both sides changed this semantic unit differently".to_string(),
+            });
+        }
+    }
+
+    conflicts
 }
 
 fn base_impact(symbol: &str) -> SemanticImpact {
@@ -610,6 +783,10 @@ fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolIn
         .context("tree-sitter parse returned no tree")?;
 
     let root = tree.root_node();
+    if root.has_error() {
+        bail!("tree-sitter parser reported syntax errors");
+    }
+
     let mut symbols = Vec::new();
     extract_symbols(root, source, None, &mut symbols)?;
 
@@ -1117,5 +1294,65 @@ mod tests {
                 && c.symbol.starts_with("export:")
                 && c.risk == SemanticRisk::High
         }));
+    }
+
+    #[test]
+    fn semantic_merge_combines_disjoint_symbol_changes() {
+        let base = b"function left() {\n  return 1;\n}\n\nfunction right() {\n  return 1;\n}\n";
+        let left = b"function left() {\n  return 2;\n}\n\nfunction right() {\n  return 1;\n}\n";
+        let right = b"function left() {\n  return 1;\n}\n\nfunction right() {\n  return 3;\n}\n";
+
+        let merged = merge(Path::new("merge.ts"), Some(base), Some(left), Some(right))
+            .expect("merge should succeed")
+            .expect("merge result should exist");
+
+        assert!(!merged.parse_fallback);
+        assert!(merged.conflicts.is_empty());
+        assert!(merged.merged_source.contains("return 2;"));
+        assert!(merged.merged_source.contains("return 3;"));
+    }
+
+    #[test]
+    fn semantic_merge_flags_divergent_edits_to_same_symbol() {
+        let base = b"function calculate(amount: number): number { return amount; }\n";
+        let left =
+            b"function calculate(amount: number, currency: string): number { return amount; }\n";
+        let right = b"function calculate(amount: number): number { return amount * 2; }\n";
+
+        let merged = merge(
+            Path::new("conflict.ts"),
+            Some(base),
+            Some(left),
+            Some(right),
+        )
+        .expect("merge should succeed")
+        .expect("merge result should exist");
+
+        assert!(!merged.conflicts.is_empty());
+        assert!(
+            merged
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.symbol == "function:calculate")
+        );
+    }
+
+    #[test]
+    fn semantic_merge_uses_text_fallback_when_parse_fails() {
+        let base = b"function add(a, b) { return a + b; }\n";
+        let left = b"function add(a, b) {\n";
+        let right = b"function add(a, b) { return a - b; }\n";
+
+        let merged = merge(
+            Path::new("fallback.ts"),
+            Some(base),
+            Some(left),
+            Some(right),
+        )
+        .expect("merge should succeed")
+        .expect("merge result should exist");
+
+        assert!(merged.parse_fallback);
+        assert!(!merged.merged_source.is_empty());
     }
 }
