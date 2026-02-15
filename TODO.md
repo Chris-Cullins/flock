@@ -196,3 +196,7 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] M1.3 Improve TS/JS analyzer coverage (arrow functions, interfaces, types)
 - [x] M1.4 Add `fl undo` basic variants on event timeline
 - [x] M1.5 Add basic git-colocated commit/push/pull bridge stubs
+
+## Bugs
+
+- [ ] `fl init --colocated` writes `mode = "git-compatible"` in `.flock/config.toml` instead of `"git-colocated"` — the `--colocated` flag is ignored when writing the config
