@@ -72,6 +72,7 @@ enum ExploreCommand {
 
 #[derive(Debug, Subcommand)]
 enum GitCommand {
+    Status,
     Commit {
         #[arg(short = 'm', long = "message")]
         message: String,
@@ -303,6 +304,29 @@ fn main() -> Result<()> {
         Command::Git { command } => {
             let repo = Repo::discover(cwd)?;
             match command {
+                GitCommand::Status => {
+                    let report = repo.git_shadow_status()?;
+                    println!(
+                        "shadow mode: {} ({})",
+                        report.mode,
+                        if report.clean {
+                            "ok"
+                        } else {
+                            "attention required"
+                        }
+                    );
+                    for check in report.checks {
+                        println!(
+                            "[{}] {}: {}",
+                            if check.ok { "ok" } else { "fail" },
+                            check.name,
+                            check.detail
+                        );
+                        if let Some(recovery) = check.recovery {
+                            println!("  recovery: {}", recovery);
+                        }
+                    }
+                }
                 GitCommand::Commit { message } => {
                     let out = repo.git_commit(message)?;
                     if !out.is_empty() {

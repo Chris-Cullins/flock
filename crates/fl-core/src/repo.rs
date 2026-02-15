@@ -35,6 +35,21 @@ pub struct FsckReport {
     pub ref_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowSafetyReport {
+    pub mode: String,
+    pub clean: bool,
+    pub checks: Vec<ShadowSafetyCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowSafetyCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+    pub recovery: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Repo {
     root: PathBuf,
@@ -658,6 +673,131 @@ impl Repo {
         })
     }
 
+    pub fn git_shadow_status(&self) -> Result<ShadowSafetyReport> {
+        self.assert_initialized()?;
+        self.assert_git_initialized()?;
+
+        let mode = self.repo_mode()?;
+        let mut checks = Vec::new();
+
+        if mode != RepoMode::GitColocated {
+            checks.push(ShadowSafetyCheck {
+                name: "mode".to_string(),
+                ok: true,
+                detail: "repository is not in git-colocated mode; shadow mode checks are inactive"
+                    .to_string(),
+                recovery: Some(
+                    "re-initialize with `fl init --colocated` to enable shadow mode safeguards"
+                        .to_string(),
+                ),
+            });
+            return Ok(ShadowSafetyReport {
+                mode: mode.as_str().to_string(),
+                clean: true,
+                checks,
+            });
+        }
+
+        let exclude_ok = self.git_exclude_has_entry(".flock/")?;
+        checks.push(ShadowSafetyCheck {
+            name: "git exclude".to_string(),
+            ok: exclude_ok,
+            detail: if exclude_ok {
+                "`.flock/` is excluded from git tracking".to_string()
+            } else {
+                "`.flock/` is not excluded in `.git/info/exclude`".to_string()
+            },
+            recovery: (!exclude_ok)
+                .then_some("append `.flock/` to `.git/info/exclude`".to_string()),
+        });
+
+        let worktree_dirty = self.git_has_worktree_changes()?;
+        checks.push(ShadowSafetyCheck {
+            name: "working tree".to_string(),
+            ok: !worktree_dirty,
+            detail: if worktree_dirty {
+                "working tree has pending changes".to_string()
+            } else {
+                "working tree is clean".to_string()
+            },
+            recovery: worktree_dirty.then_some(
+                "commit, stash, or discard local changes before bridge operations".to_string(),
+            ),
+        });
+
+        let checkpoint_count = self.list_checkpoints_with_payload()?.len();
+        if checkpoint_count == 0 {
+            checks.push(ShadowSafetyCheck {
+                name: "head/ref alignment".to_string(),
+                ok: true,
+                detail: "no checkpoints yet; alignment check deferred".to_string(),
+                recovery: Some("create a checkpoint to start ref alignment tracking".to_string()),
+            });
+        } else {
+            let head = self.resolve_git_revision_if_exists("HEAD")?;
+            let flock_main = self.resolve_git_revision_if_exists("refs/flock/branches/main")?;
+
+            match (head.as_deref(), flock_main.as_deref()) {
+                (Some(head), Some(main_ref)) if head == main_ref => checks.push(ShadowSafetyCheck {
+                    name: "head/ref alignment".to_string(),
+                    ok: true,
+                    detail: format!(
+                        "HEAD matches refs/flock/branches/main at {}",
+                        short_sha(head)
+                    ),
+                    recovery: None,
+                }),
+                (Some(head), Some(main_ref)) => checks.push(ShadowSafetyCheck {
+                    name: "head/ref alignment".to_string(),
+                    ok: false,
+                    detail: format!(
+                        "HEAD ({}) diverges from refs/flock/branches/main ({})",
+                        short_sha(head),
+                        short_sha(main_ref)
+                    ),
+                    recovery: Some(
+                        "run `fl git import` to map git commits to checkpoints, then create a new checkpoint if needed"
+                            .to_string(),
+                    ),
+                }),
+                (Some(_), None) => checks.push(ShadowSafetyCheck {
+                    name: "head/ref alignment".to_string(),
+                    ok: false,
+                    detail: "refs/flock/branches/main is missing".to_string(),
+                    recovery: Some(
+                        "run `fl checkpoint -m \"sync\"` to recreate flock main ref mapping"
+                            .to_string(),
+                    ),
+                }),
+                (None, Some(_)) => checks.push(ShadowSafetyCheck {
+                    name: "head/ref alignment".to_string(),
+                    ok: false,
+                    detail: "HEAD commit is missing while refs/flock/branches/main exists".to_string(),
+                    recovery: Some(
+                        "repair git history state, then run `fl git import` to rebuild mappings"
+                            .to_string(),
+                    ),
+                }),
+                (None, None) => checks.push(ShadowSafetyCheck {
+                    name: "head/ref alignment".to_string(),
+                    ok: false,
+                    detail: "both HEAD and refs/flock/branches/main are missing".to_string(),
+                    recovery: Some(
+                        "create a checkpoint (`fl checkpoint -m \"bootstrap\"`) to establish initial mappings"
+                            .to_string(),
+                    ),
+                }),
+            }
+        }
+
+        let clean = checks.iter().all(|check| check.ok);
+        Ok(ShadowSafetyReport {
+            mode: mode.as_str().to_string(),
+            clean,
+            checks,
+        })
+    }
+
     pub fn git_push(&self, remote: Option<String>, branch: Option<String>) -> Result<String> {
         self.run_git_bridge_action(GitBridgeAction::Push, || {
             let remote = self.resolve_git_remote_name(remote.as_deref())?;
@@ -1267,6 +1407,101 @@ impl Repo {
         fl_bridge_git::run_git(&self.root, args)
     }
 
+    fn assert_shadow_mode_safe(&self, action: &GitBridgeAction) -> Result<()> {
+        if self.repo_mode()? != RepoMode::GitColocated {
+            return Ok(());
+        }
+
+        if !self.git_exclude_has_entry(".flock/")? {
+            bail!(
+                "shadow mode safety check failed: `.flock/` is not excluded from git. Recovery: append `.flock/` to `.git/info/exclude`"
+            );
+        }
+
+        if matches!(
+            action,
+            GitBridgeAction::Pull | GitBridgeAction::Import | GitBridgeAction::Export
+        ) && self.git_has_worktree_changes()?
+        {
+            bail!(
+                "shadow mode safety check failed: working tree has uncommitted changes. Recovery: commit, stash, or discard local changes before running `fl git {}`",
+                git_action_name(action)
+            );
+        }
+
+        if matches!(
+            action,
+            GitBridgeAction::Push | GitBridgeAction::Pull | GitBridgeAction::Export
+        ) {
+            self.assert_shadow_main_ref_aligned()?;
+        }
+
+        Ok(())
+    }
+
+    fn assert_shadow_main_ref_aligned(&self) -> Result<()> {
+        let checkpoint_count = self.list_checkpoints_with_payload()?.len();
+        if checkpoint_count == 0 {
+            return Ok(());
+        }
+
+        let head = self.resolve_git_revision_if_exists("HEAD")?.ok_or_else(|| {
+            anyhow!(
+                "shadow mode safety check failed: git HEAD is missing while checkpoints exist. Recovery: restore git history, then run `fl git import`"
+            )
+        })?;
+        let flock_main = self
+            .resolve_git_revision_if_exists("refs/flock/branches/main")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "shadow mode safety check failed: refs/flock/branches/main is missing. Recovery: run `fl checkpoint -m \"sync\"`"
+                )
+            })?;
+
+        if head != flock_main {
+            bail!(
+                "shadow mode safety check failed: git HEAD ({}) diverges from refs/flock/branches/main ({}). Recovery: run `fl git import` to map git commits, then checkpoint if needed",
+                short_sha(&head),
+                short_sha(&flock_main)
+            );
+        }
+
+        Ok(())
+    }
+
+    fn git_exclude_has_entry(&self, entry: &str) -> Result<bool> {
+        let exclude_path = self.root.join(".git").join("info").join("exclude");
+        let raw = fs::read_to_string(&exclude_path).unwrap_or_default();
+        let expected = entry.trim_end_matches('/');
+        Ok(raw.lines().map(str::trim).any(|line| {
+            let normalized = line.trim_end_matches('/');
+            normalized == expected
+        }))
+    }
+
+    fn git_has_worktree_changes(&self) -> Result<bool> {
+        let output = self.run_git(&["status", "--porcelain"])?;
+        Ok(!output.trim().is_empty())
+    }
+
+    fn resolve_git_revision_if_exists(&self, revision: &str) -> Result<Option<String>> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", revision])
+            .current_dir(&self.root)
+            .output()
+            .with_context(|| format!("failed to run git rev-parse for `{revision}`"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if resolved.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(resolved))
+    }
+
     fn run_git_bridge_action<F>(&self, action: GitBridgeAction, operation: F) -> Result<String>
     where
         F: FnOnce() -> Result<String>,
@@ -1274,7 +1509,10 @@ impl Repo {
         self.assert_initialized()?;
         self.assert_git_initialized()?;
 
-        match operation() {
+        match self
+            .assert_shadow_mode_safe(&action)
+            .and_then(|_| operation())
+        {
             Ok(detail) => {
                 self.append_git_bridge_event(action, true, detail.clone())?;
                 Ok(detail)
@@ -1935,6 +2173,16 @@ fn short_sha(sha: &str) -> &str {
     &sha[..end]
 }
 
+fn git_action_name(action: &GitBridgeAction) -> &'static str {
+    match action {
+        GitBridgeAction::Commit => "commit",
+        GitBridgeAction::Push => "push",
+        GitBridgeAction::Pull => "pull",
+        GitBridgeAction::Import => "import",
+        GitBridgeAction::Export => "export",
+    }
+}
+
 fn parse_repo_mode(raw_config: &str) -> RepoMode {
     for line in raw_config.lines().rev() {
         let trimmed = line.trim();
@@ -2585,6 +2833,91 @@ mod tests {
             .run_git(&["rev-parse", &git_ref_name(RefKind::Workspace, "agent/b")])
             .expect("workspace git ref should resolve");
         assert_eq!(mapped.trim(), head);
+    }
+
+    #[test]
+    fn git_shadow_status_reports_head_ref_drift() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = dir.path().join("shadow-drift.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        fs::write(&file, "export const value = 2;").expect("write should succeed");
+        repo.run_git(&["add", "-A"])
+            .expect("git add should succeed");
+        repo.run_git(&[
+            "-c",
+            "user.name=Tester",
+            "-c",
+            "user.email=tester@example.com",
+            "commit",
+            "-m",
+            "manual git commit",
+        ])
+        .expect("manual git commit should succeed");
+
+        let report = repo.git_shadow_status().expect("status should succeed");
+        assert!(!report.clean);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "head/ref alignment" && !check.ok),
+            "expected head/ref alignment failure: {:?}",
+            report.checks
+        );
+    }
+
+    #[test]
+    fn git_push_blocks_when_shadow_mode_is_out_of_sync() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = dir.path().join("shadow-block.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        fs::write(&file, "export const value = 2;").expect("write should succeed");
+        repo.run_git(&["add", "-A"])
+            .expect("git add should succeed");
+        repo.run_git(&[
+            "-c",
+            "user.name=Tester",
+            "-c",
+            "user.email=tester@example.com",
+            "commit",
+            "-m",
+            "manual git commit",
+        ])
+        .expect("manual git commit should succeed");
+
+        let err = repo
+            .git_push(None, None)
+            .expect_err("push should fail shadow mode preflight");
+        assert!(
+            format!("{:#}", err).contains("shadow mode safety check failed"),
+            "unexpected error: {err}"
+        );
+
+        let events = repo.list_events().expect("events should load");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Push,
+                    success: false,
+                    ..
+                })
+            )
+        }));
     }
 
     #[test]
