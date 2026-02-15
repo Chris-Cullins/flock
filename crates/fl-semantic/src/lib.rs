@@ -17,6 +17,7 @@ pub struct SemanticFileDiff {
 pub struct SemanticChange {
     pub kind: SemanticChangeKind,
     pub symbol: String,
+    pub risk: SemanticRisk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,13 @@ pub enum SemanticChangeKind {
     Moved,
     #[serde(alias = "TextOnly")]
     StyleOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SemanticRisk {
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -124,7 +132,8 @@ pub fn diff(
                 (Some(old), Some(new)) if old.body_hash != new.body_hash => {
                     changes.push(SemanticChange {
                         kind: SemanticChangeKind::Modified,
-                        symbol: key,
+                        symbol: key.clone(),
+                        risk: score_risk(SemanticChangeKind::Modified, &key),
                     })
                 }
                 _ => {}
@@ -183,6 +192,7 @@ pub fn diff(
                 changes.push(SemanticChange {
                     kind: relocation_kind(&old_key, key),
                     symbol: format!("{old_key} -> {key}"),
+                    risk: score_relocation_risk(&old_key, key),
                 });
             }
         }
@@ -191,6 +201,7 @@ pub fn diff(
             changes.push(SemanticChange {
                 kind: SemanticChangeKind::Removed,
                 symbol: key.clone(),
+                risk: score_risk(SemanticChangeKind::Removed, key),
             });
         }
 
@@ -198,6 +209,7 @@ pub fn diff(
             changes.push(SemanticChange {
                 kind: SemanticChangeKind::Added,
                 symbol: key.clone(),
+                risk: score_risk(SemanticChangeKind::Added, key),
             });
         }
 
@@ -205,6 +217,7 @@ pub fn diff(
             changes.push(SemanticChange {
                 kind: SemanticChangeKind::StyleOnly,
                 symbol: "(style-only change)".to_string(),
+                risk: SemanticRisk::Low,
             });
         }
 
@@ -223,6 +236,7 @@ pub fn diff(
         changes: vec![SemanticChange {
             kind: SemanticChangeKind::StyleOnly,
             symbol: "(parser fallback)".to_string(),
+            risk: SemanticRisk::High,
         }],
     }))
 }
@@ -237,6 +251,72 @@ fn relocation_kind(old_key: &str, new_key: &str) -> SemanticChangeKind {
         SemanticChangeKind::Moved
     } else {
         SemanticChangeKind::Renamed
+    }
+}
+
+fn score_relocation_risk(old_key: &str, new_key: &str) -> SemanticRisk {
+    let kind = relocation_kind(old_key, new_key);
+    std::cmp::max(score_risk(kind, old_key), score_risk(kind, new_key))
+}
+
+fn score_risk(kind: SemanticChangeKind, symbol: &str) -> SemanticRisk {
+    let symbol_kind = symbol_kind_from_key(symbol);
+    match kind {
+        SemanticChangeKind::StyleOnly => SemanticRisk::Low,
+        SemanticChangeKind::Added => match symbol_kind {
+            Some(
+                SymbolKind::Class
+                | SymbolKind::Interface
+                | SymbolKind::TypeAlias
+                | SymbolKind::Enum
+                | SymbolKind::Export,
+            ) => SemanticRisk::Medium,
+            Some(SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor) => {
+                SemanticRisk::Medium
+            }
+            Some(SymbolKind::Field) => SemanticRisk::Low,
+            None => SemanticRisk::Medium,
+        },
+        SemanticChangeKind::Removed => match symbol_kind {
+            Some(SymbolKind::Field) => SemanticRisk::Medium,
+            Some(_) => SemanticRisk::High,
+            None => SemanticRisk::High,
+        },
+        SemanticChangeKind::Modified => match symbol_kind {
+            Some(
+                SymbolKind::Interface
+                | SymbolKind::TypeAlias
+                | SymbolKind::Enum
+                | SymbolKind::Export,
+            ) => SemanticRisk::High,
+            Some(SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor) => {
+                SemanticRisk::Medium
+            }
+            Some(SymbolKind::Class | SymbolKind::Field) => SemanticRisk::Medium,
+            None => SemanticRisk::Medium,
+        },
+        SemanticChangeKind::Renamed | SemanticChangeKind::Moved => match symbol_kind {
+            Some(SymbolKind::Field) => SemanticRisk::Low,
+            Some(SymbolKind::Export) => SemanticRisk::High,
+            Some(_) => SemanticRisk::Medium,
+            None => SemanticRisk::Medium,
+        },
+    }
+}
+
+fn symbol_kind_from_key(symbol: &str) -> Option<SymbolKind> {
+    let (prefix, _) = symbol.split_once(':')?;
+    match prefix {
+        "function" => Some(SymbolKind::Function),
+        "class" => Some(SymbolKind::Class),
+        "method" => Some(SymbolKind::Method),
+        "constructor" => Some(SymbolKind::Constructor),
+        "field" => Some(SymbolKind::Field),
+        "interface" => Some(SymbolKind::Interface),
+        "type" => Some(SymbolKind::TypeAlias),
+        "enum" => Some(SymbolKind::Enum),
+        "export" => Some(SymbolKind::Export),
+        _ => None,
     }
 }
 
@@ -533,6 +613,11 @@ mod tests {
                 .iter()
                 .any(|c| c.kind == SemanticChangeKind::Modified)
         );
+        assert!(
+            diff.changes.iter().any(|c| {
+                c.kind == SemanticChangeKind::Modified && c.risk == SemanticRisk::Medium
+            })
+        );
     }
 
     #[test]
@@ -627,7 +712,25 @@ mod tests {
             .expect("diff should exist");
 
         assert!(diff.changes.iter().any(|c| {
-            c.kind == SemanticChangeKind::StyleOnly && c.symbol == "(style-only change)"
+            c.kind == SemanticChangeKind::StyleOnly
+                && c.symbol == "(style-only change)"
+                && c.risk == SemanticRisk::Low
+        }));
+    }
+
+    #[test]
+    fn scores_removed_exports_as_high_risk() {
+        let old = b"export { foo } from './a';";
+        let new = b"";
+
+        let diff = diff(Path::new("exports.ts"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| {
+            c.kind == SemanticChangeKind::Removed
+                && c.symbol.starts_with("export:")
+                && c.risk == SemanticRisk::High
         }));
     }
 }

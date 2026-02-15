@@ -3,7 +3,7 @@ use std::env;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fl_core::repo::parse_duration_spec;
-use fl_core::{EventKind, RefKind, Repo, SemanticChangeKind, UndoRequest};
+use fl_core::{EventKind, RefKind, Repo, SemanticChangeKind, SemanticRisk, UndoRequest};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -240,7 +240,12 @@ fn main() -> Result<()> {
                         SemanticChangeKind::Moved => "M",
                         SemanticChangeKind::StyleOnly => "=",
                     };
-                    println!("  {} {}", marker, change.symbol);
+                    let risk = match change.risk {
+                        SemanticRisk::Low => "low",
+                        SemanticRisk::Medium => "medium",
+                        SemanticRisk::High => "high",
+                    };
+                    println!("  {} [{}] {}", marker, risk, change.symbol);
                 }
                 if diff.parse_fallback {
                     println!("  ! parser fallback used");

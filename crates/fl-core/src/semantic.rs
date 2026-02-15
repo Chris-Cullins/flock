@@ -1,3 +1,3 @@
 pub use fl_semantic::{
-    SemanticChange, SemanticChangeKind, SemanticFileDiff, diff, supported_source,
+    SemanticChange, SemanticChangeKind, SemanticFileDiff, SemanticRisk, diff, supported_source,
 };

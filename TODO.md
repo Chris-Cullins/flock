@@ -52,7 +52,7 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [x] Class fields and constructors
 - [x] Add semantic change taxonomy:
   - [x] Added, Removed, Modified, Renamed, Moved, StyleOnly
-- [ ] Add risk scoring (Low/Medium/High)
+- [x] Add risk scoring (Low/Medium/High)
 - [ ] Add impact tracking (affected symbols/files/modules)
 - [ ] Add compatibility checks for signature changes
 - [ ] Implement semantic merge for TS/JS with text fallback
