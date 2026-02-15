@@ -8,8 +8,8 @@ pub use event::{
 };
 pub use fl_storage::{RefKind, RepoRef, WorkspaceRefConfig};
 pub use repo::{
-    ExplorationStatus, ExplorationSummary, FsckReport, ReplayedState, Repo, ShadowSafetyCheck,
-    ShadowSafetyReport, UndoRequest, UndoResult,
+    ExplorationStatus, ExplorationSummary, FsckReport, ImpactReport, ReplayedState, Repo,
+    ReviewStats, ReviewSummary, ShadowSafetyCheck, ShadowSafetyReport, UndoRequest, UndoResult,
 };
 pub use semantic::{
     SemanticChange, SemanticChangeKind, SemanticCompatibility, SemanticCompatibilityStatus,

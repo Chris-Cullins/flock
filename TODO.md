@@ -64,13 +64,13 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## 4. Developer Experience (CLI + Review)
 
-- [ ] Implement `fl diff --intent`
-- [ ] Implement `fl impact <path-or-symbol>`
-- [ ] Implement `fl merge --dry-run --semantic`
-- [ ] Implement semantic review views:
-  - [ ] `fl review <exploration>` summary mode
-  - [ ] `fl review --expand <n>` drill-down mode
-  - [ ] `fl review --full` line diff fallback
+- [x] Implement `fl diff --intent`
+- [x] Implement `fl impact <path-or-symbol>`
+- [x] Implement `fl merge --dry-run --semantic`
+- [x] Implement semantic review views:
+  - [x] `fl review <exploration>` summary mode
+  - [x] `fl review --expand <n>` drill-down mode
+  - [x] `fl review --full` line diff fallback
 - [ ] Add TUI views for exploration trees and task graph
 - [ ] Add shell completion and command help polish
 

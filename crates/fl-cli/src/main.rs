@@ -1,11 +1,12 @@
 use std::env;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fl_core::repo::parse_duration_spec;
 use fl_core::{
-    EventKind, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus, SemanticRisk,
-    UndoRequest,
+    EventKind, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
+    SemanticConflictClassification, SemanticRisk, UndoRequest,
 };
 use uuid::Uuid;
 
@@ -32,7 +33,32 @@ enum Command {
         #[arg(long)]
         semantic: bool,
         #[arg(long)]
+        intent: bool,
+        #[arg(long)]
         json: bool,
+    },
+    Impact {
+        path: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Merge {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        semantic: bool,
+        base: String,
+        left: String,
+        right: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Review {
+        id: String,
+        #[arg(long)]
+        expand: Option<usize>,
+        #[arg(long)]
+        full: bool,
     },
     Explore {
         #[command(subcommand)]
@@ -211,78 +237,321 @@ fn main() -> Result<()> {
                 report.ref_count
             );
         }
-        Command::Diff { semantic, json } => {
-            if !semantic {
-                bail!("only `fl diff --semantic` is implemented in MVP");
+        Command::Diff {
+            semantic,
+            intent,
+            json,
+        } => {
+            if intent {
+                // --intent implies --semantic
+                let repo = Repo::discover(cwd)?;
+                let groups = repo.semantic_diff_with_intents()?;
+                if groups.is_empty() {
+                    if json {
+                        println!("[]");
+                    } else {
+                        println!("No semantic changes since last checkpoint.");
+                    }
+                    return Ok(());
+                }
+
+                if json {
+                    let json_groups: Vec<serde_json::Value> = groups
+                        .iter()
+                        .map(|(intent, files)| {
+                            serde_json::json!({
+                                "intent": intent,
+                                "files": serde_json::to_value(files).unwrap_or_default(),
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&json_groups)?);
+                    return Ok(());
+                }
+
+                for (intent_label, files) in &groups {
+                    let total_changes: usize = files.iter().map(|f| f.changes.len()).sum();
+                    println!(
+                        "## {} ({} file{}, {} change{})",
+                        intent_label,
+                        files.len(),
+                        if files.len() == 1 { "" } else { "s" },
+                        total_changes,
+                        if total_changes == 1 { "" } else { "s" }
+                    );
+                    for diff in files {
+                        println!("  {} [{}]", diff.path, diff.language);
+                        for change in &diff.changes {
+                            let marker = change_marker(change.kind);
+                            let risk = risk_label(change.risk);
+                            println!("    {} [{}] {}", marker, risk, change.symbol);
+                        }
+                    }
+                    println!();
+                }
+            } else {
+                if !semantic {
+                    bail!("only `fl diff --semantic` or `fl diff --intent` is implemented");
+                }
+
+                let repo = Repo::discover(cwd)?;
+                let diffs = repo.semantic_diff_from_latest_checkpoint()?;
+                if diffs.is_empty() {
+                    if json {
+                        println!("[]");
+                    } else {
+                        println!("No semantic changes since last checkpoint.");
+                    }
+                    return Ok(());
+                }
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&diffs)?);
+                    return Ok(());
+                }
+
+                for diff in diffs {
+                    print_semantic_file_diff(&diff);
+                }
+            }
+        }
+        Command::Impact { path, json } => {
+            let repo = Repo::discover(cwd)?;
+            let report = repo.impact_analysis(&path)?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "target": report.target,
+                        "direct_dependents": report.direct_dependents,
+                        "transitive_dependents": report.transitive_dependents,
+                        "symbols": report.symbols,
+                    }))?
+                );
+                return Ok(());
+            }
+
+            println!("Impact analysis: {}", report.target);
+            println!();
+
+            if !report.symbols.is_empty() {
+                println!("Symbols:");
+                for symbol in &report.symbols {
+                    println!("  {}", symbol);
+                }
+                println!();
+            }
+
+            if report.direct_dependents.is_empty() && report.transitive_dependents.is_empty() {
+                println!("No dependents found.");
+            } else {
+                if !report.direct_dependents.is_empty() {
+                    println!(
+                        "Direct dependents ({}):",
+                        report.direct_dependents.len()
+                    );
+                    for dep in &report.direct_dependents {
+                        println!("  {}", dep);
+                    }
+                }
+                if !report.transitive_dependents.is_empty() {
+                    println!(
+                        "Transitive dependents ({}):",
+                        report.transitive_dependents.len()
+                    );
+                    for dep in &report.transitive_dependents {
+                        println!("  {}", dep);
+                    }
+                }
+            }
+        }
+        Command::Merge {
+            dry_run,
+            semantic,
+            base,
+            left,
+            right,
+            json,
+        } => {
+            if !dry_run || !semantic {
+                bail!("`fl merge` currently requires both --dry-run and --semantic flags");
             }
 
             let repo = Repo::discover(cwd)?;
-            let diffs = repo.semantic_diff_from_latest_checkpoint()?;
-            if diffs.is_empty() {
-                if json {
-                    println!("[]");
-                } else {
-                    println!("No semantic changes since last checkpoint.");
-                }
-                return Ok(());
-            }
+            let result = repo.semantic_merge_preview(
+                &PathBuf::from(&base),
+                &PathBuf::from(&left),
+                &PathBuf::from(&right),
+            )?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&diffs)?);
+                println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(());
             }
 
-            for diff in diffs {
-                println!("{} [{}]", diff.path, diff.language);
-                for change in diff.changes {
-                    let marker = match change.kind {
-                        SemanticChangeKind::Added => "+",
-                        SemanticChangeKind::Removed => "-",
-                        SemanticChangeKind::Modified => "~",
-                        SemanticChangeKind::Renamed => "R",
-                        SemanticChangeKind::Moved => "M",
-                        SemanticChangeKind::StyleOnly => "=",
-                    };
-                    let risk = match change.risk {
-                        SemanticRisk::Low => "low",
-                        SemanticRisk::Medium => "medium",
-                        SemanticRisk::High => "high",
-                    };
-                    println!("  {} [{}] {}", marker, risk, change.symbol);
-                    let mut impact_fields = Vec::new();
-                    if !change.impact.symbols.is_empty() {
-                        impact_fields.push(format!("symbols={}", change.impact.symbols.join(", ")));
-                    }
-                    if !change.impact.files.is_empty() {
-                        impact_fields.push(format!("files={}", change.impact.files.join(", ")));
-                    }
-                    if !change.impact.modules.is_empty() {
-                        impact_fields.push(format!("modules={}", change.impact.modules.join(", ")));
-                    }
-                    if !impact_fields.is_empty() {
-                        println!("    impact: {}", impact_fields.join(" | "));
-                    }
-                    if change.compatibility.status != SemanticCompatibilityStatus::Compatible {
-                        let status = match change.compatibility.status {
-                            SemanticCompatibilityStatus::Compatible => "compatible",
-                            SemanticCompatibilityStatus::PotentiallyBreaking => {
-                                "potentially-breaking"
-                            }
-                            SemanticCompatibilityStatus::Breaking => "breaking",
-                        };
-                        if change.compatibility.notes.is_empty() {
-                            println!("    compatibility: {}", status);
-                        } else {
-                            println!(
-                                "    compatibility: {} ({})",
-                                status,
-                                change.compatibility.notes.join("; ")
-                            );
+            println!("Merge preview: {} [{}]", result.path, result.language);
+            if result.parse_fallback {
+                println!("  ! parser fallback used");
+            }
+
+            if result.conflicts.is_empty() {
+                println!("  No conflicts - clean merge");
+            } else {
+                println!(
+                    "  {} conflict{}:",
+                    result.conflicts.len(),
+                    if result.conflicts.len() == 1 { "" } else { "s" }
+                );
+                for conflict in &result.conflicts {
+                    let classification = match conflict.classification {
+                        SemanticConflictClassification::Unclassified => "unclassified",
+                        SemanticConflictClassification::DivergentEdit => "divergent-edit",
+                        SemanticConflictClassification::DeleteVsEdit => "delete-vs-edit",
+                        SemanticConflictClassification::ConcurrentAddition => {
+                            "concurrent-addition"
                         }
+                        SemanticConflictClassification::KindMismatch => "kind-mismatch",
+                        SemanticConflictClassification::TextFallback => "text-fallback",
+                    };
+                    println!("    [{}] {}", classification, conflict.symbol);
+                    if !conflict.explanation.is_empty() {
+                        println!("      {}", conflict.explanation);
                     }
                 }
-                if diff.parse_fallback {
-                    println!("  ! parser fallback used");
+            }
+
+            println!();
+            println!("Merged source ({} bytes):", result.merged_source.len());
+            // Show first 20 lines as preview
+            for (i, line) in result.merged_source.lines().take(20).enumerate() {
+                println!("  {:>3} | {}", i + 1, line);
+            }
+            let line_count = result.merged_source.lines().count();
+            if line_count > 20 {
+                println!("  ... ({} more lines)", line_count - 20);
+            }
+        }
+        Command::Review { id, expand, full } => {
+            let repo = Repo::discover(cwd)?;
+            let exploration_id = parse_uuid(&id)?;
+            let summary = repo.review_exploration(exploration_id)?;
+
+            println!(
+                "Review: {} [{}]",
+                summary.exploration.title, summary.exploration.status
+            );
+            println!("  Exploration: {}", summary.exploration.id);
+            println!(
+                "  Base checkpoint: {}",
+                summary
+                    .exploration
+                    .base_checkpoint_event
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            println!();
+
+            let stats = &summary.stats;
+            println!(
+                "Stats: {} file{} changed, +{} -{} ~{} symbols",
+                stats.files_changed,
+                if stats.files_changed == 1 { "" } else { "s" },
+                stats.symbols_added,
+                stats.symbols_removed,
+                stats.symbols_modified
+            );
+            if stats.high_risk_count > 0 || stats.breaking_count > 0 {
+                println!(
+                    "  {} high-risk, {} breaking",
+                    stats.high_risk_count, stats.breaking_count
+                );
+            }
+            println!();
+
+            if let Some(n) = expand {
+                // Expand mode: show detail for change #n (1-indexed)
+                let mut change_index = 0usize;
+                let mut found = false;
+                for diff in &summary.diffs {
+                    for change in &diff.changes {
+                        change_index += 1;
+                        if change_index == n {
+                            println!(
+                                "Change #{}: {} in {} [{}]",
+                                n, change.symbol, diff.path, diff.language
+                            );
+                            let marker = change_marker(change.kind);
+                            let risk = risk_label(change.risk);
+                            println!("  {} [{}] {}", marker, risk, change.symbol);
+
+                            if !change.impact.symbols.is_empty() {
+                                println!(
+                                    "  Impact symbols: {}",
+                                    change.impact.symbols.join(", ")
+                                );
+                            }
+                            if !change.impact.files.is_empty() {
+                                println!(
+                                    "  Impact files: {}",
+                                    change.impact.files.join(", ")
+                                );
+                            }
+                            if !change.impact.modules.is_empty() {
+                                println!(
+                                    "  Impact modules: {}",
+                                    change.impact.modules.join(", ")
+                                );
+                            }
+                            if change.compatibility.status
+                                != SemanticCompatibilityStatus::Compatible
+                            {
+                                let status = compatibility_label(change.compatibility.status);
+                                println!("  Compatibility: {}", status);
+                                for note in &change.compatibility.notes {
+                                    println!("    {}", note);
+                                }
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                if !found {
+                    bail!(
+                        "change #{} not found (total changes: {})",
+                        n,
+                        change_index
+                    );
+                }
+            } else if full {
+                // Full mode: show complete semantic diff output
+                for diff in &summary.diffs {
+                    print_semantic_file_diff(diff);
+                }
+            } else {
+                // Summary mode: numbered list of changes
+                let mut change_index = 0usize;
+                for diff in &summary.diffs {
+                    println!("{} [{}]", diff.path, diff.language);
+                    for change in &diff.changes {
+                        change_index += 1;
+                        let marker = change_marker(change.kind);
+                        let risk = risk_label(change.risk);
+                        println!(
+                            "  #{:<3} {} [{}] {}",
+                            change_index, marker, risk, change.symbol
+                        );
+                    }
+                }
+                if change_index > 0 {
+                    println!();
+                    println!(
+                        "Use --expand <n> to see detail for a specific change, or --full for complete diff."
+                    );
                 }
             }
         }
@@ -489,6 +758,70 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn change_marker(kind: SemanticChangeKind) -> &'static str {
+    match kind {
+        SemanticChangeKind::Added => "+",
+        SemanticChangeKind::Removed => "-",
+        SemanticChangeKind::Modified => "~",
+        SemanticChangeKind::Renamed => "R",
+        SemanticChangeKind::Moved => "M",
+        SemanticChangeKind::StyleOnly => "=",
+    }
+}
+
+fn risk_label(risk: SemanticRisk) -> &'static str {
+    match risk {
+        SemanticRisk::Low => "low",
+        SemanticRisk::Medium => "medium",
+        SemanticRisk::High => "high",
+    }
+}
+
+fn compatibility_label(status: SemanticCompatibilityStatus) -> &'static str {
+    match status {
+        SemanticCompatibilityStatus::Compatible => "compatible",
+        SemanticCompatibilityStatus::PotentiallyBreaking => "potentially-breaking",
+        SemanticCompatibilityStatus::Breaking => "breaking",
+    }
+}
+
+fn print_semantic_file_diff(diff: &fl_core::SemanticFileDiff) {
+    println!("{} [{}]", diff.path, diff.language);
+    for change in &diff.changes {
+        let marker = change_marker(change.kind);
+        let risk = risk_label(change.risk);
+        println!("  {} [{}] {}", marker, risk, change.symbol);
+        let mut impact_fields = Vec::new();
+        if !change.impact.symbols.is_empty() {
+            impact_fields.push(format!("symbols={}", change.impact.symbols.join(", ")));
+        }
+        if !change.impact.files.is_empty() {
+            impact_fields.push(format!("files={}", change.impact.files.join(", ")));
+        }
+        if !change.impact.modules.is_empty() {
+            impact_fields.push(format!("modules={}", change.impact.modules.join(", ")));
+        }
+        if !impact_fields.is_empty() {
+            println!("    impact: {}", impact_fields.join(" | "));
+        }
+        if change.compatibility.status != SemanticCompatibilityStatus::Compatible {
+            let status = compatibility_label(change.compatibility.status);
+            if change.compatibility.notes.is_empty() {
+                println!("    compatibility: {}", status);
+            } else {
+                println!(
+                    "    compatibility: {} ({})",
+                    status,
+                    change.compatibility.notes.join("; ")
+                );
+            }
+        }
+    }
+    if diff.parse_fallback {
+        println!("  ! parser fallback used");
+    }
 }
 
 fn build_undo_request(

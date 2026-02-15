@@ -19,7 +19,9 @@ use crate::event::{
     CheckpointEvent, Event, EventKind, ExplorationAction, ExplorationEvent, GitBridgeAction,
     GitBridgeEvent, UndoEvent,
 };
-use crate::semantic::{SemanticFileDiff, diff as semantic_diff, supported_source};
+use crate::semantic::{
+    SemanticFileDiff, SemanticMergeResult, diff as semantic_diff, supported_source,
+};
 use fl_workflow::{previous_checkpoint_before, replay_state, resolve_target_event, to_undo_mode};
 
 pub use fl_workflow::parse_duration_spec;
@@ -48,6 +50,30 @@ pub struct ShadowSafetyCheck {
     pub ok: bool,
     pub detail: String,
     pub recovery: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImpactReport {
+    pub target: String,
+    pub direct_dependents: Vec<String>,
+    pub transitive_dependents: Vec<String>,
+    pub symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewStats {
+    pub files_changed: usize,
+    pub symbols_added: usize,
+    pub symbols_removed: usize,
+    pub symbols_modified: usize,
+    pub high_risk_count: usize,
+    pub breaking_count: usize,
+}
+
+pub struct ReviewSummary {
+    pub exploration: ExplorationSummary,
+    pub diffs: Vec<SemanticFileDiff>,
+    pub stats: ReviewStats,
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +477,157 @@ impl Repo {
         enrich_semantic_impacts(self.root(), &current_files, &mut diffs)?;
         diffs.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(diffs)
+    }
+
+    /// Groups semantic changes by inferred intent category.
+    pub fn semantic_diff_with_intents(
+        &self,
+    ) -> Result<Vec<(String, Vec<SemanticFileDiff>)>> {
+        let diffs = self.semantic_diff_from_latest_checkpoint()?;
+        Ok(classify_diffs_by_intent(diffs))
+    }
+
+    /// Computes transitive impact of a file path within the repository.
+    pub fn impact_analysis(&self, path: &str) -> Result<ImpactReport> {
+        self.assert_initialized()?;
+
+        let current_files = collect_source_files(self.root(), true)?;
+        let reverse_dependencies = build_reverse_dependency_index(self.root(), &current_files)?;
+
+        let target_path = PathBuf::from(path);
+        let all_impacted = collect_impacted_files(&target_path, &reverse_dependencies);
+
+        // Separate direct vs transitive dependents
+        let direct: Vec<String> = reverse_dependencies
+            .get(&target_path)
+            .map(|deps| {
+                deps.iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let transitive: Vec<String> = all_impacted
+            .iter()
+            .filter(|p| *p != &target_path)
+            .filter(|p| !direct.contains(&p.to_string_lossy().to_string()))
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        // Collect symbols from the target file if it exists
+        let symbols = self.extract_symbols_for_path(path)?;
+
+        Ok(ImpactReport {
+            target: path.to_string(),
+            direct_dependents: direct,
+            transitive_dependents: transitive,
+            symbols,
+        })
+    }
+
+    /// Previews semantic merge of three file versions without modifying the workspace.
+    pub fn semantic_merge_preview(
+        &self,
+        base_path: &Path,
+        left_path: &Path,
+        right_path: &Path,
+    ) -> Result<SemanticMergeResult> {
+        let base = std::fs::read(base_path)
+            .with_context(|| format!("failed to read base file: {}", base_path.display()))?;
+        let left = std::fs::read(left_path)
+            .with_context(|| format!("failed to read left file: {}", left_path.display()))?;
+        let right = std::fs::read(right_path)
+            .with_context(|| format!("failed to read right file: {}", right_path.display()))?;
+
+        // Use the left path as the representative for language detection
+        let result = fl_semantic::merge(left_path, Some(&base), Some(&left), Some(&right))?;
+        result.ok_or_else(|| {
+            anyhow!(
+                "unsupported file type for semantic merge: {}",
+                left_path.display()
+            )
+        })
+    }
+
+    /// Reviews an exploration by diffing its base checkpoint against current working directory.
+    pub fn review_exploration(&self, id: Uuid) -> Result<ReviewSummary> {
+        self.assert_initialized()?;
+
+        let exploration = self
+            .list_explorations()?
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow!("exploration {} not found", id))?;
+
+        let diffs = if let Some(base_checkpoint_id) = exploration.base_checkpoint_event {
+            let event = self.event_by_id(base_checkpoint_id)?;
+            let EventKind::Checkpoint(payload) = event.kind else {
+                bail!(
+                    "base checkpoint event {} is not a checkpoint",
+                    base_checkpoint_id
+                )
+            };
+            self.diff_snapshot_against_working_dir(payload.snapshot_id)?
+        } else {
+            // No base checkpoint — diff against empty
+            self.semantic_diff_from_latest_checkpoint()?
+        };
+
+        let stats = compute_review_stats(&diffs);
+
+        Ok(ReviewSummary {
+            exploration,
+            diffs,
+            stats,
+        })
+    }
+
+    fn diff_snapshot_against_working_dir(
+        &self,
+        snapshot_id: Uuid,
+    ) -> Result<Vec<SemanticFileDiff>> {
+        let snapshot_root = self.snapshot_path(snapshot_id);
+        let snapshot_files = collect_source_files(&snapshot_root, false)?;
+        let current_files = collect_source_files(self.root(), true)?;
+
+        let mut all_paths: BTreeSet<PathBuf> = snapshot_files;
+        all_paths.extend(current_files.iter().cloned());
+
+        let mut diffs = Vec::new();
+        for rel_path in &all_paths {
+            let before_path = snapshot_root.join(rel_path);
+            let after_path = self.root.join(rel_path);
+
+            let before = fs::read(&before_path).ok();
+            let after = fs::read(&after_path).ok();
+
+            let diff = semantic_diff(rel_path, before.as_deref(), after.as_deref())?;
+            if let Some(diff) = diff {
+                diffs.push(diff);
+            }
+        }
+
+        enrich_semantic_impacts(self.root(), &current_files, &mut diffs)?;
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(diffs)
+    }
+
+    fn extract_symbols_for_path(&self, path: &str) -> Result<Vec<String>> {
+        let file_path = self.root.join(path);
+        if !file_path.is_file() {
+            return Ok(Vec::new());
+        }
+        let rel = PathBuf::from(path);
+        if !supported_source(&rel) {
+            return Ok(Vec::new());
+        }
+        let content = fs::read(&file_path)
+            .with_context(|| format!("failed to read {}", file_path.display()))?;
+        // Diff against empty to get all symbols as "Added"
+        let diff = semantic_diff(&rel, None, Some(&content))?;
+        Ok(diff
+            .map(|d| d.changes.into_iter().map(|c| c.symbol).collect())
+            .unwrap_or_default())
     }
 
     pub fn start_exploration(&self, title: String) -> Result<ExplorationSummary> {
@@ -2476,6 +2653,127 @@ fn current_actor() -> String {
 
 fn fill_random(buffer: &mut [u8]) -> Result<()> {
     getrandom::getrandom(buffer).map_err(|err| anyhow!("failed to generate random bytes: {err}"))
+}
+
+fn classify_diffs_by_intent(
+    diffs: Vec<SemanticFileDiff>,
+) -> Vec<(String, Vec<SemanticFileDiff>)> {
+    let mut groups: HashMap<String, Vec<SemanticFileDiff>> = HashMap::new();
+
+    for diff in diffs {
+        let intent = classify_single_diff_intent(&diff);
+        groups.entry(intent).or_default().push(diff);
+    }
+
+    let order = [
+        "Breaking change",
+        "New feature",
+        "Bug fix",
+        "Refactor",
+        "Removal",
+        "Mixed",
+    ];
+    let mut result = Vec::new();
+    for label in order {
+        if let Some(files) = groups.remove(label) {
+            result.push((label.to_string(), files));
+        }
+    }
+    // Any remaining categories
+    for (label, files) in groups {
+        result.push((label, files));
+    }
+    result
+}
+
+fn classify_single_diff_intent(diff: &SemanticFileDiff) -> String {
+    use crate::semantic::{SemanticChangeKind, SemanticCompatibilityStatus};
+
+    if diff.changes.is_empty() {
+        return "Mixed".to_string();
+    }
+
+    // Check for breaking changes first
+    let has_breaking = diff.changes.iter().any(|c| {
+        matches!(
+            c.compatibility.status,
+            SemanticCompatibilityStatus::Breaking | SemanticCompatibilityStatus::PotentiallyBreaking
+        )
+    });
+    if has_breaking {
+        return "Breaking change".to_string();
+    }
+
+    let all_added = diff
+        .changes
+        .iter()
+        .all(|c| matches!(c.kind, SemanticChangeKind::Added));
+    if all_added {
+        return "New feature".to_string();
+    }
+
+    let all_removed = diff
+        .changes
+        .iter()
+        .all(|c| matches!(c.kind, SemanticChangeKind::Removed));
+    if all_removed {
+        return "Removal".to_string();
+    }
+
+    let all_refactor = diff.changes.iter().all(|c| {
+        matches!(
+            c.kind,
+            SemanticChangeKind::Renamed | SemanticChangeKind::Moved | SemanticChangeKind::StyleOnly
+        )
+    });
+    if all_refactor {
+        return "Refactor".to_string();
+    }
+
+    let all_low_risk_modified = diff.changes.iter().all(|c| {
+        matches!(c.kind, SemanticChangeKind::Modified)
+            && matches!(c.risk, crate::semantic::SemanticRisk::Low)
+    });
+    if all_low_risk_modified {
+        return "Bug fix".to_string();
+    }
+
+    "Mixed".to_string()
+}
+
+fn compute_review_stats(diffs: &[SemanticFileDiff]) -> ReviewStats {
+    use crate::semantic::{SemanticChangeKind, SemanticCompatibilityStatus, SemanticRisk};
+
+    let mut stats = ReviewStats {
+        files_changed: diffs.len(),
+        symbols_added: 0,
+        symbols_removed: 0,
+        symbols_modified: 0,
+        high_risk_count: 0,
+        breaking_count: 0,
+    };
+
+    for diff in diffs {
+        for change in &diff.changes {
+            match change.kind {
+                SemanticChangeKind::Added => stats.symbols_added += 1,
+                SemanticChangeKind::Removed => stats.symbols_removed += 1,
+                _ => stats.symbols_modified += 1,
+            }
+            if matches!(change.risk, SemanticRisk::High) {
+                stats.high_risk_count += 1;
+            }
+            if matches!(
+                change.compatibility.status,
+                SemanticCompatibilityStatus::Breaking
+                    | SemanticCompatibilityStatus::PotentiallyBreaking
+            ) {
+                stats.breaking_count += 1;
+            }
+        }
+    }
+
+    stats
 }
 
 #[cfg(test)]
