@@ -17,9 +17,9 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## 1. Core Storage Engine (Git-Compatible First)
 
-- [ ] Implement append-only event log API with typed events and versioned schema
-- [ ] Add event parent pointers and causal validation
-- [ ] Add event signatures (ed25519)
+- [x] Implement append-only event log API with typed events and versioned schema
+- [x] Add event parent pointers and causal validation
+- [x] Add event signatures (ed25519)
 - [ ] Add event replay and deterministic state reconstruction
 - [ ] Add checkpoints as first-class events (commit-equivalent)
 - [ ] Add undo events:

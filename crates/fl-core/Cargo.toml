@@ -6,10 +6,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+ed25519-dalek.workspace = true
 fl-bridge-git = { path = "../fl-bridge-git" }
 fl-semantic = { path = "../fl-semantic" }
 fl-storage = { path = "../fl-storage" }
 fl-workflow = { path = "../fl-workflow" }
+getrandom.workspace = true
+hex.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 

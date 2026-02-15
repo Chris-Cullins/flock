@@ -5,7 +5,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use fl_storage::{CONFIG_FILE, FLOCK_DIR, SNAPSHOT_DIR};
+use ed25519_dalek::{Signer, SigningKey};
+use fl_storage::{CONFIG_FILE, FLOCK_DIR, KEY_DIR, SIGNING_KEY_FILE, SNAPSHOT_DIR};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -61,6 +62,7 @@ impl Repo {
             .context("failed to create snapshots directory")?;
 
         fl_storage::EventLog::for_root(self.root()).ensure_exists()?;
+        self.ensure_signing_key()?;
 
         let config = self.root.join(CONFIG_FILE);
         if !config.exists() {
@@ -133,30 +135,21 @@ impl Repo {
         self.assert_initialized()?;
 
         let id = Uuid::new_v4();
-        let timestamp = unix_timestamp_nanos()?;
         let base_checkpoint_event = self.latest_checkpoint().map(|event| event.id);
-
-        let event = Event {
-            id: Uuid::new_v4(),
-            timestamp: timestamp.clone(),
-            actor: current_actor(),
-            kind: EventKind::Exploration(ExplorationEvent {
-                exploration_id: id,
-                title: title.clone(),
-                base_checkpoint_event,
-                action: ExplorationAction::Start,
-            }),
-        };
-
-        self.append_event(&event)?;
+        let event = self.append_event(EventKind::Exploration(ExplorationEvent {
+            exploration_id: id,
+            title: title.clone(),
+            base_checkpoint_event,
+            action: ExplorationAction::Start,
+        }))?;
 
         Ok(ExplorationSummary {
             id,
             title,
             status: ExplorationStatus::Active,
             base_checkpoint_event,
-            created_at: timestamp.clone(),
-            updated_at: timestamp,
+            created_at: event.timestamp.clone(),
+            updated_at: event.timestamp,
         })
     }
 
@@ -199,17 +192,12 @@ impl Repo {
             Some(message),
         )?;
 
-        self.append_event(&Event {
-            id: Uuid::new_v4(),
-            timestamp: unix_timestamp_nanos()?,
-            actor: current_actor(),
-            kind: EventKind::Exploration(ExplorationEvent {
-                exploration_id: id,
-                title: existing.title.clone(),
-                base_checkpoint_event: existing.base_checkpoint_event,
-                action: ExplorationAction::Promote,
-            }),
-        })?;
+        self.append_event(EventKind::Exploration(ExplorationEvent {
+            exploration_id: id,
+            title: existing.title.clone(),
+            base_checkpoint_event: existing.base_checkpoint_event,
+            action: ExplorationAction::Promote,
+        }))?;
 
         self.list_explorations()?
             .into_iter()
@@ -234,17 +222,12 @@ impl Repo {
             );
         }
 
-        self.append_event(&Event {
-            id: Uuid::new_v4(),
-            timestamp: unix_timestamp_nanos()?,
-            actor: current_actor(),
-            kind: EventKind::Exploration(ExplorationEvent {
-                exploration_id: id,
-                title: existing.title.clone(),
-                base_checkpoint_event: existing.base_checkpoint_event,
-                action: ExplorationAction::Abandon,
-            }),
-        })?;
+        self.append_event(EventKind::Exploration(ExplorationEvent {
+            exploration_id: id,
+            title: existing.title.clone(),
+            base_checkpoint_event: existing.base_checkpoint_event,
+            action: ExplorationAction::Abandon,
+        }))?;
 
         self.list_explorations()?
             .into_iter()
@@ -286,16 +269,11 @@ impl Repo {
             restored_checkpoint_event = Some(checkpoint_event.id);
         }
 
-        self.append_event(&Event {
-            id: Uuid::new_v4(),
-            timestamp: unix_timestamp_nanos()?,
-            actor: current_actor(),
-            kind: EventKind::Undo(UndoEvent {
-                target_event_id: target.id,
-                mode,
-                restored_checkpoint_event,
-            }),
-        })?;
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id: target.id,
+            mode,
+            restored_checkpoint_event,
+        }))?;
 
         Ok(UndoResult {
             target_event_id: target.id,
@@ -310,16 +288,11 @@ impl Repo {
         self.run_git(&["add", "-A"])?;
         let detail = self.run_git(&["commit", "-m", &message])?;
 
-        self.append_event(&Event {
-            id: Uuid::new_v4(),
-            timestamp: unix_timestamp_nanos()?,
-            actor: current_actor(),
-            kind: EventKind::GitBridge(GitBridgeEvent {
-                action: GitBridgeAction::Commit,
-                success: true,
-                detail: detail.clone(),
-            }),
-        })?;
+        self.append_event(EventKind::GitBridge(GitBridgeEvent {
+            action: GitBridgeAction::Commit,
+            success: true,
+            detail: detail.clone(),
+        }))?;
 
         Ok(detail)
     }
@@ -339,16 +312,11 @@ impl Repo {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let detail = self.run_git(&arg_refs)?;
 
-        self.append_event(&Event {
-            id: Uuid::new_v4(),
-            timestamp: unix_timestamp_nanos()?,
-            actor: current_actor(),
-            kind: EventKind::GitBridge(GitBridgeEvent {
-                action: GitBridgeAction::Push,
-                success: true,
-                detail: detail.clone(),
-            }),
-        })?;
+        self.append_event(EventKind::GitBridge(GitBridgeEvent {
+            action: GitBridgeAction::Push,
+            success: true,
+            detail: detail.clone(),
+        }))?;
 
         Ok(detail)
     }
@@ -368,16 +336,11 @@ impl Repo {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let detail = self.run_git(&arg_refs)?;
 
-        self.append_event(&Event {
-            id: Uuid::new_v4(),
-            timestamp: unix_timestamp_nanos()?,
-            actor: current_actor(),
-            kind: EventKind::GitBridge(GitBridgeEvent {
-                action: GitBridgeAction::Pull,
-                success: true,
-                detail: detail.clone(),
-            }),
-        })?;
+        self.append_event(EventKind::GitBridge(GitBridgeEvent {
+            action: GitBridgeAction::Pull,
+            success: true,
+            detail: detail.clone(),
+        }))?;
 
         Ok(detail)
     }
@@ -398,18 +361,11 @@ impl Repo {
 
         self.copy_workspace_to_snapshot(&snapshot_path)?;
 
-        let event = Event {
-            id: Uuid::new_v4(),
-            timestamp: unix_timestamp_nanos()?,
-            actor: current_actor(),
-            kind: EventKind::Checkpoint(CheckpointEvent {
-                label,
-                message,
-                snapshot_id,
-            }),
-        };
-
-        self.append_event(&event)?;
+        let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
+            label,
+            message,
+            snapshot_id,
+        }))?;
         Ok(event)
     }
 
@@ -514,8 +470,25 @@ impl Repo {
         Ok(())
     }
 
-    fn append_event(&self, event: &Event) -> Result<()> {
-        fl_storage::EventLog::for_root(self.root()).append(event)
+    fn append_event(&self, kind: EventKind) -> Result<Event> {
+        self.ensure_signing_key()?;
+
+        let mut event = Event {
+            id: Uuid::new_v4(),
+            timestamp: unix_timestamp_nanos()?,
+            actor: current_actor(),
+            parent_id: self.latest_event_id()?,
+            signer_public_key: None,
+            signature: None,
+            kind,
+        };
+        self.sign_event(&mut event)?;
+        fl_storage::EventLog::for_root(self.root()).append(&event)?;
+        Ok(event)
+    }
+
+    fn latest_event_id(&self) -> Result<Option<Uuid>> {
+        Ok(self.list_events()?.last().map(|event| event.id))
     }
 
     fn latest_checkpoint(&self) -> Option<Event> {
@@ -575,6 +548,43 @@ impl Repo {
 
     fn run_git(&self, args: &[&str]) -> Result<String> {
         fl_bridge_git::run_git(&self.root, args)
+    }
+
+    fn ensure_signing_key(&self) -> Result<()> {
+        let key_dir = self.root.join(KEY_DIR);
+        fs::create_dir_all(&key_dir)
+            .with_context(|| format!("failed to create key directory {}", key_dir.display()))?;
+
+        let key_path = self.root.join(SIGNING_KEY_FILE);
+        if key_path.exists() {
+            return Ok(());
+        }
+
+        let mut secret = [0u8; 32];
+        fill_random(&mut secret)?;
+        let encoded = format!("{}\n", hex::encode(secret));
+        fs::write(&key_path, encoded)
+            .with_context(|| format!("failed to write signing key {}", key_path.display()))
+    }
+
+    fn sign_event(&self, event: &mut Event) -> Result<()> {
+        let signing_key = self.load_signing_key()?;
+        let payload = fl_storage::event_signing_payload(event)?;
+        let signature = signing_key.sign(&payload);
+        event.signer_public_key = Some(hex::encode(signing_key.verifying_key().to_bytes()));
+        event.signature = Some(hex::encode(signature.to_bytes()));
+        Ok(())
+    }
+
+    fn load_signing_key(&self) -> Result<SigningKey> {
+        let key_path = self.root.join(SIGNING_KEY_FILE);
+        let encoded = fs::read_to_string(&key_path)
+            .with_context(|| format!("failed to read signing key {}", key_path.display()))?;
+        let raw = hex::decode(encoded.trim())
+            .with_context(|| format!("invalid signing key encoding in {}", key_path.display()))?;
+        let secret = <[u8; 32]>::try_from(raw.as_slice())
+            .with_context(|| format!("invalid signing key length in {}", key_path.display()))?;
+        Ok(SigningKey::from_bytes(&secret))
     }
 }
 
@@ -652,6 +662,10 @@ fn current_actor() -> String {
     env::var("USER").unwrap_or_else(|_| "unknown".to_string())
 }
 
+fn fill_random(buffer: &mut [u8]) -> Result<()> {
+    getrandom::getrandom(buffer).map_err(|err| anyhow!("failed to generate random bytes: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -705,6 +719,27 @@ mod tests {
     }
 
     #[test]
+    fn events_are_linked_by_parent_pointers() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        repo.start_exploration("causal-chain".to_string())
+            .expect("exploration should start");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint should succeed");
+
+        let events = repo.list_events().expect("list events should succeed");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].parent_id, None);
+        assert_eq!(events[1].parent_id, Some(events[0].id));
+        assert!(events[0].signer_public_key.is_some());
+        assert!(events[0].signature.is_some());
+        assert!(events[1].signer_public_key.is_some());
+        assert!(events[1].signature.is_some());
+    }
+
+    #[test]
     fn undo_last_checkpoint_restores_previous_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let repo = Repo::at(dir.path());
@@ -730,5 +765,14 @@ mod tests {
         assert_eq!(parse_duration_spec("5m").expect("duration").as_secs(), 300);
         assert_eq!(parse_duration_spec("30").expect("duration").as_secs(), 30);
         assert!(parse_duration_spec("1w").is_err());
+    }
+
+    #[test]
+    fn init_creates_signing_key_file() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        assert!(dir.path().join(SIGNING_KEY_FILE).is_file());
     }
 }
