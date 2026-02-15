@@ -217,6 +217,8 @@ dependencies = [
  "anyhow",
  "clap",
  "fl-core",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

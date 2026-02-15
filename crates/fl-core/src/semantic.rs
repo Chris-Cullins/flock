@@ -32,6 +32,12 @@ enum SymbolKind {
     Function,
     Class,
     Method,
+    Constructor,
+    Field,
+    Interface,
+    TypeAlias,
+    Enum,
+    Export,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +160,12 @@ fn to_symbol_map(symbols: Vec<SymbolInfo>) -> BTreeMap<String, SymbolInfo> {
             SymbolKind::Function => "function",
             SymbolKind::Class => "class",
             SymbolKind::Method => "method",
+            SymbolKind::Constructor => "constructor",
+            SymbolKind::Field => "field",
+            SymbolKind::Interface => "interface",
+            SymbolKind::TypeAlias => "type",
+            SymbolKind::Enum => "enum",
+            SymbolKind::Export => "export",
         };
 
         let key = format!("{}:{}", prefix, symbol.name);
@@ -211,6 +223,19 @@ fn extract_symbols(
                 });
             }
         }
+        "variable_declarator" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                if matches!(value.kind(), "arrow_function" | "function_expression") {
+                    if let Some(name) = symbol_name(node, source) {
+                        symbols.push(SymbolInfo {
+                            kind: SymbolKind::Function,
+                            name,
+                            body_hash: node_hash(node, source)?,
+                        });
+                    }
+                }
+            }
+        }
         "class_declaration" => {
             if let Some(class_name) = symbol_name(node, source) {
                 symbols.push(SymbolInfo {
@@ -228,14 +253,75 @@ fn extract_symbols(
         }
         "method_definition" => {
             if let Some(method_name) = symbol_name(node, source) {
-                let scoped_name = match enclosing_class {
-                    Some(class_name) => format!("{}.{}", class_name, method_name),
-                    None => method_name,
-                };
+                if method_name == "constructor" {
+                    let scoped_name = match enclosing_class {
+                        Some(class_name) => format!("{}.constructor", class_name),
+                        None => "constructor".to_string(),
+                    };
+                    symbols.push(SymbolInfo {
+                        kind: SymbolKind::Constructor,
+                        name: scoped_name,
+                        body_hash: node_hash(node, source)?,
+                    });
+                } else {
+                    let scoped_name = match enclosing_class {
+                        Some(class_name) => format!("{}.{}", class_name, method_name),
+                        None => method_name,
+                    };
 
+                    symbols.push(SymbolInfo {
+                        kind: SymbolKind::Method,
+                        name: scoped_name,
+                        body_hash: node_hash(node, source)?,
+                    });
+                }
+            }
+        }
+        "public_field_definition" | "field_definition" => {
+            if let Some(field_name) = symbol_name(node, source) {
+                let scoped_name = match enclosing_class {
+                    Some(class_name) => format!("{}.{}", class_name, field_name),
+                    None => field_name,
+                };
                 symbols.push(SymbolInfo {
-                    kind: SymbolKind::Method,
+                    kind: SymbolKind::Field,
                     name: scoped_name,
+                    body_hash: node_hash(node, source)?,
+                });
+            }
+        }
+        "interface_declaration" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Interface,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                });
+            }
+        }
+        "type_alias_declaration" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::TypeAlias,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                });
+            }
+        }
+        "enum_declaration" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Enum,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                });
+            }
+        }
+        "export_statement" => {
+            if let Some(name) = export_symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Export,
+                    name,
                     body_hash: node_hash(node, source)?,
                 });
             }
@@ -259,6 +345,40 @@ fn symbol_name(node: Node, source: &[u8]) -> Option<String> {
         .filter(|value| !value.is_empty())?;
 
     Some(name.to_string())
+}
+
+fn export_symbol_name(node: Node, source: &[u8]) -> Option<String> {
+    if let Some(declaration) = node.child_by_field_name("declaration") {
+        if let Some(name) = symbol_name(declaration, source) {
+            return Some(format!("declaration:{}", name));
+        }
+        return Some(format!("declaration:{}", compact_text(declaration, source)));
+    }
+
+    if let Some(value) = node.child_by_field_name("value") {
+        return Some(format!("value:{}", compact_text(value, source)));
+    }
+
+    if let Some(source_node) = node.child_by_field_name("source") {
+        let src = compact_text(source_node, source);
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "export_clause" || child.kind() == "namespace_export" {
+                let clause = compact_text(child, source);
+                return Some(format!("{} from {}", clause, src));
+            }
+        }
+
+        return Some(format!("from {}", src));
+    }
+
+    Some(compact_text(node, source))
+}
+
+fn compact_text(node: Node, source: &[u8]) -> String {
+    let raw = node.utf8_text(source).unwrap_or_default();
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn node_hash(node: Node, source: &[u8]) -> Result<String> {
@@ -302,5 +422,43 @@ mod tests {
                 .iter()
                 .any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "method:A.y")
         );
+    }
+
+    #[test]
+    fn detects_arrow_function_and_type_nodes() {
+        let old = b"const add = (a, b) => a + b;";
+        let new = b"const add = (a, b) => a + b; interface User { id: string }; type Id = string; enum Kind { A, B }";
+
+        let diff = diff(Path::new("symbols.ts"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "interface:User")
+        );
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "type:Id")
+        );
+        assert!(
+            diff.changes
+                .iter()
+                .any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "enum:Kind")
+        );
+    }
+
+    #[test]
+    fn detects_re_export_changes() {
+        let old = b"export { foo } from './a';";
+        let new = b"export { foo, bar } from './a';";
+
+        let diff = diff(Path::new("reexport.ts"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| c.symbol.starts_with("export:")));
     }
 }

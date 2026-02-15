@@ -23,10 +23,10 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [ ] Add event replay and deterministic state reconstruction
 - [ ] Add checkpoints as first-class events (commit-equivalent)
 - [ ] Add undo events:
-  - [ ] `undo last`
-  - [ ] `undo --n`
-  - [ ] `undo --to`
-  - [ ] `undo --since`
+  - [x] `undo last`
+  - [x] `undo --n`
+  - [x] `undo --to`
+  - [x] `undo --since`
 - [ ] Add file-scoped undo semantics in colocated mode (best-effort fallback)
 - [ ] Add repository refs abstraction (branches/tags/workspaces)
 - [ ] Add Merkle snapshot hash generation for checkpoints
@@ -45,11 +45,11 @@ This file tracks the full build-out from current scaffold to the complete archit
 ## 3. Semantic Layer (TS/JS First)
 
 - [ ] Expand TS/JS symbol extraction beyond declarations:
-  - [ ] Arrow functions assigned to const/let
-  - [ ] Function expressions
-  - [ ] Exported declarations and re-exports
-  - [ ] Interfaces, type aliases, enums
-  - [ ] Class fields and constructors
+  - [x] Arrow functions assigned to const/let
+  - [x] Function expressions
+  - [x] Exported declarations and re-exports
+  - [x] Interfaces, type aliases, enums
+  - [x] Class fields and constructors
 - [ ] Add semantic change taxonomy:
   - [ ] Added, Removed, Modified, Renamed, Moved, StyleOnly
 - [ ] Add risk scoring (Low/Medium/High)
@@ -57,7 +57,7 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [ ] Add compatibility checks for signature changes
 - [ ] Implement semantic merge for TS/JS with text fallback
 - [ ] Implement semantic conflict classification and explanation
-- [ ] Add machine-readable semantic diff output (`--json`)
+- [x] Add machine-readable semantic diff output (`--json`)
 - [ ] Add plugin trait/API for additional analyzers
 - [ ] Add analyzer process boundary (FFI or gRPC) and lifecycle management
 - [ ] Add first non-TS/JS fallback analyzer contract tests
@@ -78,11 +78,11 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 - [ ] Implement exploration model with lifecycle states
 - [ ] Add exploration commands:
-  - [ ] `fl explore start`
-  - [ ] `fl explore list`
+  - [x] `fl explore start`
+  - [x] `fl explore list`
   - [ ] `fl explore compare`
-  - [ ] `fl explore promote`
-  - [ ] `fl explore abandon`
+  - [x] `fl explore promote`
+  - [x] `fl explore abandon`
 - [ ] Add TTL and background pruning for abandoned/expired explorations
 - [ ] Add workspace isolation model (base snapshot + overlay events)
 - [ ] Add workspace resource limits and policy enforcement
@@ -191,8 +191,8 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## Immediate Next Milestone (Suggested)
 
-- [ ] M1.1 Add `fl explore start/list/promote/abandon`
-- [ ] M1.2 Add semantic diff JSON output
-- [ ] M1.3 Improve TS/JS analyzer coverage (arrow functions, interfaces, types)
-- [ ] M1.4 Add `fl undo` basic variants on event timeline
-- [ ] M1.5 Add basic git-colocated commit/push/pull bridge stubs
+- [x] M1.1 Add `fl explore start/list/promote/abandon`
+- [x] M1.2 Add semantic diff JSON output
+- [x] M1.3 Improve TS/JS analyzer coverage (arrow functions, interfaces, types)
+- [x] M1.4 Add `fl undo` basic variants on event timeline
+- [x] M1.5 Add basic git-colocated commit/push/pull bridge stubs
