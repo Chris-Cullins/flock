@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -82,6 +82,8 @@ pub enum GitBridgeAction {
     Commit,
     Push,
     Pull,
+    Import,
+    Export,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

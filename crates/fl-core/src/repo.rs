@@ -1,8 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -701,8 +702,185 @@ impl Repo {
         })
     }
 
+    pub fn git_import(&self, git_ref: Option<String>) -> Result<String> {
+        self.run_git_bridge_action(GitBridgeAction::Import, || {
+            let git_ref = git_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("HEAD")
+                .to_string();
+
+            let output = self
+                .run_git(&["rev-list", "--reverse", &git_ref])
+                .with_context(|| format!("failed to enumerate commits for `{git_ref}`"))?;
+            let commits: Vec<String> = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+
+            if commits.is_empty() {
+                bail!("no commits found for git ref `{git_ref}`");
+            }
+
+            let mut known_commits = self.known_git_commit_mappings()?;
+            let mut parent_checkpoint = self.latest_checkpoint().map(|event| event.id);
+            let mut imported = Vec::new();
+
+            for commit in commits {
+                if known_commits.contains(&commit) {
+                    continue;
+                }
+
+                let subject = self.run_git(&["show", "-s", "--format=%s", &commit])?;
+                let message = self.run_git(&["show", "-s", "--format=%B", &commit])?;
+                let label = normalize_label(subject.trim());
+                let label = if label.is_empty() {
+                    format!("git-import-{}", short_sha(&commit))
+                } else {
+                    label
+                };
+                let message = if message.trim().is_empty() {
+                    Some(format!("git import {}", commit))
+                } else {
+                    Some(message.trim().to_string())
+                };
+
+                let event = self.create_checkpoint_from_git_commit(
+                    &commit,
+                    label,
+                    message,
+                    parent_checkpoint,
+                )?;
+                parent_checkpoint = Some(event.id);
+                known_commits.insert(commit.clone());
+                imported.push((commit, event.id));
+            }
+
+            if imported.is_empty() {
+                return Ok(format!(
+                    "import {git_ref}: no new commits (all commits are already mapped)"
+                ));
+            }
+
+            let mut details = Vec::new();
+            details.push(format!(
+                "import {git_ref}: imported {} commits",
+                imported.len()
+            ));
+            details.extend(imported.iter().map(|(commit, checkpoint)| {
+                format!("git_commit={commit} checkpoint={checkpoint}")
+            }));
+            Ok(join_non_empty_lines(details))
+        })
+    }
+
+    pub fn git_export(&self, branch: Option<String>) -> Result<String> {
+        self.run_git_bridge_action(GitBridgeAction::Export, || {
+            let branch = branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("flock/export")
+                .to_string();
+            let checkpoints = self.list_checkpoints_with_payload()?;
+            if checkpoints.is_empty() {
+                bail!("no checkpoints available to export");
+            }
+
+            let temp_repo =
+                tempfile::tempdir().context("failed to create temporary git export repository")?;
+            fl_bridge_git::run_git(temp_repo.path(), &["init"])
+                .context("failed to initialize temporary git repository for export")?;
+
+            let mut mapping = Vec::new();
+            for (event, checkpoint) in &checkpoints {
+                clear_directory_except(temp_repo.path(), &[".git"])?;
+                let snapshot_root = self.snapshot_path(checkpoint.snapshot_id);
+                copy_tree(snapshot_root.as_path(), temp_repo.path(), false)?;
+
+                fl_bridge_git::run_git(temp_repo.path(), &["add", "-A"])
+                    .context("failed to stage exported checkpoint contents")?;
+                let message = checkpoint
+                    .message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&checkpoint.label);
+                fl_bridge_git::run_git(
+                    temp_repo.path(),
+                    &[
+                        "-c",
+                        "user.name=Flock",
+                        "-c",
+                        "user.email=flock@local",
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        message,
+                    ],
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to commit exported checkpoint {} in temporary git repository",
+                        event.id
+                    )
+                })?;
+
+                let sha = fl_bridge_git::run_git(temp_repo.path(), &["rev-parse", "HEAD"])
+                    .context("failed to resolve exported commit sha")?;
+                mapping.push((event.id, sha.trim().to_string()));
+            }
+
+            let source = temp_repo.path().to_string_lossy().to_string();
+            let refspec = format!("+HEAD:refs/heads/{branch}");
+            let fetch = self
+                .run_git(&["fetch", &source, &refspec])
+                .with_context(|| format!("failed to import exported history into `{branch}`"))?;
+
+            let mut details = Vec::new();
+            details.push(format!(
+                "exported {} checkpoints to refs/heads/{}",
+                mapping.len(),
+                branch
+            ));
+            if !fetch.trim().is_empty() {
+                details.push(fetch);
+            }
+            details.extend(mapping.iter().map(|(checkpoint, commit)| {
+                format!("checkpoint={checkpoint} git_commit={commit}")
+            }));
+            Ok(join_non_empty_lines(details))
+        })
+    }
+
     fn create_checkpoint_with_lineage(
         &self,
+        label: String,
+        message: Option<String>,
+        parent_checkpoint_event: Option<Uuid>,
+    ) -> Result<Event> {
+        let git_commit_mapping = if self.repo_mode()? == RepoMode::GitColocated {
+            Some(self.commit_checkpoint_to_git(message.as_deref(), &label)?)
+        } else {
+            None
+        };
+
+        self.create_checkpoint_from_source_with_lineage(
+            &self.root,
+            true,
+            label,
+            message,
+            parent_checkpoint_event,
+            git_commit_mapping,
+        )
+    }
+
+    fn create_checkpoint_from_git_commit(
+        &self,
+        git_commit: &str,
         label: String,
         message: Option<String>,
         parent_checkpoint_event: Option<Uuid>,
@@ -715,19 +893,58 @@ impl Repo {
                 snapshot_path.display()
             )
         })?;
+        self.extract_git_commit_tree_to_directory(git_commit, &snapshot_path)?;
 
-        self.copy_workspace_to_snapshot(&snapshot_path)?;
+        self.create_checkpoint_from_existing_snapshot_with_lineage(
+            snapshot_id,
+            label,
+            message,
+            parent_checkpoint_event,
+            Some(git_commit.to_string()),
+        )
+    }
+
+    fn create_checkpoint_from_source_with_lineage(
+        &self,
+        source_root: &Path,
+        apply_skip: bool,
+        label: String,
+        message: Option<String>,
+        parent_checkpoint_event: Option<Uuid>,
+        git_commit_mapping: Option<String>,
+    ) -> Result<Event> {
+        let snapshot_id = Uuid::new_v4();
+        let snapshot_path = self.snapshot_path(snapshot_id);
+        fs::create_dir_all(&snapshot_path).with_context(|| {
+            format!(
+                "failed to create snapshot directory {}",
+                snapshot_path.display()
+            )
+        })?;
+
+        copy_tree(source_root, &snapshot_path, apply_skip)?;
+
+        self.create_checkpoint_from_existing_snapshot_with_lineage(
+            snapshot_id,
+            label,
+            message,
+            parent_checkpoint_event,
+            git_commit_mapping,
+        )
+    }
+
+    fn create_checkpoint_from_existing_snapshot_with_lineage(
+        &self,
+        snapshot_id: Uuid,
+        label: String,
+        message: Option<String>,
+        parent_checkpoint_event: Option<Uuid>,
+        git_commit_mapping: Option<String>,
+    ) -> Result<Event> {
+        let snapshot_path = self.snapshot_path(snapshot_id);
         let snapshot_merkle_root = compute_snapshot_merkle_root(&snapshot_path)?;
-
         let parent_checkpoint_event =
             parent_checkpoint_event.or_else(|| self.latest_checkpoint().map(|event| event.id));
-
-        let git_commit_sha = if self.repo_mode()? == RepoMode::GitColocated {
-            Some(self.commit_checkpoint_to_git(message.as_deref(), &label)?)
-        } else {
-            None
-        };
-
         let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
             label,
             message: message.clone(),
@@ -736,7 +953,7 @@ impl Repo {
             snapshot_merkle_root: Some(snapshot_merkle_root),
         }))?;
 
-        if let Some(git_commit_sha) = git_commit_sha {
+        if let Some(git_commit_sha) = git_commit_mapping {
             self.append_event(EventKind::GitBridge(GitBridgeEvent {
                 action: GitBridgeAction::Commit,
                 success: true,
@@ -746,6 +963,37 @@ impl Repo {
 
         self.advance_main_ref(event.id)?;
         Ok(event)
+    }
+
+    fn extract_git_commit_tree_to_directory(
+        &self,
+        git_commit: &str,
+        destination: &Path,
+    ) -> Result<()> {
+        let output = Command::new("git")
+            .args(["archive", "--format=tar", git_commit])
+            .current_dir(&self.root)
+            .output()
+            .with_context(|| format!("failed to run git archive for commit `{git_commit}`"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            bail!(
+                "git archive failed for commit `{}`: {}",
+                git_commit,
+                if stderr.is_empty() {
+                    "(no output)"
+                } else {
+                    stderr.as_str()
+                }
+            );
+        }
+
+        let cursor = Cursor::new(output.stdout);
+        let mut archive = tar::Archive::new(cursor);
+        archive
+            .unpack(destination)
+            .with_context(|| format!("failed to extract git archive for `{git_commit}`"))?;
+        Ok(())
     }
 
     fn restore_workspace_from_snapshot(&self, snapshot_id: Uuid) -> Result<()> {
@@ -942,47 +1190,32 @@ impl Repo {
         events.into_iter().find(|event| event.id == checkpoint_id)
     }
 
-    fn copy_workspace_to_snapshot(&self, snapshot_root: &Path) -> Result<()> {
-        let walker = WalkDir::new(&self.root)
-            .into_iter()
-            .filter_entry(|entry| !should_skip_path(&self.root, entry.path()));
+    fn list_checkpoints_with_payload(&self) -> Result<Vec<(Event, CheckpointEvent)>> {
+        let mut checkpoints = Vec::new();
+        for event in self.list_events()? {
+            let EventKind::Checkpoint(payload) = event.kind.clone() else {
+                continue;
+            };
+            checkpoints.push((event, payload));
+        }
+        Ok(checkpoints)
+    }
 
-        for entry in walker {
-            let entry = entry.context("failed while walking repository")?;
-            let path = entry.path();
-
-            if path == self.root {
+    fn known_git_commit_mappings(&self) -> Result<BTreeSet<String>> {
+        let mut commits = BTreeSet::new();
+        for event in self.list_events()? {
+            let EventKind::GitBridge(bridge) = event.kind else {
+                continue;
+            };
+            if bridge.action != GitBridgeAction::Commit || !bridge.success {
                 continue;
             }
 
-            let rel = path
-                .strip_prefix(&self.root)
-                .context("failed to compute relative snapshot path")?;
-
-            if should_skip_relative(rel) {
-                continue;
-            }
-
-            let target = snapshot_root.join(rel);
-            if entry.file_type().is_dir() {
-                fs::create_dir_all(&target)
-                    .with_context(|| format!("failed to create {}", target.display()))?;
-                continue;
-            }
-
-            if entry.file_type().is_file() {
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("failed to create parent directory {}", parent.display())
-                    })?;
-                }
-                fs::copy(path, &target).with_context(|| {
-                    format!("failed to copy {} -> {}", path.display(), target.display())
-                })?;
+            if let Some(commit) = parse_git_commit_from_detail(&bridge.detail) {
+                commits.insert(commit);
             }
         }
-
-        Ok(())
+        Ok(commits)
     }
 
     fn snapshot_path(&self, snapshot_id: Uuid) -> PathBuf {
@@ -1431,6 +1664,74 @@ fn should_skip_relative(path: &Path) -> bool {
     false
 }
 
+fn copy_tree(source_root: &Path, destination_root: &Path, apply_skip: bool) -> Result<()> {
+    let walker = WalkDir::new(source_root)
+        .into_iter()
+        .filter_entry(|entry| !apply_skip || !should_skip_path(source_root, entry.path()));
+
+    for entry in walker {
+        let entry = entry.context("failed while walking source tree for copy")?;
+        let path = entry.path();
+        if path == source_root {
+            continue;
+        }
+
+        let rel = path
+            .strip_prefix(source_root)
+            .context("failed to compute relative path while copying tree")?;
+        if apply_skip && should_skip_relative(rel) {
+            continue;
+        }
+
+        let target = destination_root.join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)
+                .with_context(|| format!("failed to create {}", target.display()))?;
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create parent directory {}", parent.display())
+                })?;
+            }
+            fs::copy(path, &target).with_context(|| {
+                format!("failed to copy {} -> {}", path.display(), target.display())
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn clear_directory_except(root: &Path, keep_names: &[&str]) -> Result<()> {
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("failed to read directory {}", root.display()))?
+    {
+        let entry = entry.context("failed to read directory entry")?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if keep_names.iter().any(|keep| *keep == file_name) {
+            continue;
+        }
+
+        let path = entry.path();
+        if entry
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .is_dir()
+        {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to remove directory {}", path.display()))?;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove file {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_source_files(root: &Path, apply_skip: bool) -> Result<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
 
@@ -1615,6 +1916,23 @@ fn parse_checkpoint_git_mapping(detail: &str, checkpoint_id: Uuid) -> Option<Str
         return mapped_commit.map(ToOwned::to_owned);
     }
     None
+}
+
+fn parse_git_commit_from_detail(detail: &str) -> Option<String> {
+    for token in detail.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        if key == "git_commit" {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn short_sha(sha: &str) -> &str {
+    let end = std::cmp::min(8, sha.len());
+    &sha[..end]
 }
 
 fn parse_repo_mode(raw_config: &str) -> RepoMode {
@@ -2414,6 +2732,164 @@ mod tests {
                 event.kind,
                 EventKind::GitBridge(GitBridgeEvent {
                     action: GitBridgeAction::Pull,
+                    success: true,
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn git_import_replays_commit_history_into_checkpoints() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        fl_bridge_git::run_git(dir.path(), &["init"]).expect("git init should succeed");
+        let file = dir.path().join("import.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        fl_bridge_git::run_git(dir.path(), &["add", "import.ts"]).expect("git add should succeed");
+        fl_bridge_git::run_git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=tester@example.com",
+                "commit",
+                "-m",
+                "first",
+            ],
+        )
+        .expect("first commit should succeed");
+
+        fs::write(&file, "export const value = 2;").expect("write should succeed");
+        fl_bridge_git::run_git(dir.path(), &["add", "import.ts"]).expect("git add should succeed");
+        fl_bridge_git::run_git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=tester@example.com",
+                "commit",
+                "-m",
+                "second",
+            ],
+        )
+        .expect("second commit should succeed");
+
+        repo.git_import(None).expect("git import should succeed");
+
+        let events = repo.list_events().expect("events should load");
+        let checkpoints: Vec<&Event> = events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Checkpoint(_)))
+            .collect();
+        assert_eq!(checkpoints.len(), 2);
+        let EventKind::Checkpoint(last_checkpoint) = &checkpoints[1].kind else {
+            panic!("checkpoint payload expected");
+        };
+        let restored = fs::read_to_string(
+            repo.snapshot_path(last_checkpoint.snapshot_id)
+                .join("import.ts"),
+        )
+        .expect("snapshot file should be readable");
+        assert_eq!(restored, "export const value = 2;");
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Import,
+                    success: true,
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn git_import_is_idempotent_for_existing_commit_mappings() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        fl_bridge_git::run_git(dir.path(), &["init"]).expect("git init should succeed");
+        let file = dir.path().join("import-once.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        fl_bridge_git::run_git(dir.path(), &["add", "import-once.ts"])
+            .expect("git add should succeed");
+        fl_bridge_git::run_git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Tester",
+                "-c",
+                "user.email=tester@example.com",
+                "commit",
+                "-m",
+                "first",
+            ],
+        )
+        .expect("commit should succeed");
+
+        repo.git_import(None).expect("first import should succeed");
+        let first_checkpoint_count = repo
+            .list_events()
+            .expect("events should load")
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Checkpoint(_)))
+            .count();
+
+        let second = repo.git_import(None).expect("second import should succeed");
+        let second_checkpoint_count = repo
+            .list_events()
+            .expect("events should load")
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::Checkpoint(_)))
+            .count();
+
+        assert_eq!(first_checkpoint_count, second_checkpoint_count);
+        assert!(
+            second.contains("no new commits"),
+            "unexpected output: {second}"
+        );
+    }
+
+    #[test]
+    fn git_export_writes_checkpoint_history_to_target_branch() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = dir.path().join("export.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        fs::write(&file, "export const value = 2;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+
+        repo.git_export(Some("flock-export".to_string()))
+            .expect("git export should succeed");
+
+        let export_count = repo
+            .run_git(&["rev-list", "--count", "refs/heads/flock-export"])
+            .expect("export branch count should resolve");
+        assert_eq!(export_count.trim(), "2");
+        let exported_file = repo
+            .run_git(&["show", "refs/heads/flock-export:export.ts"])
+            .expect("exported file should exist");
+        assert_eq!(exported_file.trim(), "export const value = 2;");
+
+        let events = repo.list_events().expect("events should load");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Export,
                     success: true,
                     ..
                 })

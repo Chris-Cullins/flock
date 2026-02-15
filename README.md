@@ -10,6 +10,7 @@ Initial Rust implementation of `fl` with:
 - exploration lifecycle commands (`start/list/promote/abandon`)
 - undo variants on the event timeline
 - git bridge commands (`commit/push/pull`) with event logging
+- git import/export commands for checkpoint history translation
 - optional git-colocated mode (`--colocated`) with checkpoint-to-git commit mapping
 - repository refs abstraction (`branch`, `tag`, `workspace`)
 - colocated ref mirroring into git refs:
@@ -72,6 +73,8 @@ cargo run -p fl-cli -- undo --file src/app.ts
 cargo run -p fl-cli -- git commit -m \"checkpoint from fl\"
 cargo run -p fl-cli -- git push
 cargo run -p fl-cli -- git pull
+cargo run -p fl-cli -- git import
+cargo run -p fl-cli -- git export
 
 # refs commands
 cargo run -p fl-cli -- refs list

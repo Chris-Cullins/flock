@@ -84,6 +84,12 @@ enum GitCommand {
         remote: Option<String>,
         branch: Option<String>,
     },
+    Import {
+        git_ref: Option<String>,
+    },
+    Export {
+        branch: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -311,6 +317,18 @@ fn main() -> Result<()> {
                 }
                 GitCommand::Pull { remote, branch } => {
                     let out = repo.git_pull(remote, branch)?;
+                    if !out.is_empty() {
+                        println!("{}", out);
+                    }
+                }
+                GitCommand::Import { git_ref } => {
+                    let out = repo.git_import(git_ref)?;
+                    if !out.is_empty() {
+                        println!("{}", out);
+                    }
+                }
+                GitCommand::Export { branch } => {
+                    let out = repo.git_export(branch)?;
                     if !out.is_empty() {
                         println!("{}", out);
                     }
