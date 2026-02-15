@@ -16,17 +16,23 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::event::{
-    CheckpointEvent, Event, EventKind, ExplorationAction, ExplorationEvent, GitBridgeAction,
-    GitBridgeEvent, UndoEvent,
+    CheckpointEvent, DecisionAction, DecisionEvent, Event, EventKind, ExplorationAction,
+    ExplorationEvent, GitBridgeAction, GitBridgeEvent, ResourceUsageEvent, SessionAction,
+    SessionEvent, TaskAction, TaskEvent, UndoEvent,
 };
+use fl_storage::ApiCallRecord;
 use crate::semantic::{
     SemanticFileDiff, SemanticMergeResult, diff as semantic_diff, supported_source,
 };
-use fl_workflow::{previous_checkpoint_before, replay_state, resolve_target_event, to_undo_mode};
+use fl_workflow::{
+    build_task_graph, previous_checkpoint_before, replay_state, resolve_target_event, to_undo_mode,
+};
 
 pub use fl_workflow::parse_duration_spec;
 pub use fl_workflow::{
-    ExplorationStatus, ExplorationSummary, ReplayedState, UndoRequest, UndoResult,
+    DecisionSummary, ExplorationStatus, ExplorationSummary, ReplayedState, ResourceUsageTotals,
+    SessionStatus, SessionSummary, TaskEdge, TaskGraph, TaskRelation, TaskStatus, TaskSummary,
+    UndoRequest, UndoResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +89,20 @@ pub struct WorkspaceInfo {
     pub checkpoint_count: usize,
     pub snapshot_count: usize,
     pub limits_exceeded: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvenanceInfo {
+    pub session: Option<SessionSummary>,
+    pub exploration: ExplorationSummary,
+    pub decisions: Vec<DecisionSummary>,
+    pub related_events: Vec<Event>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionReplay {
+    pub session: SessionSummary,
+    pub timeline: Vec<Event>,
 }
 
 fn check_workspace_limits(
@@ -405,6 +425,10 @@ impl Repo {
                     }
                 }
                 EventKind::GitBridge(_) => {}
+                EventKind::Session(_) => {}
+                EventKind::Decision(_) => {}
+                EventKind::ResourceUsage(_) => {}
+                EventKind::Task(_) => {}
             }
         }
 
@@ -895,6 +919,534 @@ impl Repo {
         }
 
         Ok(pruned)
+    }
+
+    // ── Session methods ───────────────────────────────────────────────
+
+    pub fn start_session(
+        &self,
+        task: String,
+        agent: Option<String>,
+        initiator: Option<String>,
+    ) -> Result<SessionSummary> {
+        self.assert_initialized()?;
+
+        let session_id = Uuid::new_v4();
+        let agent_name = agent.unwrap_or_else(current_actor);
+        let event = self.append_event(EventKind::Session(SessionEvent {
+            session_id,
+            action: SessionAction::Start,
+            agent: agent_name.clone(),
+            initiator: initiator.clone(),
+            task_description: Some(task.clone()),
+            exploration_id: None,
+            result: None,
+        }))?;
+
+        Ok(SessionSummary {
+            id: session_id,
+            agent: agent_name,
+            initiator,
+            task_description: Some(task),
+            status: SessionStatus::Active,
+            explorations: Vec::new(),
+            decisions: Vec::new(),
+            resource_usage: ResourceUsageTotals::default(),
+            created_at: event.timestamp,
+            completed_at: None,
+            result: None,
+        })
+    }
+
+    pub fn link_session_exploration(
+        &self,
+        session_id: Uuid,
+        exploration_id: Uuid,
+    ) -> Result<()> {
+        self.assert_initialized()?;
+        self.assert_session_active(session_id)?;
+
+        self.append_event(EventKind::Session(SessionEvent {
+            session_id,
+            action: SessionAction::Link,
+            agent: current_actor(),
+            initiator: None,
+            task_description: None,
+            exploration_id: Some(exploration_id),
+            result: None,
+        }))?;
+
+        Ok(())
+    }
+
+    pub fn record_decision(
+        &self,
+        session_id: Uuid,
+        exploration_id: Uuid,
+        action: DecisionAction,
+        reason: String,
+        confidence: f64,
+    ) -> Result<()> {
+        self.assert_initialized()?;
+        self.assert_session_active(session_id)?;
+
+        if !(0.0..=1.0).contains(&confidence) {
+            bail!("confidence must be between 0.0 and 1.0, got {}", confidence);
+        }
+
+        self.append_event(EventKind::Decision(DecisionEvent {
+            session_id,
+            exploration_id,
+            action,
+            reason,
+            confidence,
+        }))?;
+
+        Ok(())
+    }
+
+    pub fn record_resource_usage(
+        &self,
+        session_id: Uuid,
+        tokens: Option<u64>,
+        runtime_ms: Option<u64>,
+        api_calls: Option<Vec<ApiCallRecord>>,
+    ) -> Result<()> {
+        self.assert_initialized()?;
+        self.assert_session_active(session_id)?;
+
+        self.append_event(EventKind::ResourceUsage(ResourceUsageEvent {
+            session_id,
+            tokens_consumed: tokens,
+            runtime_ms,
+            api_calls,
+        }))?;
+
+        Ok(())
+    }
+
+    pub fn complete_session(
+        &self,
+        session_id: Uuid,
+        result: Option<String>,
+    ) -> Result<SessionSummary> {
+        self.assert_initialized()?;
+        self.assert_session_active(session_id)?;
+
+        self.append_event(EventKind::Session(SessionEvent {
+            session_id,
+            action: SessionAction::Complete,
+            agent: current_actor(),
+            initiator: None,
+            task_description: None,
+            exploration_id: None,
+            result,
+        }))?;
+
+        self.session_info(session_id)
+    }
+
+    pub fn fail_session(&self, session_id: Uuid, reason: String) -> Result<SessionSummary> {
+        self.assert_initialized()?;
+        self.assert_session_active(session_id)?;
+
+        self.append_event(EventKind::Session(SessionEvent {
+            session_id,
+            action: SessionAction::Fail,
+            agent: current_actor(),
+            initiator: None,
+            task_description: None,
+            exploration_id: None,
+            result: Some(reason),
+        }))?;
+
+        self.session_info(session_id)
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let mut sessions: Vec<SessionSummary> = state.sessions.into_values().collect();
+        sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(sessions)
+    }
+
+    pub fn session_info(&self, session_id: Uuid) -> Result<SessionSummary> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        state
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("session {} not found", session_id))
+    }
+
+    pub fn query_provenance(&self, exploration_id: Uuid) -> Result<ProvenanceInfo> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let exploration = state
+            .explorations
+            .get(&exploration_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("exploration {} not found", exploration_id))?;
+
+        // Find the session that contains this exploration
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.explorations.contains(&exploration_id))
+            .cloned();
+
+        // Collect decisions related to this exploration
+        let decisions: Vec<DecisionSummary> = session
+            .as_ref()
+            .map(|s| {
+                s.decisions
+                    .iter()
+                    .filter(|d| d.exploration_id == exploration_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Collect related events (exploration events for this ID + session events)
+        let related_events: Vec<Event> = events
+            .iter()
+            .filter(|e| match &e.kind {
+                EventKind::Exploration(exp) => exp.exploration_id == exploration_id,
+                EventKind::Decision(dec) => dec.exploration_id == exploration_id,
+                EventKind::Session(ses) => {
+                    session.as_ref().is_some_and(|s| ses.session_id == s.id)
+                }
+                EventKind::ResourceUsage(usage) => {
+                    session.as_ref().is_some_and(|s| usage.session_id == s.id)
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect();
+
+        Ok(ProvenanceInfo {
+            session,
+            exploration,
+            decisions,
+            related_events,
+        })
+    }
+
+    pub fn replay_session(&self, session_id: Uuid) -> Result<SessionReplay> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let session = state
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("session {} not found", session_id))?;
+
+        let timeline: Vec<Event> = events
+            .into_iter()
+            .filter(|e| match &e.kind {
+                EventKind::Session(ses) => ses.session_id == session_id,
+                EventKind::Decision(dec) => dec.session_id == session_id,
+                EventKind::ResourceUsage(usage) => usage.session_id == session_id,
+                EventKind::Exploration(exp) => session.explorations.contains(&exp.exploration_id),
+                _ => false,
+            })
+            .collect();
+
+        Ok(SessionReplay { session, timeline })
+    }
+
+    fn assert_session_active(&self, session_id: Uuid) -> Result<()> {
+        let session = self.session_info(session_id)?;
+        if session.status != SessionStatus::Active {
+            bail!(
+                "session {} is not active (current status: {})",
+                session_id,
+                session.status
+            );
+        }
+        Ok(())
+    }
+
+    // ── Task methods ─────────────────────────────────────────────────
+
+    pub fn create_task(
+        &self,
+        title: String,
+        description: Option<String>,
+        dependencies: Vec<Uuid>,
+        discovered_from: Option<Uuid>,
+    ) -> Result<TaskSummary> {
+        self.assert_initialized()?;
+
+        // Validate dependencies exist
+        if !dependencies.is_empty() {
+            let events = self.list_events()?;
+            let state = replay_state(&events)?;
+            for dep_id in &dependencies {
+                if !state.tasks.contains_key(dep_id) {
+                    bail!("dependency task {} not found", dep_id);
+                }
+            }
+        }
+
+        let task_id = Uuid::new_v4();
+        let event = self.append_event(EventKind::Task(TaskEvent {
+            task_id,
+            action: TaskAction::Create,
+            title: title.clone(),
+            description: description.clone(),
+            dependencies: dependencies.clone(),
+            assignee: None,
+            result: None,
+            linked_events: Vec::new(),
+            discovered_from,
+        }))?;
+
+        Ok(TaskSummary {
+            id: task_id,
+            title,
+            description,
+            status: TaskStatus::Open,
+            dependencies,
+            dependents: Vec::new(),
+            assignee: None,
+            created_at: event.timestamp,
+            claimed_at: None,
+            completed_at: None,
+            result: None,
+            linked_events: Vec::new(),
+            discovered_from,
+        })
+    }
+
+    pub fn list_tasks(&self) -> Result<Vec<TaskSummary>> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let mut tasks: Vec<TaskSummary> = state.tasks.into_values().collect();
+        tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(tasks)
+    }
+
+    pub fn task_info(&self, task_id: Uuid) -> Result<TaskSummary> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        state
+            .tasks
+            .get(&task_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("task {} not found", task_id))
+    }
+
+    pub fn claim_task(&self, task_id: Uuid, assignee: Option<String>) -> Result<TaskSummary> {
+        self.assert_initialized()?;
+
+        let task = self.task_info(task_id)?;
+        if task.status != TaskStatus::Open {
+            bail!(
+                "task {} is not open (current status: {})",
+                task_id,
+                task.status
+            );
+        }
+
+        let assignee_name = assignee.unwrap_or_else(current_actor);
+        self.append_event(EventKind::Task(TaskEvent {
+            task_id,
+            action: TaskAction::Claim,
+            title: task.title.clone(),
+            description: None,
+            dependencies: Vec::new(),
+            assignee: Some(assignee_name.clone()),
+            result: None,
+            linked_events: Vec::new(),
+            discovered_from: None,
+        }))?;
+
+        self.task_info(task_id)
+    }
+
+    pub fn unclaim_task(&self, task_id: Uuid) -> Result<TaskSummary> {
+        self.assert_initialized()?;
+
+        let task = self.task_info(task_id)?;
+        if task.status != TaskStatus::Claimed {
+            bail!(
+                "task {} is not claimed (current status: {})",
+                task_id,
+                task.status
+            );
+        }
+
+        self.append_event(EventKind::Task(TaskEvent {
+            task_id,
+            action: TaskAction::Unclaim,
+            title: task.title.clone(),
+            description: None,
+            dependencies: Vec::new(),
+            assignee: None,
+            result: None,
+            linked_events: Vec::new(),
+            discovered_from: None,
+        }))?;
+
+        self.task_info(task_id)
+    }
+
+    pub fn complete_task(&self, task_id: Uuid, result: Option<String>) -> Result<TaskSummary> {
+        self.assert_initialized()?;
+
+        let task = self.task_info(task_id)?;
+        if task.status != TaskStatus::Open && task.status != TaskStatus::Claimed {
+            bail!(
+                "task {} cannot be completed (current status: {})",
+                task_id,
+                task.status
+            );
+        }
+
+        self.append_event(EventKind::Task(TaskEvent {
+            task_id,
+            action: TaskAction::Complete,
+            title: task.title.clone(),
+            description: None,
+            dependencies: Vec::new(),
+            assignee: None,
+            result: result.clone(),
+            linked_events: Vec::new(),
+            discovered_from: None,
+        }))?;
+
+        self.task_info(task_id)
+    }
+
+    pub fn fail_task(&self, task_id: Uuid, reason: String) -> Result<TaskSummary> {
+        self.assert_initialized()?;
+
+        let task = self.task_info(task_id)?;
+        if task.status != TaskStatus::Open && task.status != TaskStatus::Claimed {
+            bail!(
+                "task {} cannot be failed (current status: {})",
+                task_id,
+                task.status
+            );
+        }
+
+        self.append_event(EventKind::Task(TaskEvent {
+            task_id,
+            action: TaskAction::Fail,
+            title: task.title.clone(),
+            description: None,
+            dependencies: Vec::new(),
+            assignee: None,
+            result: Some(reason),
+            linked_events: Vec::new(),
+            discovered_from: None,
+        }))?;
+
+        self.task_info(task_id)
+    }
+
+    pub fn link_task_event(&self, task_id: Uuid, event_ids: Vec<Uuid>) -> Result<()> {
+        self.assert_initialized()?;
+
+        let task = self.task_info(task_id)?;
+        if task.status == TaskStatus::Completed || task.status == TaskStatus::Failed {
+            bail!(
+                "task {} is already finished (current status: {})",
+                task_id,
+                task.status
+            );
+        }
+
+        self.append_event(EventKind::Task(TaskEvent {
+            task_id,
+            action: TaskAction::Link,
+            title: task.title.clone(),
+            description: None,
+            dependencies: Vec::new(),
+            assignee: None,
+            result: None,
+            linked_events: event_ids,
+            discovered_from: None,
+        }))?;
+
+        Ok(())
+    }
+
+    /// Returns open tasks whose dependencies are all completed,
+    /// sorted by creation time (oldest first).
+    pub fn ready_tasks(&self) -> Result<Vec<TaskSummary>> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let mut ready: Vec<TaskSummary> = state
+            .tasks
+            .values()
+            .filter(|t| t.is_ready(&state.tasks))
+            .cloned()
+            .collect();
+        ready.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(ready)
+    }
+
+    /// Returns a count of completed/failed tasks older than the given duration.
+    /// In the append-only model, compaction is informational — the tasks are
+    /// already hidden from default list views.
+    pub fn compact_tasks_dry_run(&self, max_age: std::time::Duration) -> Result<usize> {
+        self.assert_initialized()?;
+
+        let now_nanos: u128 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before unix epoch")?
+            .as_nanos();
+
+        let tasks = self.list_tasks()?;
+        let mut compactable = 0;
+
+        for task in &tasks {
+            let finished = task.status == TaskStatus::Completed || task.status == TaskStatus::Failed;
+            if !finished {
+                continue;
+            }
+
+            let completed_nanos: u128 = task
+                .completed_at
+                .as_deref()
+                .and_then(|ts| ts.parse().ok())
+                .unwrap_or(0);
+            let age_nanos = now_nanos.saturating_sub(completed_nanos);
+
+            if age_nanos >= max_age.as_nanos() {
+                compactable += 1;
+            }
+        }
+
+        Ok(compactable)
+    }
+
+    pub fn task_graph(&self) -> Result<TaskGraph> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        Ok(build_task_graph(&state.tasks))
     }
 
     /// Create an isolated workspace with its own base snapshot.

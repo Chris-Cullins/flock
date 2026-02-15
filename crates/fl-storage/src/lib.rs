@@ -4,9 +4,10 @@ pub mod layout;
 pub mod refs;
 
 pub use event::{
-    CURRENT_EVENT_SCHEMA_VERSION, CheckpointEvent, Event, EventKind, EventRecord,
-    ExplorationAction, ExplorationEvent, GitBridgeAction, GitBridgeEvent, UndoEvent, UndoMode,
-    event_signing_payload,
+    ApiCallRecord, CURRENT_EVENT_SCHEMA_VERSION, CheckpointEvent, DecisionAction, DecisionEvent,
+    Event, EventKind, EventRecord, ExplorationAction, ExplorationEvent, GitBridgeAction,
+    GitBridgeEvent, ResourceUsageEvent, SessionAction, SessionEvent, TaskAction, TaskEvent,
+    UndoEvent, UndoMode, event_signing_payload,
 };
 pub use event_log::EventLog;
 pub use layout::{

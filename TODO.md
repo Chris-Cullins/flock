@@ -90,27 +90,27 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## 6. Agent Sessions and Provenance
 
-- [ ] Implement session entity and linkage to explorations/tasks
-- [ ] Track decisions (kept/discarded + reason + confidence)
-- [ ] Add resource usage accounting (tokens, runtime, external API calls)
-- [ ] Implement provenance query commands
-- [ ] Implement session replay command
+- [x] Implement session entity and linkage to explorations/tasks
+- [x] Track decisions (kept/discarded + reason + confidence)
+- [x] Add resource usage accounting (tokens, runtime, external API calls)
+- [x] Implement provenance query commands
+- [x] Implement session replay command
 
 ## 7. Work Queue (Built-in Task Graph)
 
-- [ ] Implement task schema and DAG dependencies
-- [ ] Add task lifecycle commands:
-  - [ ] `fl task create`
-  - [ ] `fl task list`
-  - [ ] `fl task claim`
-  - [ ] `fl task done`
-  - [ ] `fl task show`
-  - [ ] `fl task graph`
-- [ ] Implement `fl ready` priority + dependency-unblocked selection
-- [ ] Add `--json` output for agent consumption
-- [ ] Link tasks to events/checkpoints/explorations
-- [ ] Add discovered-from relationships and auto-linking
-- [ ] Implement task compaction for old completed tasks
+- [x] Implement task schema and DAG dependencies
+- [x] Add task lifecycle commands:
+  - [x] `fl task create`
+  - [x] `fl task list`
+  - [x] `fl task claim`
+  - [x] `fl task done`
+  - [x] `fl task show`
+  - [x] `fl task graph`
+- [x] Implement `fl ready` priority + dependency-unblocked selection
+- [x] Add `--json` output for agent consumption
+- [x] Link tasks to events/checkpoints/explorations
+- [x] Add discovered-from relationships and auto-linking
+- [x] Implement task compaction for old completed tasks
 
 ## 8. Collaboration Layer
 

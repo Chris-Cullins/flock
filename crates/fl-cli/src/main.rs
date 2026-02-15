@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fl_core::repo::parse_duration_spec;
 use fl_core::{
-    EventKind, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
-    SemanticConflictClassification, SemanticRisk, UndoRequest,
+    ApiCallRecord, DecisionAction, EventKind, RefKind, Repo, SemanticChangeKind,
+    SemanticCompatibilityStatus, SemanticConflictClassification, SemanticRisk, UndoRequest,
 };
 use uuid::Uuid;
 
@@ -85,6 +85,18 @@ enum Command {
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
+    },
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+    Ready {
+        #[arg(long)]
+        json: bool,
     },
     QuickSave {
         #[arg(long)]
@@ -177,6 +189,138 @@ enum WorkspaceCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    Start {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        initiator: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        active: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Link {
+        session_id: String,
+        exploration_id: String,
+    },
+    Decision {
+        session_id: String,
+        exploration_id: String,
+        #[arg(long)]
+        action: DecisionActionArg,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value = "0.9")]
+        confidence: f64,
+    },
+    Usage {
+        session_id: String,
+        #[arg(long)]
+        tokens: Option<u64>,
+        #[arg(long)]
+        runtime_ms: Option<u64>,
+        #[arg(long = "api-call")]
+        api_call: Vec<String>,
+    },
+    Complete {
+        id: String,
+        #[arg(long)]
+        result: Option<String>,
+    },
+    Fail {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Provenance {
+        exploration_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Replay {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    Create {
+        title: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+        #[arg(long = "discovered-from")]
+        discovered_from: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Claim {
+        id: String,
+        #[arg(long)]
+        assignee: Option<String>,
+    },
+    Done {
+        id: String,
+        #[arg(long)]
+        result: Option<String>,
+    },
+    Fail {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Graph {
+        #[arg(long)]
+        json: bool,
+    },
+    Link {
+        task_id: String,
+        event_ids: Vec<String>,
+    },
+    Compact {
+        #[arg(long, default_value = "7d")]
+        older_than: String,
+    },
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum DecisionActionArg {
+    Kept,
+    Discarded,
+}
+
+impl From<DecisionActionArg> for DecisionAction {
+    fn from(value: DecisionActionArg) -> Self {
+        match value {
+            DecisionActionArg::Kept => DecisionAction::Kept,
+            DecisionActionArg::Discarded => DecisionAction::Discarded,
+        }
+    }
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum RefKindArg {
     Branch,
@@ -261,6 +405,29 @@ fn main() -> Result<()> {
                     EventKind::GitBridge(bridge) => println!(
                         "{}  git:{:?}  success={}  {}",
                         event.timestamp, bridge.action, bridge.success, bridge.detail
+                    ),
+                    EventKind::Session(ses) => println!(
+                        "{}  session:{:?}  {}  agent={}",
+                        event.timestamp, ses.action, ses.session_id, ses.agent
+                    ),
+                    EventKind::Decision(dec) => println!(
+                        "{}  decision:{:?}  session={}  exploration={}  confidence={:.2}",
+                        event.timestamp,
+                        dec.action,
+                        dec.session_id,
+                        dec.exploration_id,
+                        dec.confidence
+                    ),
+                    EventKind::ResourceUsage(usage) => println!(
+                        "{}  resource-usage  session={}  tokens={}  runtime={}ms",
+                        event.timestamp,
+                        usage.session_id,
+                        usage.tokens_consumed.unwrap_or(0),
+                        usage.runtime_ms.unwrap_or(0)
+                    ),
+                    EventKind::Task(task) => println!(
+                        "{}  task:{:?}  {}  {}",
+                        event.timestamp, task.action, task.task_id, task.title
                     ),
                 }
             }
@@ -906,6 +1073,538 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Session { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                SessionCommand::Start {
+                    task,
+                    agent,
+                    initiator,
+                } => {
+                    let session = repo.start_session(task, agent, initiator)?;
+                    println!("session {} started: {}", session.id, session.task_description.as_deref().unwrap_or(""));
+                }
+                SessionCommand::List { active, json } => {
+                    let mut sessions = repo.list_sessions()?;
+                    if active {
+                        sessions.retain(|s| s.status == fl_core::SessionStatus::Active);
+                    }
+
+                    if json {
+                        let json_sessions: Vec<serde_json::Value> = sessions
+                            .iter()
+                            .map(|s| {
+                                serde_json::json!({
+                                    "id": s.id.to_string(),
+                                    "agent": s.agent,
+                                    "initiator": s.initiator,
+                                    "task": s.task_description,
+                                    "status": s.status.to_string(),
+                                    "explorations": s.explorations.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                                    "created_at": s.created_at,
+                                    "completed_at": s.completed_at,
+                                    "result": s.result,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&json_sessions)?);
+                        return Ok(());
+                    }
+
+                    if sessions.is_empty() {
+                        println!("No sessions.");
+                        return Ok(());
+                    }
+
+                    for session in sessions {
+                        println!(
+                            "{}  {}  {}  {}",
+                            session.id,
+                            session.status,
+                            session.agent,
+                            session.task_description.as_deref().unwrap_or("")
+                        );
+                    }
+                }
+                SessionCommand::Show { id, json } => {
+                    let session_id = parse_uuid(&id)?;
+                    let session = repo.session_info(session_id)?;
+
+                    if json {
+                        let json_val = serde_json::json!({
+                            "id": session.id.to_string(),
+                            "agent": session.agent,
+                            "initiator": session.initiator,
+                            "task": session.task_description,
+                            "status": session.status.to_string(),
+                            "explorations": session.explorations.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                            "decisions": session.decisions.iter().map(|d| serde_json::json!({
+                                "exploration_id": d.exploration_id.to_string(),
+                                "action": format!("{:?}", d.action),
+                                "reason": d.reason,
+                                "confidence": d.confidence,
+                                "timestamp": d.timestamp,
+                            })).collect::<Vec<_>>(),
+                            "resource_usage": {
+                                "total_tokens": session.resource_usage.total_tokens,
+                                "total_runtime_ms": session.resource_usage.total_runtime_ms,
+                                "api_calls": session.resource_usage.api_calls.iter().map(|c| serde_json::json!({
+                                    "service": c.service,
+                                    "endpoint": c.endpoint,
+                                    "count": c.count,
+                                })).collect::<Vec<_>>(),
+                            },
+                            "created_at": session.created_at,
+                            "completed_at": session.completed_at,
+                            "result": session.result,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&json_val)?);
+                        return Ok(());
+                    }
+
+                    println!("Session: {}", session.id);
+                    println!("  Agent: {}", session.agent);
+                    if let Some(initiator) = &session.initiator {
+                        println!("  Initiator: {}", initiator);
+                    }
+                    if let Some(task) = &session.task_description {
+                        println!("  Task: {}", task);
+                    }
+                    println!("  Status: {}", session.status);
+                    println!("  Created: {}", session.created_at);
+                    if let Some(completed) = &session.completed_at {
+                        println!("  Completed: {}", completed);
+                    }
+                    if let Some(result) = &session.result {
+                        println!("  Result: {}", result);
+                    }
+
+                    if !session.explorations.is_empty() {
+                        println!("  Explorations:");
+                        for exp_id in &session.explorations {
+                            println!("    {}", exp_id);
+                        }
+                    }
+
+                    if !session.decisions.is_empty() {
+                        println!("  Decisions:");
+                        for dec in &session.decisions {
+                            println!(
+                                "    {:?} {} (confidence={:.2}) - {}",
+                                dec.action, dec.exploration_id, dec.confidence, dec.reason
+                            );
+                        }
+                    }
+
+                    let usage = &session.resource_usage;
+                    if usage.total_tokens > 0 || usage.total_runtime_ms > 0 {
+                        println!("  Resource usage:");
+                        println!("    Tokens: {}", usage.total_tokens);
+                        println!("    Runtime: {}ms", usage.total_runtime_ms);
+                        for call in &usage.api_calls {
+                            println!("    API: {}:{} x{}", call.service, call.endpoint, call.count);
+                        }
+                    }
+                }
+                SessionCommand::Link {
+                    session_id,
+                    exploration_id,
+                } => {
+                    let sid = parse_uuid(&session_id)?;
+                    let eid = parse_uuid(&exploration_id)?;
+                    repo.link_session_exploration(sid, eid)?;
+                    println!("linked exploration {} to session {}", eid, sid);
+                }
+                SessionCommand::Decision {
+                    session_id,
+                    exploration_id,
+                    action,
+                    reason,
+                    confidence,
+                } => {
+                    let sid = parse_uuid(&session_id)?;
+                    let eid = parse_uuid(&exploration_id)?;
+                    repo.record_decision(sid, eid, action.into(), reason, confidence)?;
+                    println!("decision recorded for session {}", sid);
+                }
+                SessionCommand::Usage {
+                    session_id,
+                    tokens,
+                    runtime_ms,
+                    api_call,
+                } => {
+                    let sid = parse_uuid(&session_id)?;
+                    let api_calls = if api_call.is_empty() {
+                        None
+                    } else {
+                        let mut records = Vec::new();
+                        for spec in &api_call {
+                            let parts: Vec<&str> = spec.splitn(3, ':').collect();
+                            if parts.len() != 3 {
+                                bail!(
+                                    "invalid --api-call format `{}`; expected service:endpoint:count",
+                                    spec
+                                );
+                            }
+                            let count: u32 = parts[2].parse().with_context(|| {
+                                format!("invalid count in --api-call `{}`", spec)
+                            })?;
+                            records.push(ApiCallRecord {
+                                service: parts[0].to_string(),
+                                endpoint: parts[1].to_string(),
+                                count,
+                            });
+                        }
+                        Some(records)
+                    };
+                    repo.record_resource_usage(sid, tokens, runtime_ms, api_calls)?;
+                    println!("resource usage recorded for session {}", sid);
+                }
+                SessionCommand::Complete { id, result } => {
+                    let session_id = parse_uuid(&id)?;
+                    let session = repo.complete_session(session_id, result)?;
+                    println!("session {} completed", session.id);
+                }
+                SessionCommand::Fail { id, reason } => {
+                    let session_id = parse_uuid(&id)?;
+                    let session = repo.fail_session(session_id, reason)?;
+                    println!("session {} failed", session.id);
+                }
+                SessionCommand::Provenance {
+                    exploration_id,
+                    json,
+                } => {
+                    let eid = parse_uuid(&exploration_id)?;
+                    let info = repo.query_provenance(eid)?;
+
+                    if json {
+                        let json_val = serde_json::json!({
+                            "exploration": {
+                                "id": info.exploration.id.to_string(),
+                                "title": info.exploration.title,
+                                "status": info.exploration.status.to_string(),
+                            },
+                            "session": info.session.as_ref().map(|s| serde_json::json!({
+                                "id": s.id.to_string(),
+                                "agent": s.agent,
+                                "status": s.status.to_string(),
+                            })),
+                            "decisions": info.decisions.iter().map(|d| serde_json::json!({
+                                "action": format!("{:?}", d.action),
+                                "reason": d.reason,
+                                "confidence": d.confidence,
+                            })).collect::<Vec<_>>(),
+                            "related_event_count": info.related_events.len(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&json_val)?);
+                        return Ok(());
+                    }
+
+                    println!(
+                        "Provenance: {} [{}]",
+                        info.exploration.title, info.exploration.status
+                    );
+                    if let Some(session) = &info.session {
+                        println!(
+                            "  Session: {} (agent={}, status={})",
+                            session.id, session.agent, session.status
+                        );
+                        if let Some(task) = &session.task_description {
+                            println!("  Task: {}", task);
+                        }
+                    } else {
+                        println!("  No session linked.");
+                    }
+                    if !info.decisions.is_empty() {
+                        println!("  Decisions:");
+                        for dec in &info.decisions {
+                            println!(
+                                "    {:?} (confidence={:.2}) - {}",
+                                dec.action, dec.confidence, dec.reason
+                            );
+                        }
+                    }
+                    println!("  Related events: {}", info.related_events.len());
+                }
+                SessionCommand::Replay { id, json } => {
+                    let session_id = parse_uuid(&id)?;
+                    let replay = repo.replay_session(session_id)?;
+
+                    if json {
+                        let json_val = serde_json::json!({
+                            "session": {
+                                "id": replay.session.id.to_string(),
+                                "agent": replay.session.agent,
+                                "status": replay.session.status.to_string(),
+                            },
+                            "timeline_event_count": replay.timeline.len(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&json_val)?);
+                        return Ok(());
+                    }
+
+                    println!("Session replay: {} [{}]", replay.session.id, replay.session.status);
+                    println!("  Agent: {}", replay.session.agent);
+                    if let Some(task) = &replay.session.task_description {
+                        println!("  Task: {}", task);
+                    }
+                    println!();
+                    println!("Timeline ({} events):", replay.timeline.len());
+                    for event in &replay.timeline {
+                        let kind_label = match &event.kind {
+                            EventKind::Session(s) => format!("session:{:?}", s.action),
+                            EventKind::Decision(d) => format!("decision:{:?}", d.action),
+                            EventKind::ResourceUsage(_) => "resource-usage".to_string(),
+                            EventKind::Exploration(e) => {
+                                format!("exploration:{:?}", e.action)
+                            }
+                            other => format!("{:?}", std::mem::discriminant(other)),
+                        };
+                        println!("  {}  {}", event.timestamp, kind_label);
+                    }
+                }
+            }
+        }
+        Command::Task { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                TaskCommand::Create {
+                    title,
+                    description,
+                    depends_on,
+                    discovered_from,
+                } => {
+                    let deps = depends_on
+                        .iter()
+                        .map(|id| parse_uuid(id))
+                        .collect::<Result<Vec<_>>>()?;
+                    let discovered = discovered_from
+                        .as_deref()
+                        .map(parse_uuid)
+                        .transpose()?;
+                    let task = repo.create_task(title, description, deps, discovered)?;
+                    println!("task {} created: {}", task.id, task.title);
+                }
+                TaskCommand::List { all, json } => {
+                    let mut tasks = repo.list_tasks()?;
+                    if !all {
+                        tasks.retain(|t| {
+                            t.status == fl_core::TaskStatus::Open
+                                || t.status == fl_core::TaskStatus::Claimed
+                        });
+                    }
+
+                    if json {
+                        let json_tasks: Vec<serde_json::Value> = tasks
+                            .iter()
+                            .map(|t| task_to_json(t))
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&json_tasks)?);
+                        return Ok(());
+                    }
+
+                    if tasks.is_empty() {
+                        println!("No tasks.");
+                        return Ok(());
+                    }
+
+                    for task in &tasks {
+                        let deps_str = if task.dependencies.is_empty() {
+                            String::new()
+                        } else {
+                            let dep_ids: Vec<String> = task
+                                .dependencies
+                                .iter()
+                                .map(|id| id.to_string()[..8].to_string())
+                                .collect();
+                            format!(" [deps: {}]", dep_ids.join(", "))
+                        };
+                        let assignee_str = task
+                            .assignee
+                            .as_deref()
+                            .map(|a| format!(" @{}", a))
+                            .unwrap_or_default();
+                        println!(
+                            "{}  {}  {}{}{}",
+                            &task.id.to_string()[..8],
+                            task.status,
+                            task.title,
+                            assignee_str,
+                            deps_str,
+                        );
+                    }
+                }
+                TaskCommand::Show { id, json } => {
+                    let task_id = parse_uuid(&id)?;
+                    let task = repo.task_info(task_id)?;
+
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&task_to_json(&task))?
+                        );
+                        return Ok(());
+                    }
+
+                    println!("Task: {}", task.id);
+                    println!("  Title: {}", task.title);
+                    if let Some(desc) = &task.description {
+                        println!("  Description: {}", desc);
+                    }
+                    println!("  Status: {}", task.status);
+                    if let Some(assignee) = &task.assignee {
+                        println!("  Assignee: {}", assignee);
+                    }
+                    println!("  Created: {}", task.created_at);
+                    if let Some(claimed_at) = &task.claimed_at {
+                        println!("  Claimed: {}", claimed_at);
+                    }
+                    if let Some(completed_at) = &task.completed_at {
+                        println!("  Completed: {}", completed_at);
+                    }
+                    if let Some(result) = &task.result {
+                        println!("  Result: {}", result);
+                    }
+                    if !task.dependencies.is_empty() {
+                        println!("  Dependencies:");
+                        for dep in &task.dependencies {
+                            println!("    {}", dep);
+                        }
+                    }
+                    if !task.dependents.is_empty() {
+                        println!("  Dependents:");
+                        for dep in &task.dependents {
+                            println!("    {}", dep);
+                        }
+                    }
+                    if !task.linked_events.is_empty() {
+                        println!("  Linked events:");
+                        for ev in &task.linked_events {
+                            println!("    {}", ev);
+                        }
+                    }
+                    if let Some(discovered) = &task.discovered_from {
+                        println!("  Discovered from: {}", discovered);
+                    }
+                }
+                TaskCommand::Claim { id, assignee } => {
+                    let task_id = parse_uuid(&id)?;
+                    let task = repo.claim_task(task_id, assignee)?;
+                    println!(
+                        "task {} claimed by {}",
+                        &task.id.to_string()[..8],
+                        task.assignee.as_deref().unwrap_or("unknown")
+                    );
+                }
+                TaskCommand::Done { id, result } => {
+                    let task_id = parse_uuid(&id)?;
+                    let task = repo.complete_task(task_id, result)?;
+                    println!("task {} completed", &task.id.to_string()[..8]);
+                }
+                TaskCommand::Fail { id, reason } => {
+                    let task_id = parse_uuid(&id)?;
+                    let task = repo.fail_task(task_id, reason)?;
+                    println!("task {} failed", &task.id.to_string()[..8]);
+                }
+                TaskCommand::Graph { json } => {
+                    let graph = repo.task_graph()?;
+
+                    if json {
+                        let json_val = serde_json::json!({
+                            "tasks": graph.tasks.iter().map(|t| task_to_json(t)).collect::<Vec<_>>(),
+                            "edges": graph.edges.iter().map(|e| serde_json::json!({
+                                "from": e.from_task.to_string(),
+                                "to": e.to_task.to_string(),
+                                "relation": format!("{:?}", e.relation),
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&json_val)?);
+                        return Ok(());
+                    }
+
+                    if graph.tasks.is_empty() {
+                        println!("No tasks.");
+                        return Ok(());
+                    }
+
+                    println!("Tasks ({}):", graph.tasks.len());
+                    for task in &graph.tasks {
+                        let marker = match task.status {
+                            fl_core::TaskStatus::Open => " ",
+                            fl_core::TaskStatus::Claimed => ">",
+                            fl_core::TaskStatus::Completed => "x",
+                            fl_core::TaskStatus::Failed => "!",
+                        };
+                        println!(
+                            "  [{}] {}  {}",
+                            marker,
+                            &task.id.to_string()[..8],
+                            task.title,
+                        );
+                    }
+
+                    if !graph.edges.is_empty() {
+                        println!("\nEdges:");
+                        for edge in &graph.edges {
+                            let relation = match edge.relation {
+                                fl_core::TaskRelation::DependsOn => "depends-on",
+                                fl_core::TaskRelation::DiscoveredFrom => "discovered-from",
+                            };
+                            println!(
+                                "  {} --{}--> {}",
+                                &edge.from_task.to_string()[..8],
+                                relation,
+                                &edge.to_task.to_string()[..8],
+                            );
+                        }
+                    }
+                }
+                TaskCommand::Link { task_id, event_ids } => {
+                    let tid = parse_uuid(&task_id)?;
+                    let eids = event_ids
+                        .iter()
+                        .map(|id| parse_uuid(id))
+                        .collect::<Result<Vec<_>>>()?;
+                    repo.link_task_event(tid, eids)?;
+                    println!("linked events to task {}", &task_id[..8.min(task_id.len())]);
+                }
+                TaskCommand::Compact { older_than } => {
+                    let duration = parse_duration_spec(&older_than)?;
+                    let count = repo.compact_tasks_dry_run(duration)?;
+                    if count == 0 {
+                        println!("No completed tasks older than {} to compact.", older_than);
+                    } else {
+                        println!(
+                            "{} completed task(s) older than {} eligible for compaction.",
+                            count, older_than
+                        );
+                        println!("(In append-only mode, completed tasks are hidden from default views.)");
+                    }
+                }
+            }
+        }
+        Command::Ready { json } => {
+            let repo = Repo::discover(cwd)?;
+            let ready = repo.ready_tasks()?;
+
+            if json {
+                let json_tasks: Vec<serde_json::Value> = ready
+                    .iter()
+                    .map(|t| task_to_json(t))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&json_tasks)?);
+                return Ok(());
+            }
+
+            if ready.is_empty() {
+                println!("No ready tasks.");
+                return Ok(());
+            }
+
+            for task in &ready {
+                println!("{}  {}", &task.id.to_string()[..8], task.title);
+            }
+        }
         Command::QuickSave { tag } => {
             let repo = Repo::discover(cwd)?;
             let event = repo.quick_save(tag)?;
@@ -1028,4 +1727,22 @@ fn build_undo_request(
 
 fn parse_uuid(value: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("invalid UUID `{}`", value))
+}
+
+fn task_to_json(task: &fl_core::TaskSummary) -> serde_json::Value {
+    serde_json::json!({
+        "id": task.id.to_string(),
+        "title": task.title,
+        "description": task.description,
+        "status": task.status.to_string(),
+        "assignee": task.assignee,
+        "dependencies": task.dependencies.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "dependents": task.dependents.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "created_at": task.created_at,
+        "claimed_at": task.claimed_at,
+        "completed_at": task.completed_at,
+        "result": task.result,
+        "linked_events": task.linked_events.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "discovered_from": task.discovered_from.map(|id| id.to_string()),
+    })
 }

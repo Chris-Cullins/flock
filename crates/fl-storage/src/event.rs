@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -25,6 +25,10 @@ pub enum EventKind {
     Exploration(ExplorationEvent),
     Undo(UndoEvent),
     GitBridge(GitBridgeEvent),
+    Session(SessionEvent),
+    Decision(DecisionEvent),
+    ResourceUsage(ResourceUsageEvent),
+    Task(TaskEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +88,87 @@ pub enum GitBridgeAction {
     Pull,
     Import,
     Export,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionEvent {
+    pub session_id: Uuid,
+    pub action: SessionAction,
+    pub agent: String,
+    pub initiator: Option<String>,
+    pub task_description: Option<String>,
+    pub exploration_id: Option<Uuid>,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionAction {
+    Start,
+    Link,
+    Unlink,
+    Complete,
+    Fail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DecisionEvent {
+    pub session_id: Uuid,
+    pub exploration_id: Uuid,
+    pub action: DecisionAction,
+    pub reason: String,
+    pub confidence: f64,
+}
+
+impl Eq for DecisionEvent {}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DecisionAction {
+    Kept,
+    Discarded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceUsageEvent {
+    pub session_id: Uuid,
+    pub tokens_consumed: Option<u64>,
+    pub runtime_ms: Option<u64>,
+    pub api_calls: Option<Vec<ApiCallRecord>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiCallRecord {
+    pub service: String,
+    pub endpoint: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvent {
+    pub task_id: Uuid,
+    pub action: TaskAction,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<Uuid>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub linked_events: Vec<Uuid>,
+    #[serde(default)]
+    pub discovered_from: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskAction {
+    Create,
+    Claim,
+    Unclaim,
+    Complete,
+    Fail,
+    Link,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

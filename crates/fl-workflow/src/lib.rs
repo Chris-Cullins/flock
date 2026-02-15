@@ -3,7 +3,10 @@ use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use fl_storage::{Event, EventKind, ExplorationAction, UndoMode};
+use fl_storage::{
+    ApiCallRecord, DecisionAction, Event, EventKind, ExplorationAction, SessionAction, TaskAction,
+    UndoMode,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +36,54 @@ pub struct ExplorationSummary {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Active,
+    Completed,
+    Failed,
+}
+
+impl fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Active => f.write_str("active"),
+            Self::Completed => f.write_str("completed"),
+            Self::Failed => f.write_str("failed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub agent: String,
+    pub initiator: Option<String>,
+    pub task_description: Option<String>,
+    pub status: SessionStatus,
+    pub explorations: Vec<Uuid>,
+    pub decisions: Vec<DecisionSummary>,
+    pub resource_usage: ResourceUsageTotals,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionSummary {
+    pub exploration_id: Uuid,
+    pub action: DecisionAction,
+    pub reason: String,
+    pub confidence: f64,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResourceUsageTotals {
+    pub total_tokens: u64,
+    pub total_runtime_ms: u64,
+    pub api_calls: Vec<ApiCallRecord>,
+}
+
 #[derive(Debug, Clone)]
 pub enum UndoRequest {
     Last,
@@ -47,11 +98,82 @@ pub struct UndoResult {
     pub restored_checkpoint_event: Option<Uuid>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    Open,
+    Claimed,
+    Completed,
+    Failed,
+}
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open => f.write_str("open"),
+            Self::Claimed => f.write_str("claimed"),
+            Self::Completed => f.write_str("completed"),
+            Self::Failed => f.write_str("failed"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSummary {
+    pub id: Uuid,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: TaskStatus,
+    pub dependencies: Vec<Uuid>,
+    pub dependents: Vec<Uuid>,
+    pub assignee: Option<String>,
+    pub created_at: String,
+    pub claimed_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub result: Option<String>,
+    pub linked_events: Vec<Uuid>,
+    pub discovered_from: Option<Uuid>,
+}
+
+impl TaskSummary {
+    /// Returns true if all dependency tasks are completed.
+    pub fn is_ready(&self, tasks: &BTreeMap<Uuid, TaskSummary>) -> bool {
+        if self.status != TaskStatus::Open {
+            return false;
+        }
+        self.dependencies.iter().all(|dep_id| {
+            tasks
+                .get(dep_id)
+                .is_some_and(|t| t.status == TaskStatus::Completed)
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskGraph {
+    pub tasks: Vec<TaskSummary>,
+    pub edges: Vec<TaskEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEdge {
+    pub from_task: Uuid,
+    pub to_task: Uuid,
+    pub relation: TaskRelation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRelation {
+    DependsOn,
+    DiscoveredFrom,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReplayedState {
     pub latest_checkpoint_event_id: Option<Uuid>,
     pub latest_checkpoint_snapshot_id: Option<Uuid>,
     pub explorations: BTreeMap<Uuid, ExplorationSummary>,
+    pub sessions: BTreeMap<Uuid, SessionSummary>,
+    pub tasks: BTreeMap<Uuid, TaskSummary>,
     pub applied_event_ids: Vec<Uuid>,
 }
 
@@ -60,15 +182,33 @@ struct ReplayAccumulator {
     latest_checkpoint_event_id: Option<Uuid>,
     latest_checkpoint_snapshot_id: Option<Uuid>,
     explorations: BTreeMap<Uuid, ExplorationSummary>,
+    sessions: BTreeMap<Uuid, SessionSummary>,
+    tasks: BTreeMap<Uuid, TaskSummary>,
     applied_event_ids: Vec<Uuid>,
 }
 
 impl ReplayAccumulator {
     fn into_state(self) -> ReplayedState {
+        // Compute dependents from dependencies
+        let mut tasks = self.tasks;
+        let dep_pairs: Vec<(Uuid, Uuid)> = tasks
+            .values()
+            .flat_map(|t| t.dependencies.iter().map(move |dep| (*dep, t.id)))
+            .collect();
+        for (dep_id, dependent_id) in dep_pairs {
+            if let Some(dep_task) = tasks.get_mut(&dep_id) {
+                if !dep_task.dependents.contains(&dependent_id) {
+                    dep_task.dependents.push(dependent_id);
+                }
+            }
+        }
+
         ReplayedState {
             latest_checkpoint_event_id: self.latest_checkpoint_event_id,
             latest_checkpoint_snapshot_id: self.latest_checkpoint_snapshot_id,
             explorations: self.explorations,
+            sessions: self.sessions,
+            tasks,
             applied_event_ids: self.applied_event_ids,
         }
     }
@@ -162,6 +302,142 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                 }
             }
             EventKind::GitBridge(_) => {}
+            EventKind::Session(session) => match session.action {
+                SessionAction::Start => {
+                    state.sessions.insert(
+                        session.session_id,
+                        SessionSummary {
+                            id: session.session_id,
+                            agent: session.agent.clone(),
+                            initiator: session.initiator.clone(),
+                            task_description: session.task_description.clone(),
+                            status: SessionStatus::Active,
+                            explorations: Vec::new(),
+                            decisions: Vec::new(),
+                            resource_usage: ResourceUsageTotals::default(),
+                            created_at: event.timestamp.clone(),
+                            completed_at: None,
+                            result: None,
+                        },
+                    );
+                }
+                SessionAction::Link => {
+                    if let Some(entry) = state.sessions.get_mut(&session.session_id) {
+                        if let Some(exploration_id) = session.exploration_id {
+                            if !entry.explorations.contains(&exploration_id) {
+                                entry.explorations.push(exploration_id);
+                            }
+                        }
+                    }
+                }
+                SessionAction::Unlink => {
+                    if let Some(entry) = state.sessions.get_mut(&session.session_id) {
+                        if let Some(exploration_id) = session.exploration_id {
+                            entry.explorations.retain(|id| *id != exploration_id);
+                        }
+                    }
+                }
+                SessionAction::Complete => {
+                    if let Some(entry) = state.sessions.get_mut(&session.session_id) {
+                        entry.status = SessionStatus::Completed;
+                        entry.completed_at = Some(event.timestamp.clone());
+                        entry.result = session.result.clone();
+                    }
+                }
+                SessionAction::Fail => {
+                    if let Some(entry) = state.sessions.get_mut(&session.session_id) {
+                        entry.status = SessionStatus::Failed;
+                        entry.completed_at = Some(event.timestamp.clone());
+                        entry.result = session.result.clone();
+                    }
+                }
+            },
+            EventKind::Decision(decision) => {
+                if let Some(entry) = state.sessions.get_mut(&decision.session_id) {
+                    entry.decisions.push(DecisionSummary {
+                        exploration_id: decision.exploration_id,
+                        action: decision.action,
+                        reason: decision.reason.clone(),
+                        confidence: decision.confidence,
+                        timestamp: event.timestamp.clone(),
+                    });
+                }
+            }
+            EventKind::ResourceUsage(usage) => {
+                if let Some(entry) = state.sessions.get_mut(&usage.session_id) {
+                    if let Some(tokens) = usage.tokens_consumed {
+                        entry.resource_usage.total_tokens += tokens;
+                    }
+                    if let Some(runtime) = usage.runtime_ms {
+                        entry.resource_usage.total_runtime_ms += runtime;
+                    }
+                    if let Some(calls) = &usage.api_calls {
+                        entry.resource_usage.api_calls.extend(calls.iter().cloned());
+                    }
+                }
+            }
+            EventKind::Task(task) => match task.action {
+                TaskAction::Create => {
+                    state.tasks.insert(
+                        task.task_id,
+                        TaskSummary {
+                            id: task.task_id,
+                            title: task.title.clone(),
+                            description: task.description.clone(),
+                            status: TaskStatus::Open,
+                            dependencies: task.dependencies.clone(),
+                            dependents: Vec::new(),
+                            assignee: None,
+                            created_at: event.timestamp.clone(),
+                            claimed_at: None,
+                            completed_at: None,
+                            result: None,
+                            linked_events: task.linked_events.clone(),
+                            discovered_from: task.discovered_from,
+                        },
+                    );
+                }
+                TaskAction::Claim => {
+                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                        entry.status = TaskStatus::Claimed;
+                        entry.assignee = task
+                            .assignee
+                            .clone()
+                            .or_else(|| Some(event.actor.clone()));
+                        entry.claimed_at = Some(event.timestamp.clone());
+                    }
+                }
+                TaskAction::Unclaim => {
+                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                        entry.status = TaskStatus::Open;
+                        entry.assignee = None;
+                        entry.claimed_at = None;
+                    }
+                }
+                TaskAction::Complete => {
+                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                        entry.status = TaskStatus::Completed;
+                        entry.completed_at = Some(event.timestamp.clone());
+                        entry.result = task.result.clone();
+                    }
+                }
+                TaskAction::Fail => {
+                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                        entry.status = TaskStatus::Failed;
+                        entry.completed_at = Some(event.timestamp.clone());
+                        entry.result = task.result.clone();
+                    }
+                }
+                TaskAction::Link => {
+                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                        for linked in &task.linked_events {
+                            if !entry.linked_events.contains(linked) {
+                                entry.linked_events.push(*linked);
+                            }
+                        }
+                    }
+                }
+            },
         }
 
         if !state.applied_event_ids.contains(&event.id) {
@@ -174,6 +450,41 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
 
 pub fn replay_explorations(events: &[Event]) -> Result<BTreeMap<Uuid, ExplorationSummary>> {
     Ok(replay_state(events)?.explorations)
+}
+
+pub fn replay_sessions(events: &[Event]) -> Result<BTreeMap<Uuid, SessionSummary>> {
+    Ok(replay_state(events)?.sessions)
+}
+
+pub fn replay_tasks(events: &[Event]) -> Result<BTreeMap<Uuid, TaskSummary>> {
+    Ok(replay_state(events)?.tasks)
+}
+
+pub fn build_task_graph(tasks: &BTreeMap<Uuid, TaskSummary>) -> TaskGraph {
+    let task_list: Vec<TaskSummary> = tasks.values().cloned().collect();
+    let mut edges = Vec::new();
+
+    for task in tasks.values() {
+        for dep_id in &task.dependencies {
+            edges.push(TaskEdge {
+                from_task: task.id,
+                to_task: *dep_id,
+                relation: TaskRelation::DependsOn,
+            });
+        }
+        if let Some(discovered_from) = task.discovered_from {
+            edges.push(TaskEdge {
+                from_task: task.id,
+                to_task: discovered_from,
+                relation: TaskRelation::DiscoveredFrom,
+            });
+        }
+    }
+
+    TaskGraph {
+        tasks: task_list,
+        edges,
+    }
 }
 
 pub fn resolve_target_event<'a>(events: &'a [Event], request: &UndoRequest) -> Result<&'a Event> {
@@ -288,7 +599,11 @@ pub fn parse_duration_spec(input: &str) -> Result<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use fl_storage::{CheckpointEvent, EventKind, ExplorationEvent, UndoEvent};
+    use fl_storage::{
+        ApiCallRecord, CheckpointEvent, DecisionAction, DecisionEvent, EventKind,
+        ExplorationEvent, ResourceUsageEvent, SessionAction, SessionEvent, TaskAction, TaskEvent,
+        UndoEvent,
+    };
 
     use super::*;
 
@@ -491,6 +806,373 @@ mod tests {
             replay_state(&[cp1, cp2, exploration_start, restored.clone(), undo]).expect("replay");
         assert_eq!(state.latest_checkpoint_event_id, Some(restored.id));
         assert!(state.explorations.contains_key(&Uuid::from_u128(21)));
+    }
+
+    #[test]
+    fn replay_session_lifecycle() {
+        let start = make_event(
+            1,
+            None,
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(100),
+                action: SessionAction::Start,
+                agent: "claude".to_string(),
+                initiator: Some("user".to_string()),
+                task_description: Some("implement feature X".to_string()),
+                exploration_id: None,
+                result: None,
+            }),
+        );
+        let link = make_event(
+            2,
+            Some(start.id),
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(100),
+                action: SessionAction::Link,
+                agent: "claude".to_string(),
+                initiator: None,
+                task_description: None,
+                exploration_id: Some(Uuid::from_u128(200)),
+                result: None,
+            }),
+        );
+        let decision = make_event(
+            3,
+            Some(link.id),
+            EventKind::Decision(DecisionEvent {
+                session_id: Uuid::from_u128(100),
+                exploration_id: Uuid::from_u128(200),
+                action: DecisionAction::Kept,
+                reason: "tests pass".to_string(),
+                confidence: 0.95,
+            }),
+        );
+        let usage = make_event(
+            4,
+            Some(decision.id),
+            EventKind::ResourceUsage(ResourceUsageEvent {
+                session_id: Uuid::from_u128(100),
+                tokens_consumed: Some(5000),
+                runtime_ms: Some(12000),
+                api_calls: Some(vec![ApiCallRecord {
+                    service: "claude".to_string(),
+                    endpoint: "messages".to_string(),
+                    count: 3,
+                }]),
+            }),
+        );
+        let complete = make_event(
+            5,
+            Some(usage.id),
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(100),
+                action: SessionAction::Complete,
+                agent: "claude".to_string(),
+                initiator: None,
+                task_description: None,
+                exploration_id: None,
+                result: Some("feature X implemented".to_string()),
+            }),
+        );
+
+        let state = replay_state(&[start, link, decision, usage, complete]).expect("replay");
+        let session = state.sessions.get(&Uuid::from_u128(100)).expect("session");
+
+        assert_eq!(session.agent, "claude");
+        assert_eq!(session.initiator.as_deref(), Some("user"));
+        assert_eq!(session.status, SessionStatus::Completed);
+        assert_eq!(session.explorations, vec![Uuid::from_u128(200)]);
+        assert_eq!(session.decisions.len(), 1);
+        assert_eq!(session.decisions[0].action, DecisionAction::Kept);
+        assert_eq!(session.resource_usage.total_tokens, 5000);
+        assert_eq!(session.resource_usage.total_runtime_ms, 12000);
+        assert_eq!(session.resource_usage.api_calls.len(), 1);
+        assert_eq!(session.result.as_deref(), Some("feature X implemented"));
+        assert!(session.completed_at.is_some());
+    }
+
+    #[test]
+    fn replay_session_fail() {
+        let start = make_event(
+            1,
+            None,
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(101),
+                action: SessionAction::Start,
+                agent: "agent-1".to_string(),
+                initiator: None,
+                task_description: Some("risky task".to_string()),
+                exploration_id: None,
+                result: None,
+            }),
+        );
+        let fail = make_event(
+            2,
+            Some(start.id),
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(101),
+                action: SessionAction::Fail,
+                agent: "agent-1".to_string(),
+                initiator: None,
+                task_description: None,
+                exploration_id: None,
+                result: Some("compilation errors".to_string()),
+            }),
+        );
+
+        let state = replay_state(&[start, fail]).expect("replay");
+        let session = state.sessions.get(&Uuid::from_u128(101)).expect("session");
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(session.result.as_deref(), Some("compilation errors"));
+    }
+
+    #[test]
+    fn replay_session_unlink() {
+        let start = make_event(
+            1,
+            None,
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(102),
+                action: SessionAction::Start,
+                agent: "bot".to_string(),
+                initiator: None,
+                task_description: None,
+                exploration_id: None,
+                result: None,
+            }),
+        );
+        let link = make_event(
+            2,
+            Some(start.id),
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(102),
+                action: SessionAction::Link,
+                agent: "bot".to_string(),
+                initiator: None,
+                task_description: None,
+                exploration_id: Some(Uuid::from_u128(300)),
+                result: None,
+            }),
+        );
+        let unlink = make_event(
+            3,
+            Some(link.id),
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(102),
+                action: SessionAction::Unlink,
+                agent: "bot".to_string(),
+                initiator: None,
+                task_description: None,
+                exploration_id: Some(Uuid::from_u128(300)),
+                result: None,
+            }),
+        );
+
+        let state = replay_state(&[start, link, unlink]).expect("replay");
+        let session = state.sessions.get(&Uuid::from_u128(102)).expect("session");
+        assert!(session.explorations.is_empty());
+    }
+
+    #[test]
+    fn replay_sessions_accumulates_resource_usage() {
+        let start = make_event(
+            1,
+            None,
+            EventKind::Session(SessionEvent {
+                session_id: Uuid::from_u128(103),
+                action: SessionAction::Start,
+                agent: "agent".to_string(),
+                initiator: None,
+                task_description: None,
+                exploration_id: None,
+                result: None,
+            }),
+        );
+        let usage1 = make_event(
+            2,
+            Some(start.id),
+            EventKind::ResourceUsage(ResourceUsageEvent {
+                session_id: Uuid::from_u128(103),
+                tokens_consumed: Some(1000),
+                runtime_ms: Some(500),
+                api_calls: None,
+            }),
+        );
+        let usage2 = make_event(
+            3,
+            Some(usage1.id),
+            EventKind::ResourceUsage(ResourceUsageEvent {
+                session_id: Uuid::from_u128(103),
+                tokens_consumed: Some(2000),
+                runtime_ms: Some(700),
+                api_calls: None,
+            }),
+        );
+
+        let sessions = replay_sessions(&[start, usage1, usage2]).expect("replay");
+        let session = sessions.get(&Uuid::from_u128(103)).expect("session");
+        assert_eq!(session.resource_usage.total_tokens, 3000);
+        assert_eq!(session.resource_usage.total_runtime_ms, 1200);
+    }
+
+    fn make_task_event(task_id: u128, action: TaskAction) -> TaskEvent {
+        TaskEvent {
+            task_id: Uuid::from_u128(task_id),
+            action,
+            title: format!("task-{}", task_id),
+            description: None,
+            dependencies: Vec::new(),
+            assignee: None,
+            result: None,
+            linked_events: Vec::new(),
+            discovered_from: None,
+        }
+    }
+
+    #[test]
+    fn replay_task_lifecycle() {
+        let create = make_event(
+            1,
+            None,
+            EventKind::Task(make_task_event(500, TaskAction::Create)),
+        );
+        let mut claim_payload = make_task_event(500, TaskAction::Claim);
+        claim_payload.assignee = Some("agent-1".to_string());
+        let claim = make_event(2, Some(create.id), EventKind::Task(claim_payload));
+        let mut complete_payload = make_task_event(500, TaskAction::Complete);
+        complete_payload.result = Some("done".to_string());
+        let complete = make_event(3, Some(claim.id), EventKind::Task(complete_payload));
+
+        let state = replay_state(&[create, claim, complete]).expect("replay");
+        let task = state.tasks.get(&Uuid::from_u128(500)).expect("task");
+
+        assert_eq!(task.title, "task-500");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.assignee.as_deref(), Some("agent-1"));
+        assert!(task.completed_at.is_some());
+        assert_eq!(task.result.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn replay_task_dependencies_compute_dependents() {
+        let mut create1 = make_task_event(600, TaskAction::Create);
+        create1.title = "parent task".to_string();
+        let ev1 = make_event(1, None, EventKind::Task(create1));
+
+        let mut create2 = make_task_event(601, TaskAction::Create);
+        create2.title = "child task".to_string();
+        create2.dependencies = vec![Uuid::from_u128(600)];
+        let ev2 = make_event(2, Some(ev1.id), EventKind::Task(create2));
+
+        let state = replay_state(&[ev1, ev2]).expect("replay");
+        let parent = state.tasks.get(&Uuid::from_u128(600)).expect("parent");
+        let child = state.tasks.get(&Uuid::from_u128(601)).expect("child");
+
+        assert_eq!(parent.dependents, vec![Uuid::from_u128(601)]);
+        assert_eq!(child.dependencies, vec![Uuid::from_u128(600)]);
+    }
+
+    #[test]
+    fn replay_task_is_ready() {
+        let mut create1 = make_task_event(700, TaskAction::Create);
+        create1.title = "dep".to_string();
+        let ev1 = make_event(1, None, EventKind::Task(create1));
+
+        let mut create2 = make_task_event(701, TaskAction::Create);
+        create2.title = "blocked".to_string();
+        create2.dependencies = vec![Uuid::from_u128(700)];
+        let ev2 = make_event(2, Some(ev1.id), EventKind::Task(create2));
+
+        let ev2_id = ev2.id;
+        let state = replay_state(&[ev1, ev2]).expect("replay");
+        let blocked = state.tasks.get(&Uuid::from_u128(701)).expect("blocked");
+        assert!(!blocked.is_ready(&state.tasks));
+
+        // Now complete the dependency — rebuild events since originals were moved
+        let mut complete = make_task_event(700, TaskAction::Complete);
+        complete.result = Some("done".to_string());
+        let ev3 = make_event(3, Some(ev2_id), EventKind::Task(complete));
+
+        let ev1_clone = make_event(
+            1,
+            None,
+            EventKind::Task({
+                let mut t = make_task_event(700, TaskAction::Create);
+                t.title = "dep".to_string();
+                t
+            }),
+        );
+        let ev2_clone = make_event(
+            2,
+            Some(ev1_clone.id),
+            EventKind::Task({
+                let mut t = make_task_event(701, TaskAction::Create);
+                t.title = "blocked".to_string();
+                t.dependencies = vec![Uuid::from_u128(700)];
+                t
+            }),
+        );
+        let state2 = replay_state(&[ev1_clone, ev2_clone, ev3]).expect("replay");
+        let unblocked = state2.tasks.get(&Uuid::from_u128(701)).expect("unblocked");
+        assert!(unblocked.is_ready(&state2.tasks));
+    }
+
+    #[test]
+    fn replay_task_fail() {
+        let create = make_event(
+            1,
+            None,
+            EventKind::Task(make_task_event(800, TaskAction::Create)),
+        );
+        let mut fail_payload = make_task_event(800, TaskAction::Fail);
+        fail_payload.result = Some("compilation error".to_string());
+        let fail = make_event(2, Some(create.id), EventKind::Task(fail_payload));
+
+        let state = replay_state(&[create, fail]).expect("replay");
+        let task = state.tasks.get(&Uuid::from_u128(800)).expect("task");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.result.as_deref(), Some("compilation error"));
+    }
+
+    #[test]
+    fn replay_task_unclaim() {
+        let create = make_event(
+            1,
+            None,
+            EventKind::Task(make_task_event(900, TaskAction::Create)),
+        );
+        let mut claim_payload = make_task_event(900, TaskAction::Claim);
+        claim_payload.assignee = Some("agent-1".to_string());
+        let claim = make_event(2, Some(create.id), EventKind::Task(claim_payload));
+        let unclaim = make_event(
+            3,
+            Some(claim.id),
+            EventKind::Task(make_task_event(900, TaskAction::Unclaim)),
+        );
+
+        let state = replay_state(&[create, claim, unclaim]).expect("replay");
+        let task = state.tasks.get(&Uuid::from_u128(900)).expect("task");
+        assert_eq!(task.status, TaskStatus::Open);
+        assert!(task.assignee.is_none());
+    }
+
+    #[test]
+    fn build_task_graph_produces_edges() {
+        let mut create1 = make_task_event(1000, TaskAction::Create);
+        create1.title = "first".to_string();
+        let ev1 = make_event(1, None, EventKind::Task(create1));
+
+        let mut create2 = make_task_event(1001, TaskAction::Create);
+        create2.title = "second".to_string();
+        create2.dependencies = vec![Uuid::from_u128(1000)];
+        create2.discovered_from = Some(Uuid::from_u128(1000));
+        let ev2 = make_event(2, Some(ev1.id), EventKind::Task(create2));
+
+        let state = replay_state(&[ev1, ev2]).expect("replay");
+        let graph = build_task_graph(&state.tasks);
+
+        assert_eq!(graph.tasks.len(), 2);
+        assert_eq!(graph.edges.len(), 2); // 1 DependsOn + 1 DiscoveredFrom
     }
 
     fn make_event(id: u128, parent_id: Option<Uuid>, kind: EventKind) -> Event {
