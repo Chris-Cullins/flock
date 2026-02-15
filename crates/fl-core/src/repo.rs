@@ -280,6 +280,69 @@ impl Repo {
             target_event_id: target.id,
             mode,
             restored_checkpoint_event,
+            file_scope: None,
+        }))?;
+
+        Ok(UndoResult {
+            target_event_id: target.id,
+            restored_checkpoint_event,
+        })
+    }
+
+    pub fn undo_file(
+        &self,
+        request: UndoRequest,
+        file_path: impl AsRef<Path>,
+    ) -> Result<UndoResult> {
+        self.assert_initialized()?;
+
+        let scoped_file = self.normalize_scoped_file_path(file_path.as_ref())?;
+        let scoped_file_display = scoped_file.to_string_lossy().to_string();
+
+        let events = self.list_events()?;
+        if events.is_empty() {
+            bail!("cannot undo: event log is empty")
+        }
+
+        let target = resolve_target_event(&events, &request)?;
+        let mode = to_undo_mode(&request, target.id);
+
+        if !matches!(&target.kind, EventKind::Checkpoint(_)) {
+            bail!(
+                "file-scoped undo in git-compatible mode supports checkpoint targets only; resolved target {} is not a checkpoint",
+                target.id
+            );
+        }
+
+        let Some(previous_checkpoint) = previous_checkpoint_before(&events, target.id) else {
+            bail!(
+                "cannot undo checkpoint {} for file {}: no earlier checkpoint exists",
+                target.id,
+                scoped_file_display
+            )
+        };
+
+        let EventKind::Checkpoint(payload) = previous_checkpoint.kind else {
+            bail!("expected checkpoint payload")
+        };
+
+        self.restore_workspace_file_from_snapshot(payload.snapshot_id, &scoped_file)?;
+
+        let checkpoint_event = self.create_checkpoint_with_lineage(
+            format!("undo-file-{}", normalize_label(&scoped_file_display)),
+            Some(format!(
+                "undo file {} from checkpoint {}",
+                scoped_file_display, target.id
+            )),
+            None,
+        )?;
+        let restored_checkpoint_event = Some(checkpoint_event.id);
+
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id: target.id,
+            mode,
+            restored_checkpoint_event,
+            file_scope: Some(scoped_file_display),
         }))?;
 
         Ok(UndoResult {
@@ -434,6 +497,71 @@ impl Repo {
         Ok(())
     }
 
+    fn restore_workspace_file_from_snapshot(
+        &self,
+        snapshot_id: Uuid,
+        rel_path: &Path,
+    ) -> Result<()> {
+        let snapshot_root = self.snapshot_path(snapshot_id);
+        if !snapshot_root.is_dir() {
+            bail!("snapshot {} not found", snapshot_id)
+        }
+
+        let snapshot_file = snapshot_root.join(rel_path);
+        let workspace_file = self.root.join(rel_path);
+
+        if snapshot_file.exists() {
+            let metadata = fs::metadata(&snapshot_file).with_context(|| {
+                format!(
+                    "failed to inspect snapshot file {}",
+                    snapshot_file.display()
+                )
+            })?;
+            if metadata.is_dir() {
+                bail!(
+                    "scoped undo target {} resolves to a directory in snapshot {}",
+                    rel_path.display(),
+                    snapshot_id
+                );
+            }
+
+            if let Some(parent) = workspace_file.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create parent directory {}", parent.display())
+                })?;
+            }
+
+            fs::copy(&snapshot_file, &workspace_file).with_context(|| {
+                format!(
+                    "failed to restore {} -> {}",
+                    snapshot_file.display(),
+                    workspace_file.display()
+                )
+            })?;
+            return Ok(());
+        }
+
+        if workspace_file.exists() {
+            let metadata = fs::metadata(&workspace_file).with_context(|| {
+                format!(
+                    "failed to inspect workspace path {}",
+                    workspace_file.display()
+                )
+            })?;
+            if metadata.is_dir() {
+                fs::remove_dir_all(&workspace_file).with_context(|| {
+                    format!("failed to remove directory {}", workspace_file.display())
+                })?;
+            } else {
+                fs::remove_file(&workspace_file).with_context(|| {
+                    format!("failed to remove file {}", workspace_file.display())
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn clear_workspace_files(&self) -> Result<()> {
         for entry in fs::read_dir(&self.root)
             .with_context(|| format!("failed to read root directory {}", self.root.display()))?
@@ -555,6 +683,47 @@ impl Repo {
 
     fn snapshot_path(&self, snapshot_id: Uuid) -> PathBuf {
         self.root.join(SNAPSHOT_DIR).join(snapshot_id.to_string())
+    }
+
+    fn normalize_scoped_file_path(&self, file_path: &Path) -> Result<PathBuf> {
+        let rel_path = if file_path.is_absolute() {
+            file_path.strip_prefix(&self.root).with_context(|| {
+                format!(
+                    "scoped undo path {} is outside repository root {}",
+                    file_path.display(),
+                    self.root.display()
+                )
+            })?
+        } else {
+            file_path
+        };
+
+        let mut normalized = PathBuf::new();
+        for component in rel_path.components() {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                _ => {
+                    bail!(
+                        "scoped undo path {} must stay within repository root",
+                        file_path.display()
+                    )
+                }
+            }
+        }
+
+        if normalized.as_os_str().is_empty() {
+            bail!("scoped undo path cannot be empty");
+        }
+
+        if should_skip_relative(&normalized) {
+            bail!(
+                "scoped undo path {} is reserved and cannot be targeted",
+                normalized.display()
+            );
+        }
+
+        Ok(normalized)
     }
 
     fn run_git(&self, args: &[&str]) -> Result<String> {
@@ -865,6 +1034,83 @@ mod tests {
         assert_eq!(
             replayed.latest_checkpoint_event_id,
             result.restored_checkpoint_event
+        );
+    }
+
+    #[test]
+    fn undo_file_restores_target_path_only() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let target = dir.path().join("target.ts");
+        let untouched = dir.path().join("untouched.ts");
+
+        fs::write(&target, "const value = 1;").expect("write should succeed");
+        fs::write(&untouched, "const other = 10;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        fs::write(&target, "const value = 2;").expect("write should succeed");
+        fs::write(&untouched, "const other = 20;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+
+        repo.undo_file(UndoRequest::Last, Path::new("target.ts"))
+            .expect("file-scoped undo should succeed");
+
+        let target_contents = fs::read_to_string(&target).expect("read should succeed");
+        let untouched_contents = fs::read_to_string(&untouched).expect("read should succeed");
+        assert!(target_contents.contains("const value = 1;"));
+        assert!(untouched_contents.contains("const other = 20;"));
+    }
+
+    #[test]
+    fn undo_file_records_scope_and_preserves_unrelated_state() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let target = dir.path().join("scoped.ts");
+        fs::write(&target, "const value = 1;").expect("write should succeed");
+        let cp1 = repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        fs::write(&target, "const value = 2;").expect("write should succeed");
+        let cp2 = repo
+            .create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+
+        let exploration = repo
+            .start_exploration("keep-state".to_string())
+            .expect("exploration should start");
+
+        repo.undo_file(UndoRequest::To(cp2.id.to_string()), Path::new("scoped.ts"))
+            .expect("file-scoped undo should succeed");
+
+        let events = repo.list_events().expect("events should load");
+        let last = events.last().expect("event should exist");
+        let EventKind::Undo(undo) = &last.kind else {
+            panic!("last event should be undo");
+        };
+        assert_eq!(undo.file_scope.as_deref(), Some("scoped.ts"));
+        assert_eq!(undo.target_event_id, cp2.id);
+
+        let explorations = repo.list_explorations().expect("explorations should load");
+        assert!(
+            explorations.iter().any(
+                |entry| entry.id == exploration.id && entry.status == ExplorationStatus::Active
+            )
+        );
+
+        let EventKind::Checkpoint(cp1_payload) = cp1.kind else {
+            panic!("checkpoint payload expected");
+        };
+        let replayed = repo.replay_state().expect("replay should succeed");
+        assert_ne!(
+            replayed.latest_checkpoint_snapshot_id,
+            Some(cp1_payload.snapshot_id)
         );
     }
 

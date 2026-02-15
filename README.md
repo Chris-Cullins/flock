@@ -52,6 +52,7 @@ cargo run -p fl-cli -- undo
 cargo run -p fl-cli -- undo --n 2
 cargo run -p fl-cli -- undo --to <event-id-or-prefix>
 cargo run -p fl-cli -- undo --since 5m
+cargo run -p fl-cli -- undo --file src/app.ts
 
 # git bridge stubs (pass-through to git + event logging)
 cargo run -p fl-cli -- git commit -m \"checkpoint from fl\"

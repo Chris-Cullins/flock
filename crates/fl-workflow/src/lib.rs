@@ -129,17 +129,19 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     bail!("undo event {} cannot target itself", event.id);
                 }
 
-                let rewound = state_before_event
-                    .get(&undo.target_event_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "undo event {} targets unknown event {}",
-                            event.id,
-                            undo.target_event_id
-                        )
-                    })?;
-                state = rewound;
+                if undo.file_scope.is_none() {
+                    let rewound = state_before_event
+                        .get(&undo.target_event_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "undo event {} targets unknown event {}",
+                                event.id,
+                                undo.target_event_id
+                            )
+                        })?;
+                    state = rewound;
+                }
 
                 if let Some(restored_checkpoint_event) = undo.restored_checkpoint_event {
                     let snapshot_id = checkpoints
@@ -326,6 +328,7 @@ mod tests {
                 target_event_id: exploration_start.id,
                 mode: UndoMode::Last,
                 restored_checkpoint_event: None,
+                file_scope: None,
             }),
         );
 
@@ -381,6 +384,7 @@ mod tests {
                 target_event_id: cp2.id,
                 mode: UndoMode::Last,
                 restored_checkpoint_event: Some(restored.id),
+                file_scope: None,
             }),
         );
 
@@ -419,6 +423,65 @@ mod tests {
         let first = replay_state(&events).expect("first replay");
         let second = replay_state(&events).expect("second replay");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn replay_state_file_scoped_undo_does_not_rewind_explorations() {
+        let cp1 = make_event(
+            1,
+            None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(11),
+                parent_checkpoint_event: None,
+            }),
+        );
+        let cp2 = make_event(
+            2,
+            Some(cp1.id),
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp2".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(12),
+                parent_checkpoint_event: None,
+            }),
+        );
+        let exploration_start = make_event(
+            3,
+            Some(cp2.id),
+            EventKind::Exploration(ExplorationEvent {
+                exploration_id: Uuid::from_u128(21),
+                title: "exp".to_string(),
+                base_checkpoint_event: Some(cp2.id),
+                action: ExplorationAction::Start,
+            }),
+        );
+        let restored = make_event(
+            4,
+            Some(exploration_start.id),
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "undo-file".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(13),
+                parent_checkpoint_event: Some(cp2.id),
+            }),
+        );
+        let undo = make_event(
+            5,
+            Some(restored.id),
+            EventKind::Undo(UndoEvent {
+                target_event_id: cp2.id,
+                mode: UndoMode::To(cp2.id),
+                restored_checkpoint_event: Some(restored.id),
+                file_scope: Some("src/file.ts".to_string()),
+            }),
+        );
+
+        let state =
+            replay_state(&[cp1, cp2, exploration_start, restored.clone(), undo]).expect("replay");
+        assert_eq!(state.latest_checkpoint_event_id, Some(restored.id));
+        assert!(state.explorations.contains_key(&Uuid::from_u128(21)));
     }
 
     fn make_event(id: u128, parent_id: Option<Uuid>, kind: EventKind) -> Event {

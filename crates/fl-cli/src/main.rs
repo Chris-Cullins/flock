@@ -38,6 +38,8 @@ enum Command {
         to: Option<String>,
         #[arg(long)]
         since: Option<String>,
+        #[arg(long = "file")]
+        file: Option<String>,
     },
     Git {
         #[command(subcommand)]
@@ -127,12 +129,13 @@ fn main() -> Result<()> {
                         event.timestamp, exp.action, exp.exploration_id, exp.title
                     ),
                     EventKind::Undo(undo) => println!(
-                        "{}  undo  target={}  restored={}",
+                        "{}  undo  target={}  restored={}  scope={}",
                         event.timestamp,
                         undo.target_event_id,
                         undo.restored_checkpoint_event
                             .map(|id| id.to_string())
-                            .unwrap_or_else(|| "none".to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        undo.file_scope.as_deref().unwrap_or("all")
                     ),
                     EventKind::GitBridge(bridge) => println!(
                         "{}  git:{:?}  success={}  {}",
@@ -220,10 +223,14 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Undo { n, to, since } => {
+        Command::Undo { n, to, since, file } => {
             let repo = Repo::discover(cwd)?;
             let request = build_undo_request(n, to, since)?;
-            let result = repo.undo(request)?;
+            let result = if let Some(path) = file {
+                repo.undo_file(request, path)?
+            } else {
+                repo.undo(request)?
+            };
 
             println!("undo target event: {}", result.target_event_id);
             if let Some(checkpoint_id) = result.restored_checkpoint_event {

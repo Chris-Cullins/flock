@@ -27,7 +27,7 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [x] `undo --n`
   - [x] `undo --to`
   - [x] `undo --since`
-- [ ] Add file-scoped undo semantics in colocated mode (best-effort fallback)
+- [x] Add file-scoped undo semantics in colocated mode (best-effort fallback)
 - [ ] Add repository refs abstraction (branches/tags/workspaces)
 - [ ] Add Merkle snapshot hash generation for checkpoints
 - [ ] Add storage integrity verifier command (`fl fsck`)

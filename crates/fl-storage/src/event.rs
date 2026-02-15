@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -56,6 +56,8 @@ pub struct UndoEvent {
     pub target_event_id: Uuid,
     pub mode: UndoMode,
     pub restored_checkpoint_event: Option<Uuid>,
+    #[serde(default)]
+    pub file_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
