@@ -9,6 +9,7 @@ anyhow.workspace = true
 blake3.workspace = true
 ed25519-dalek.workspace = true
 fl-bridge-git = { path = "../fl-bridge-git" }
+fl-collab = { path = "../fl-collab" }
 fl-semantic = { path = "../fl-semantic" }
 fl-storage = { path = "../fl-storage" }
 fl-workflow = { path = "../fl-workflow" }

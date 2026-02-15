@@ -5,8 +5,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use fl_core::repo::parse_duration_spec;
 use fl_core::{
-    ApiCallRecord, DecisionAction, EventKind, RefKind, Repo, SemanticChangeKind,
-    SemanticCompatibilityStatus, SemanticConflictClassification, SemanticRisk, UndoRequest,
+    ApiCallRecord, DecisionAction, EventKind, GateCondition, GatePolicy, RefKind, Repo,
+    SemanticChangeKind, SemanticCompatibilityStatus, SemanticConflictClassification, SemanticRisk,
+    UndoRequest,
 };
 use uuid::Uuid;
 
@@ -103,6 +104,35 @@ enum Command {
         tag: Option<String>,
     },
     QuickRestore,
+    Presence {
+        #[command(subcommand)]
+        command: PresenceCommand,
+    },
+    Lock {
+        #[command(subcommand)]
+        command: LockCommand,
+    },
+    Subscribe {
+        #[arg(long)]
+        path: Vec<String>,
+        #[arg(long)]
+        symbol: Vec<String>,
+        #[arg(long)]
+        module: Vec<String>,
+        #[arg(long)]
+        notify: Option<String>,
+    },
+    Unsubscribe {
+        id: String,
+    },
+    Subscriptions {
+        #[arg(long)]
+        json: bool,
+    },
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,6 +336,87 @@ enum TaskCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum PresenceCommand {
+    Heartbeat {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long)]
+        file: Vec<String>,
+        #[arg(long)]
+        intent: Option<String>,
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    Depart {
+        #[arg(long)]
+        workspace: String,
+    },
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum LockCommand {
+    Acquire {
+        resource: String,
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    List,
+    Release {
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GateCommand {
+    Create {
+        #[arg(long)]
+        condition: GateConditionArg,
+        #[arg(long)]
+        pattern: Option<String>,
+        #[arg(long)]
+        threshold: Option<u32>,
+        #[arg(long, default_value = "block")]
+        policy: GatePolicyArg,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Check {
+        path: String,
+    },
+    Approve {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Reject {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    Delete {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum GateConditionArg {
+    FileTouched,
+    SymbolModified,
+    ImpactExceeds,
+    SecuritySensitive,
+    AgentConfidenceLow,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum GatePolicyArg {
+    Block,
+    QueueAndContinue,
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum DecisionActionArg {
     Kept,
@@ -428,6 +539,22 @@ fn main() -> Result<()> {
                     EventKind::Task(task) => println!(
                         "{}  task:{:?}  {}  {}",
                         event.timestamp, task.action, task.task_id, task.title
+                    ),
+                    EventKind::Presence(p) => println!(
+                        "{}  presence:{:?}  {}  workspace={}",
+                        event.timestamp, p.action, p.actor, p.workspace
+                    ),
+                    EventKind::Lock(l) => println!(
+                        "{}  lock:{:?}  {}  resource={}  holder={}",
+                        event.timestamp, l.action, l.lock_id, l.resource, l.holder
+                    ),
+                    EventKind::Subscription(s) => println!(
+                        "{}  subscription:{:?}  {}  actor={}",
+                        event.timestamp, s.action, s.subscription_id, s.actor
+                    ),
+                    EventKind::Gate(g) => println!(
+                        "{}  gate:{:?}  {}",
+                        event.timestamp, g.action, g.gate_id
                     ),
                 }
             }
@@ -1619,6 +1746,276 @@ fn main() -> Result<()> {
             println!("restored to before event {}", result.target_event_id);
             if let Some(cp) = result.restored_checkpoint_event {
                 println!("new checkpoint: {}", cp);
+            }
+        }
+        Command::Presence { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                PresenceCommand::Heartbeat {
+                    workspace,
+                    file,
+                    intent,
+                    ttl,
+                } => {
+                    let presence = repo.heartbeat(workspace, file, intent, ttl)?;
+                    println!(
+                        "heartbeat: {} in {} (ttl={}s)",
+                        presence.actor,
+                        presence.workspace,
+                        presence.ttl.as_secs()
+                    );
+                }
+                PresenceCommand::Depart { workspace } => {
+                    repo.depart(workspace.clone())?;
+                    println!("departed from workspace {}", workspace);
+                }
+                PresenceCommand::List => {
+                    let presences = repo.list_presence()?;
+                    if presences.is_empty() {
+                        println!("No active presence.");
+                        return Ok(());
+                    }
+                    for p in &presences {
+                        let files_str = if p.active_files.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" files=[{}]", p.active_files.join(", "))
+                        };
+                        let intent_str = p
+                            .intent
+                            .as_deref()
+                            .map(|i| format!(" intent=\"{}\"", i))
+                            .unwrap_or_default();
+                        println!(
+                            "{}  {}  ttl={}s{}{}",
+                            p.actor,
+                            p.workspace,
+                            p.ttl.as_secs(),
+                            files_str,
+                            intent_str
+                        );
+                    }
+                }
+            }
+        }
+        Command::Lock { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                LockCommand::Acquire { resource, ttl } => {
+                    let lock = repo.acquire_lock(resource, ttl)?;
+                    println!(
+                        "lock {} acquired on `{}` by {} (ttl={}s)",
+                        &lock.id.to_string()[..8],
+                        lock.resource,
+                        lock.holder,
+                        lock.ttl.as_secs()
+                    );
+                }
+                LockCommand::List => {
+                    let locks = repo.list_locks()?;
+                    if locks.is_empty() {
+                        println!("No active locks.");
+                        return Ok(());
+                    }
+                    for lock in &locks {
+                        println!(
+                            "{}  {}  holder={}  ttl={}s",
+                            &lock.id.to_string()[..8],
+                            lock.resource,
+                            lock.holder,
+                            lock.ttl.as_secs()
+                        );
+                    }
+                }
+                LockCommand::Release { id } => {
+                    let lock_id = parse_uuid(&id)?;
+                    repo.release_lock(lock_id)?;
+                    println!("lock {} released", &id[..8.min(id.len())]);
+                }
+            }
+        }
+        Command::Subscribe {
+            path,
+            symbol,
+            module,
+            notify,
+        } => {
+            let repo = Repo::discover(cwd)?;
+            let sub = repo.subscribe(path, symbol, module, notify)?;
+            println!(
+                "subscription {} created (notify={})",
+                &sub.id.to_string()[..8],
+                sub.notify
+            );
+        }
+        Command::Unsubscribe { id } => {
+            let repo = Repo::discover(cwd)?;
+            let sub_id = parse_uuid(&id)?;
+            repo.unsubscribe(sub_id)?;
+            println!("subscription {} cancelled", &id[..8.min(id.len())]);
+        }
+        Command::Subscriptions { json } => {
+            let repo = Repo::discover(cwd)?;
+            let subs = repo.list_subscriptions()?;
+
+            if json {
+                let json_subs: Vec<serde_json::Value> = subs
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "id": s.id.to_string(),
+                            "actor": s.actor,
+                            "status": s.status.to_string(),
+                            "paths": s.paths,
+                            "symbols": s.symbols,
+                            "modules": s.modules,
+                            "notify": s.notify.to_string(),
+                            "created_at": s.created_at,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&json_subs)?);
+                return Ok(());
+            }
+
+            if subs.is_empty() {
+                println!("No active subscriptions.");
+                return Ok(());
+            }
+            for sub in &subs {
+                let mut filters = Vec::new();
+                if !sub.paths.is_empty() {
+                    filters.push(format!("paths=[{}]", sub.paths.join(", ")));
+                }
+                if !sub.symbols.is_empty() {
+                    filters.push(format!("symbols=[{}]", sub.symbols.join(", ")));
+                }
+                if !sub.modules.is_empty() {
+                    filters.push(format!("modules=[{}]", sub.modules.join(", ")));
+                }
+                println!(
+                    "{}  {}  {}  notify={}",
+                    &sub.id.to_string()[..8],
+                    sub.actor,
+                    filters.join(" "),
+                    sub.notify
+                );
+            }
+        }
+        Command::Gate { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                GateCommand::Create {
+                    condition,
+                    pattern,
+                    threshold,
+                    policy,
+                } => {
+                    let gate_condition = match condition {
+                        GateConditionArg::FileTouched => {
+                            let p = pattern.ok_or_else(|| {
+                                anyhow::anyhow!("--pattern required for file-touched condition")
+                            })?;
+                            GateCondition::FileTouched(p)
+                        }
+                        GateConditionArg::SymbolModified => {
+                            let p = pattern.ok_or_else(|| {
+                                anyhow::anyhow!("--pattern required for symbol-modified condition")
+                            })?;
+                            GateCondition::SymbolModified(p)
+                        }
+                        GateConditionArg::ImpactExceeds => {
+                            let t = threshold.ok_or_else(|| {
+                                anyhow::anyhow!("--threshold required for impact-exceeds condition")
+                            })?;
+                            GateCondition::ImpactExceeds(t)
+                        }
+                        GateConditionArg::SecuritySensitive => GateCondition::SecuritySensitive,
+                        GateConditionArg::AgentConfidenceLow => {
+                            let t = threshold.unwrap_or(80);
+                            GateCondition::AgentConfidenceLow(t)
+                        }
+                    };
+                    let gate_policy = match policy {
+                        GatePolicyArg::Block => GatePolicy::Block,
+                        GatePolicyArg::QueueAndContinue => GatePolicy::QueueAndContinue,
+                    };
+                    let gate = repo.create_gate(gate_condition, gate_policy)?;
+                    println!(
+                        "gate {} created: {} (policy={})",
+                        &gate.id.to_string()[..8],
+                        gate.condition,
+                        gate.policy
+                    );
+                }
+                GateCommand::List { json } => {
+                    let gates = repo.list_gates()?;
+                    if json {
+                        let json_gates: Vec<serde_json::Value> = gates
+                            .iter()
+                            .map(|g| {
+                                serde_json::json!({
+                                    "id": g.id.to_string(),
+                                    "status": g.status.to_string(),
+                                    "condition": g.condition.to_string(),
+                                    "policy": g.policy.to_string(),
+                                    "created_at": g.created_at,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&json_gates)?);
+                        return Ok(());
+                    }
+                    if gates.is_empty() {
+                        println!("No active gates.");
+                        return Ok(());
+                    }
+                    for gate in &gates {
+                        println!(
+                            "{}  {}  {}  policy={}",
+                            &gate.id.to_string()[..8],
+                            gate.status,
+                            gate.condition,
+                            gate.policy
+                        );
+                    }
+                }
+                GateCommand::Check { path } => {
+                    let blocking = repo.check_gates_for_path(&path)?;
+                    if blocking.is_empty() {
+                        println!("No gates block path `{}`.", path);
+                    } else {
+                        println!(
+                            "{} gate{} block path `{}`:",
+                            blocking.len(),
+                            if blocking.len() == 1 { "" } else { "s" },
+                            path
+                        );
+                        for gate in &blocking {
+                            println!(
+                                "  {}  {}  policy={}",
+                                &gate.id.to_string()[..8],
+                                gate.condition,
+                                gate.policy
+                            );
+                        }
+                    }
+                }
+                GateCommand::Approve { id, reason } => {
+                    let gate_id = parse_uuid(&id)?;
+                    repo.approve_gate(gate_id, reason)?;
+                    println!("gate {} approved", &id[..8.min(id.len())]);
+                }
+                GateCommand::Reject { id, reason } => {
+                    let gate_id = parse_uuid(&id)?;
+                    repo.reject_gate(gate_id, reason)?;
+                    println!("gate {} rejected", &id[..8.min(id.len())]);
+                }
+                GateCommand::Delete { id } => {
+                    let gate_id = parse_uuid(&id)?;
+                    repo.delete_gate(gate_id)?;
+                    println!("gate {} deleted", &id[..8.min(id.len())]);
+                }
             }
         }
     }

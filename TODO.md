@@ -114,13 +114,13 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## 8. Collaboration Layer
 
-- [ ] Implement presence model and heartbeat protocol
-- [ ] Add advisory lock API with TTL:
-  - [ ] `fl lock acquire`
-  - [ ] `fl lock list`
-  - [ ] `fl lock release`
-- [ ] Implement change subscriptions and notification filters
-- [ ] Implement human-in-the-loop gates and policies
+- [x] Implement presence model and heartbeat protocol
+- [x] Add advisory lock API with TTL:
+  - [x] `fl lock acquire`
+  - [x] `fl lock list`
+  - [x] `fl lock release`
+- [x] Implement change subscriptions and notification filters
+- [x] Implement human-in-the-loop gates and policies
 - [ ] Implement continuous auto-rebase for active workspaces
 - [ ] Implement conflict resolution workflow:
   - [ ] detect

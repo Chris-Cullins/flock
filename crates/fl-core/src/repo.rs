@@ -17,9 +17,12 @@ use walkdir::WalkDir;
 
 use crate::event::{
     CheckpointEvent, DecisionAction, DecisionEvent, Event, EventKind, ExplorationAction,
-    ExplorationEvent, GitBridgeAction, GitBridgeEvent, ResourceUsageEvent, SessionAction,
-    SessionEvent, TaskAction, TaskEvent, UndoEvent,
+    ExplorationEvent, GateAction, GateCondition, GateEvent, GatePolicy, GitBridgeAction,
+    GitBridgeEvent, LockAction, LockEvent, NotifyConfig, PresenceAction, PresenceEvent,
+    ResourceUsageEvent, SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent,
+    SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
 };
+use fl_collab::can_acquire_lock;
 use fl_storage::ApiCallRecord;
 use crate::semantic::{
     SemanticFileDiff, SemanticMergeResult, diff as semantic_diff, supported_source,
@@ -28,6 +31,10 @@ use fl_workflow::{
     build_task_graph, previous_checkpoint_before, replay_state, resolve_target_event, to_undo_mode,
 };
 
+pub use fl_collab::{
+    GateConditionKind, GatePolicyKind, GateStatus, GateSummary, LockStatus, LockSummary,
+    PresenceSummary, SubscriptionNotify, SubscriptionStatus, SubscriptionSummary,
+};
 pub use fl_workflow::parse_duration_spec;
 pub use fl_workflow::{
     DecisionSummary, ExplorationStatus, ExplorationSummary, ReplayedState, ResourceUsageTotals,
@@ -429,6 +436,10 @@ impl Repo {
                 EventKind::Decision(_) => {}
                 EventKind::ResourceUsage(_) => {}
                 EventKind::Task(_) => {}
+                EventKind::Presence(_) => {}
+                EventKind::Lock(_) => {}
+                EventKind::Subscription(_) => {}
+                EventKind::Gate(_) => {}
             }
         }
 
@@ -2906,6 +2917,350 @@ impl Repo {
         let secret = <[u8; 32]>::try_from(raw.as_slice())
             .with_context(|| format!("invalid signing key length in {}", key_path.display()))?;
         Ok(SigningKey::from_bytes(&secret))
+    }
+
+    // --- Collaboration: Presence ---
+
+    pub fn heartbeat(
+        &self,
+        workspace: String,
+        active_files: Vec<String>,
+        intent: Option<String>,
+        ttl_secs: Option<u64>,
+    ) -> Result<PresenceSummary> {
+        self.assert_initialized()?;
+        let actor = self.current_actor();
+        let ttl = ttl_secs.unwrap_or(300);
+        self.append_event(EventKind::Presence(PresenceEvent {
+            actor: actor.clone(),
+            workspace: workspace.clone(),
+            action: PresenceAction::Heartbeat,
+            active_files: active_files.clone(),
+            intent: intent.clone(),
+            ttl_secs: ttl,
+        }))?;
+        Ok(PresenceSummary {
+            actor,
+            workspace,
+            active_files,
+            intent,
+            ttl: std::time::Duration::from_secs(ttl),
+            last_heartbeat: self.now_nanos_str(),
+        })
+    }
+
+    pub fn depart(&self, workspace: String) -> Result<()> {
+        self.assert_initialized()?;
+        let actor = self.current_actor();
+        self.append_event(EventKind::Presence(PresenceEvent {
+            actor,
+            workspace,
+            action: PresenceAction::Depart,
+            active_files: Vec::new(),
+            intent: None,
+            ttl_secs: 0,
+        }))?;
+        Ok(())
+    }
+
+    pub fn list_presence(&self) -> Result<Vec<PresenceSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let now_nanos = self.now_nanos();
+        Ok(state
+            .presence
+            .into_values()
+            .filter(|p| !p.is_expired_at(now_nanos))
+            .collect())
+    }
+
+    // --- Collaboration: Advisory Locks ---
+
+    pub fn acquire_lock(
+        &self,
+        resource: String,
+        ttl_secs: Option<u64>,
+    ) -> Result<LockSummary> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let now_nanos = self.now_nanos();
+
+        can_acquire_lock(&resource, &state.locks, now_nanos)?;
+
+        let lock_id = Uuid::new_v4();
+        let holder = self.current_actor();
+        let ttl = ttl_secs.unwrap_or(600);
+        self.append_event(EventKind::Lock(LockEvent {
+            lock_id,
+            resource: resource.clone(),
+            holder: holder.clone(),
+            action: LockAction::Acquire,
+            ttl_secs: ttl,
+        }))?;
+        Ok(LockSummary {
+            id: lock_id,
+            resource,
+            holder,
+            status: LockStatus::Held,
+            ttl: std::time::Duration::from_secs(ttl),
+            acquired_at: self.now_nanos_str(),
+            released_at: None,
+        })
+    }
+
+    pub fn release_lock(&self, lock_id: Uuid) -> Result<()> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let lock = state
+            .locks
+            .get(&lock_id)
+            .ok_or_else(|| anyhow!("lock {} not found", lock_id))?;
+        if lock.status != LockStatus::Held {
+            bail!("lock {} is already released", lock_id);
+        }
+        self.append_event(EventKind::Lock(LockEvent {
+            lock_id,
+            resource: lock.resource.clone(),
+            holder: lock.holder.clone(),
+            action: LockAction::Release,
+            ttl_secs: 0,
+        }))?;
+        Ok(())
+    }
+
+    pub fn list_locks(&self) -> Result<Vec<LockSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let now_nanos = self.now_nanos();
+        Ok(state
+            .locks
+            .into_values()
+            .filter(|l| l.status == LockStatus::Held && !l.is_expired_at(now_nanos))
+            .collect())
+    }
+
+    // --- Collaboration: Subscriptions ---
+
+    pub fn subscribe(
+        &self,
+        paths: Vec<String>,
+        symbols: Vec<String>,
+        modules: Vec<String>,
+        notify: Option<String>,
+    ) -> Result<SubscriptionSummary> {
+        self.assert_initialized()?;
+        let actor = self.current_actor();
+        let subscription_id = Uuid::new_v4();
+        let notify_config = match notify.as_deref() {
+            Some("batched") => NotifyConfig::Batched,
+            Some("digest") => NotifyConfig::Digest,
+            _ => NotifyConfig::Immediate,
+        };
+        let notify_kind = match notify_config {
+            NotifyConfig::Immediate => SubscriptionNotify::Immediate,
+            NotifyConfig::Batched => SubscriptionNotify::Batched,
+            NotifyConfig::Digest => SubscriptionNotify::Digest,
+        };
+        self.append_event(EventKind::Subscription(SubscriptionEvent {
+            subscription_id,
+            actor: actor.clone(),
+            action: SubscriptionAction::Subscribe,
+            filter: Some(SubscriptionFilter {
+                paths: paths.clone(),
+                symbols: symbols.clone(),
+                modules: modules.clone(),
+            }),
+            notify: Some(notify_config),
+        }))?;
+        Ok(SubscriptionSummary {
+            id: subscription_id,
+            actor,
+            status: SubscriptionStatus::Active,
+            paths,
+            symbols,
+            modules,
+            notify: notify_kind,
+            created_at: self.now_nanos_str(),
+            cancelled_at: None,
+        })
+    }
+
+    pub fn unsubscribe(&self, subscription_id: Uuid) -> Result<()> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let sub = state
+            .subscriptions
+            .get(&subscription_id)
+            .ok_or_else(|| anyhow!("subscription {} not found", subscription_id))?;
+        if sub.status != SubscriptionStatus::Active {
+            bail!("subscription {} is already cancelled", subscription_id);
+        }
+        self.append_event(EventKind::Subscription(SubscriptionEvent {
+            subscription_id,
+            actor: sub.actor.clone(),
+            action: SubscriptionAction::Unsubscribe,
+            filter: None,
+            notify: None,
+        }))?;
+        Ok(())
+    }
+
+    pub fn list_subscriptions(&self) -> Result<Vec<SubscriptionSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        Ok(state
+            .subscriptions
+            .into_values()
+            .filter(|s| s.status == SubscriptionStatus::Active)
+            .collect())
+    }
+
+    // --- Collaboration: Gates ---
+
+    pub fn create_gate(
+        &self,
+        condition: GateCondition,
+        policy: GatePolicy,
+    ) -> Result<GateSummary> {
+        self.assert_initialized()?;
+        let gate_id = Uuid::new_v4();
+        let condition_kind = match &condition {
+            GateCondition::FileTouched(p) => GateConditionKind::FileTouched(p.clone()),
+            GateCondition::SymbolModified(s) => GateConditionKind::SymbolModified(s.clone()),
+            GateCondition::ImpactExceeds(n) => GateConditionKind::ImpactExceeds(*n),
+            GateCondition::SecuritySensitive => GateConditionKind::SecuritySensitive,
+            GateCondition::AgentConfidenceLow(n) => GateConditionKind::AgentConfidenceLow(*n),
+        };
+        let policy_kind = match policy {
+            GatePolicy::Block => GatePolicyKind::Block,
+            GatePolicy::QueueAndContinue => GatePolicyKind::QueueAndContinue,
+        };
+        self.append_event(EventKind::Gate(GateEvent {
+            gate_id,
+            action: GateAction::Create,
+            condition: Some(condition),
+            policy: Some(policy),
+            approved_by: None,
+            reason: None,
+        }))?;
+        Ok(GateSummary {
+            id: gate_id,
+            status: GateStatus::Active,
+            condition: condition_kind,
+            policy: policy_kind,
+            approved_by: None,
+            reason: None,
+            created_at: self.now_nanos_str(),
+            resolved_at: None,
+        })
+    }
+
+    pub fn approve_gate(&self, gate_id: Uuid, reason: Option<String>) -> Result<()> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let gate = state
+            .gates
+            .get(&gate_id)
+            .ok_or_else(|| anyhow!("gate {} not found", gate_id))?;
+        if gate.status != GateStatus::Active {
+            bail!("gate {} is not active (status: {})", gate_id, gate.status);
+        }
+        let actor = self.current_actor();
+        self.append_event(EventKind::Gate(GateEvent {
+            gate_id,
+            action: GateAction::Approve,
+            condition: None,
+            policy: None,
+            approved_by: Some(actor),
+            reason,
+        }))?;
+        Ok(())
+    }
+
+    pub fn reject_gate(&self, gate_id: Uuid, reason: Option<String>) -> Result<()> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let gate = state
+            .gates
+            .get(&gate_id)
+            .ok_or_else(|| anyhow!("gate {} not found", gate_id))?;
+        if gate.status != GateStatus::Active {
+            bail!("gate {} is not active (status: {})", gate_id, gate.status);
+        }
+        let actor = self.current_actor();
+        self.append_event(EventKind::Gate(GateEvent {
+            gate_id,
+            action: GateAction::Reject,
+            condition: None,
+            policy: None,
+            approved_by: Some(actor),
+            reason,
+        }))?;
+        Ok(())
+    }
+
+    pub fn delete_gate(&self, gate_id: Uuid) -> Result<()> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let _gate = state
+            .gates
+            .get(&gate_id)
+            .ok_or_else(|| anyhow!("gate {} not found", gate_id))?;
+        self.append_event(EventKind::Gate(GateEvent {
+            gate_id,
+            action: GateAction::Delete,
+            condition: None,
+            policy: None,
+            approved_by: None,
+            reason: None,
+        }))?;
+        Ok(())
+    }
+
+    pub fn list_gates(&self) -> Result<Vec<GateSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        Ok(state
+            .gates
+            .into_values()
+            .filter(|g| g.status == GateStatus::Active)
+            .collect())
+    }
+
+    pub fn check_gates_for_path(&self, path: &str) -> Result<Vec<GateSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        Ok(fl_collab::check_gates_for_path(path, &state.gates))
+    }
+
+    // --- Helper methods for collaboration ---
+
+    fn current_actor(&self) -> String {
+        env::var("FL_ACTOR")
+            .or_else(|_| env::var("USER"))
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+
+    fn now_nanos(&self) -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    fn now_nanos_str(&self) -> String {
+        self.now_nanos().to_string()
     }
 }
 

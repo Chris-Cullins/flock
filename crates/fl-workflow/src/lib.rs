@@ -3,9 +3,14 @@ use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use fl_collab::{
+    GateConditionKind, GatePolicyKind, GateStatus, GateSummary, LockStatus, LockSummary,
+    PresenceSummary, SubscriptionNotify, SubscriptionStatus, SubscriptionSummary,
+};
 use fl_storage::{
-    ApiCallRecord, DecisionAction, Event, EventKind, ExplorationAction, SessionAction, TaskAction,
-    UndoMode,
+    ApiCallRecord, DecisionAction, Event, EventKind, ExplorationAction, GateAction, GateCondition,
+    GatePolicy, LockAction, NotifyConfig, PresenceAction, SessionAction, SubscriptionAction,
+    TaskAction, UndoMode,
 };
 use uuid::Uuid;
 
@@ -174,6 +179,10 @@ pub struct ReplayedState {
     pub explorations: BTreeMap<Uuid, ExplorationSummary>,
     pub sessions: BTreeMap<Uuid, SessionSummary>,
     pub tasks: BTreeMap<Uuid, TaskSummary>,
+    pub presence: BTreeMap<String, PresenceSummary>,
+    pub locks: BTreeMap<Uuid, LockSummary>,
+    pub subscriptions: BTreeMap<Uuid, SubscriptionSummary>,
+    pub gates: BTreeMap<Uuid, GateSummary>,
     pub applied_event_ids: Vec<Uuid>,
 }
 
@@ -184,6 +193,10 @@ struct ReplayAccumulator {
     explorations: BTreeMap<Uuid, ExplorationSummary>,
     sessions: BTreeMap<Uuid, SessionSummary>,
     tasks: BTreeMap<Uuid, TaskSummary>,
+    presence: BTreeMap<String, PresenceSummary>,
+    locks: BTreeMap<Uuid, LockSummary>,
+    subscriptions: BTreeMap<Uuid, SubscriptionSummary>,
+    gates: BTreeMap<Uuid, GateSummary>,
     applied_event_ids: Vec<Uuid>,
 }
 
@@ -209,6 +222,10 @@ impl ReplayAccumulator {
             explorations: self.explorations,
             sessions: self.sessions,
             tasks,
+            presence: self.presence,
+            locks: self.locks,
+            subscriptions: self.subscriptions,
+            gates: self.gates,
             applied_event_ids: self.applied_event_ids,
         }
     }
@@ -376,6 +393,129 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     }
                 }
             }
+            EventKind::Presence(presence) => match presence.action {
+                PresenceAction::Heartbeat => {
+                    let key = format!("{}@{}", presence.actor, presence.workspace);
+                    state.presence.insert(
+                        key,
+                        PresenceSummary {
+                            actor: presence.actor.clone(),
+                            workspace: presence.workspace.clone(),
+                            active_files: presence.active_files.clone(),
+                            intent: presence.intent.clone(),
+                            ttl: Duration::from_secs(presence.ttl_secs),
+                            last_heartbeat: event.timestamp.clone(),
+                        },
+                    );
+                }
+                PresenceAction::Depart => {
+                    let key = format!("{}@{}", presence.actor, presence.workspace);
+                    state.presence.remove(&key);
+                }
+            },
+            EventKind::Lock(lock) => match lock.action {
+                LockAction::Acquire => {
+                    state.locks.insert(
+                        lock.lock_id,
+                        LockSummary {
+                            id: lock.lock_id,
+                            resource: lock.resource.clone(),
+                            holder: lock.holder.clone(),
+                            status: LockStatus::Held,
+                            ttl: Duration::from_secs(lock.ttl_secs),
+                            acquired_at: event.timestamp.clone(),
+                            released_at: None,
+                        },
+                    );
+                }
+                LockAction::Release => {
+                    if let Some(entry) = state.locks.get_mut(&lock.lock_id) {
+                        entry.status = LockStatus::Released;
+                        entry.released_at = Some(event.timestamp.clone());
+                    }
+                }
+            },
+            EventKind::Subscription(sub) => match sub.action {
+                SubscriptionAction::Subscribe => {
+                    let filter = sub.filter.as_ref();
+                    let notify = match sub.notify.as_ref() {
+                        Some(NotifyConfig::Immediate) | None => SubscriptionNotify::Immediate,
+                        Some(NotifyConfig::Batched) => SubscriptionNotify::Batched,
+                        Some(NotifyConfig::Digest) => SubscriptionNotify::Digest,
+                    };
+                    state.subscriptions.insert(
+                        sub.subscription_id,
+                        SubscriptionSummary {
+                            id: sub.subscription_id,
+                            actor: sub.actor.clone(),
+                            status: SubscriptionStatus::Active,
+                            paths: filter.map(|f| f.paths.clone()).unwrap_or_default(),
+                            symbols: filter.map(|f| f.symbols.clone()).unwrap_or_default(),
+                            modules: filter.map(|f| f.modules.clone()).unwrap_or_default(),
+                            notify,
+                            created_at: event.timestamp.clone(),
+                            cancelled_at: None,
+                        },
+                    );
+                }
+                SubscriptionAction::Unsubscribe => {
+                    if let Some(entry) = state.subscriptions.get_mut(&sub.subscription_id) {
+                        entry.status = SubscriptionStatus::Cancelled;
+                        entry.cancelled_at = Some(event.timestamp.clone());
+                    }
+                }
+            },
+            EventKind::Gate(gate) => match gate.action {
+                GateAction::Create => {
+                    let condition = match &gate.condition {
+                        Some(GateCondition::FileTouched(p)) => GateConditionKind::FileTouched(p.clone()),
+                        Some(GateCondition::SymbolModified(s)) => GateConditionKind::SymbolModified(s.clone()),
+                        Some(GateCondition::ImpactExceeds(n)) => GateConditionKind::ImpactExceeds(*n),
+                        Some(GateCondition::SecuritySensitive) => GateConditionKind::SecuritySensitive,
+                        Some(GateCondition::AgentConfidenceLow(n)) => GateConditionKind::AgentConfidenceLow(*n),
+                        None => GateConditionKind::SecuritySensitive,
+                    };
+                    let policy = match gate.policy {
+                        Some(GatePolicy::QueueAndContinue) => GatePolicyKind::QueueAndContinue,
+                        Some(GatePolicy::Block) | None => GatePolicyKind::Block,
+                    };
+                    state.gates.insert(
+                        gate.gate_id,
+                        GateSummary {
+                            id: gate.gate_id,
+                            status: GateStatus::Active,
+                            condition,
+                            policy,
+                            approved_by: None,
+                            reason: None,
+                            created_at: event.timestamp.clone(),
+                            resolved_at: None,
+                        },
+                    );
+                }
+                GateAction::Approve => {
+                    if let Some(entry) = state.gates.get_mut(&gate.gate_id) {
+                        entry.status = GateStatus::Approved;
+                        entry.approved_by = gate.approved_by.clone();
+                        entry.reason = gate.reason.clone();
+                        entry.resolved_at = Some(event.timestamp.clone());
+                    }
+                }
+                GateAction::Reject => {
+                    if let Some(entry) = state.gates.get_mut(&gate.gate_id) {
+                        entry.status = GateStatus::Rejected;
+                        entry.approved_by = gate.approved_by.clone();
+                        entry.reason = gate.reason.clone();
+                        entry.resolved_at = Some(event.timestamp.clone());
+                    }
+                }
+                GateAction::Delete => {
+                    if let Some(entry) = state.gates.get_mut(&gate.gate_id) {
+                        entry.status = GateStatus::Deleted;
+                        entry.resolved_at = Some(event.timestamp.clone());
+                    }
+                }
+            },
             EventKind::Task(task) => match task.action {
                 TaskAction::Create => {
                     state.tasks.insert(
@@ -458,6 +598,22 @@ pub fn replay_sessions(events: &[Event]) -> Result<BTreeMap<Uuid, SessionSummary
 
 pub fn replay_tasks(events: &[Event]) -> Result<BTreeMap<Uuid, TaskSummary>> {
     Ok(replay_state(events)?.tasks)
+}
+
+pub fn replay_presence(events: &[Event]) -> Result<BTreeMap<String, PresenceSummary>> {
+    Ok(replay_state(events)?.presence)
+}
+
+pub fn replay_locks(events: &[Event]) -> Result<BTreeMap<Uuid, LockSummary>> {
+    Ok(replay_state(events)?.locks)
+}
+
+pub fn replay_subscriptions(events: &[Event]) -> Result<BTreeMap<Uuid, SubscriptionSummary>> {
+    Ok(replay_state(events)?.subscriptions)
+}
+
+pub fn replay_gates(events: &[Event]) -> Result<BTreeMap<Uuid, GateSummary>> {
+    Ok(replay_state(events)?.gates)
 }
 
 pub fn build_task_graph(tasks: &BTreeMap<Uuid, TaskSummary>) -> TaskGraph {
@@ -1173,6 +1329,272 @@ mod tests {
 
         assert_eq!(graph.tasks.len(), 2);
         assert_eq!(graph.edges.len(), 2); // 1 DependsOn + 1 DiscoveredFrom
+    }
+
+    #[test]
+    fn replay_presence_heartbeat_and_depart() {
+        let heartbeat = make_event(
+            1,
+            None,
+            EventKind::Presence(fl_storage::PresenceEvent {
+                actor: "agent-1".to_string(),
+                workspace: "ws1".to_string(),
+                action: fl_storage::PresenceAction::Heartbeat,
+                active_files: vec!["src/main.rs".to_string()],
+                intent: Some("refactoring".to_string()),
+                ttl_secs: 300,
+            }),
+        );
+        let state = replay_state(&[heartbeat.clone()]).expect("replay");
+        assert_eq!(state.presence.len(), 1);
+        let p = state.presence.get("agent-1@ws1").expect("presence");
+        assert_eq!(p.actor, "agent-1");
+        assert_eq!(p.workspace, "ws1");
+        assert_eq!(p.active_files, vec!["src/main.rs"]);
+        assert_eq!(p.intent.as_deref(), Some("refactoring"));
+        assert_eq!(p.ttl.as_secs(), 300);
+
+        let depart = make_event(
+            2,
+            Some(heartbeat.id),
+            EventKind::Presence(fl_storage::PresenceEvent {
+                actor: "agent-1".to_string(),
+                workspace: "ws1".to_string(),
+                action: fl_storage::PresenceAction::Depart,
+                active_files: Vec::new(),
+                intent: None,
+                ttl_secs: 0,
+            }),
+        );
+        let state2 = replay_state(&[heartbeat, depart]).expect("replay");
+        assert!(state2.presence.is_empty());
+    }
+
+    #[test]
+    fn replay_lock_acquire_and_release() {
+        let acquire = make_event(
+            1,
+            None,
+            EventKind::Lock(fl_storage::LockEvent {
+                lock_id: Uuid::from_u128(50),
+                resource: "src/api.ts".to_string(),
+                holder: "agent-1".to_string(),
+                action: fl_storage::LockAction::Acquire,
+                ttl_secs: 600,
+            }),
+        );
+        let state = replay_state(&[acquire.clone()]).expect("replay");
+        assert_eq!(state.locks.len(), 1);
+        let lock = state.locks.get(&Uuid::from_u128(50)).expect("lock");
+        assert_eq!(lock.resource, "src/api.ts");
+        assert_eq!(lock.holder, "agent-1");
+        assert_eq!(lock.status, fl_collab::LockStatus::Held);
+        assert_eq!(lock.ttl.as_secs(), 600);
+
+        let release = make_event(
+            2,
+            Some(acquire.id),
+            EventKind::Lock(fl_storage::LockEvent {
+                lock_id: Uuid::from_u128(50),
+                resource: "src/api.ts".to_string(),
+                holder: "agent-1".to_string(),
+                action: fl_storage::LockAction::Release,
+                ttl_secs: 0,
+            }),
+        );
+        let state2 = replay_state(&[acquire, release]).expect("replay");
+        let lock2 = state2.locks.get(&Uuid::from_u128(50)).expect("lock");
+        assert_eq!(lock2.status, fl_collab::LockStatus::Released);
+        assert!(lock2.released_at.is_some());
+    }
+
+    #[test]
+    fn replay_subscription_lifecycle() {
+        let subscribe = make_event(
+            1,
+            None,
+            EventKind::Subscription(fl_storage::SubscriptionEvent {
+                subscription_id: Uuid::from_u128(60),
+                actor: "agent-1".to_string(),
+                action: fl_storage::SubscriptionAction::Subscribe,
+                filter: Some(fl_storage::SubscriptionFilter {
+                    paths: vec!["src/api/*".to_string()],
+                    symbols: vec!["processPayment".to_string()],
+                    modules: Vec::new(),
+                }),
+                notify: Some(fl_storage::NotifyConfig::Batched),
+            }),
+        );
+        let state = replay_state(&[subscribe.clone()]).expect("replay");
+        assert_eq!(state.subscriptions.len(), 1);
+        let sub = state.subscriptions.get(&Uuid::from_u128(60)).expect("sub");
+        assert_eq!(sub.actor, "agent-1");
+        assert_eq!(sub.status, fl_collab::SubscriptionStatus::Active);
+        assert_eq!(sub.paths, vec!["src/api/*"]);
+        assert_eq!(sub.symbols, vec!["processPayment"]);
+        assert_eq!(sub.notify, fl_collab::SubscriptionNotify::Batched);
+
+        let unsubscribe = make_event(
+            2,
+            Some(subscribe.id),
+            EventKind::Subscription(fl_storage::SubscriptionEvent {
+                subscription_id: Uuid::from_u128(60),
+                actor: "agent-1".to_string(),
+                action: fl_storage::SubscriptionAction::Unsubscribe,
+                filter: None,
+                notify: None,
+            }),
+        );
+        let state2 = replay_state(&[subscribe, unsubscribe]).expect("replay");
+        let sub2 = state2.subscriptions.get(&Uuid::from_u128(60)).expect("sub");
+        assert_eq!(sub2.status, fl_collab::SubscriptionStatus::Cancelled);
+        assert!(sub2.cancelled_at.is_some());
+    }
+
+    #[test]
+    fn replay_gate_create_approve_reject() {
+        let create = make_event(
+            1,
+            None,
+            EventKind::Gate(fl_storage::GateEvent {
+                gate_id: Uuid::from_u128(70),
+                action: fl_storage::GateAction::Create,
+                condition: Some(fl_storage::GateCondition::FileTouched(
+                    "src/payments/*".to_string(),
+                )),
+                policy: Some(fl_storage::GatePolicy::Block),
+                approved_by: None,
+                reason: None,
+            }),
+        );
+        let state = replay_state(&[create.clone()]).expect("replay");
+        assert_eq!(state.gates.len(), 1);
+        let gate = state.gates.get(&Uuid::from_u128(70)).expect("gate");
+        assert_eq!(gate.status, fl_collab::GateStatus::Active);
+        assert_eq!(
+            gate.condition,
+            fl_collab::GateConditionKind::FileTouched("src/payments/*".to_string())
+        );
+        assert_eq!(gate.policy, fl_collab::GatePolicyKind::Block);
+
+        let approve = make_event(
+            2,
+            Some(create.id),
+            EventKind::Gate(fl_storage::GateEvent {
+                gate_id: Uuid::from_u128(70),
+                action: fl_storage::GateAction::Approve,
+                condition: None,
+                policy: None,
+                approved_by: Some("reviewer".to_string()),
+                reason: Some("looks good".to_string()),
+            }),
+        );
+        let state2 = replay_state(&[create.clone(), approve]).expect("replay");
+        let gate2 = state2.gates.get(&Uuid::from_u128(70)).expect("gate");
+        assert_eq!(gate2.status, fl_collab::GateStatus::Approved);
+        assert_eq!(gate2.approved_by.as_deref(), Some("reviewer"));
+        assert_eq!(gate2.reason.as_deref(), Some("looks good"));
+
+        // Test reject path
+        let reject = make_event(
+            3,
+            Some(create.id),
+            EventKind::Gate(fl_storage::GateEvent {
+                gate_id: Uuid::from_u128(71),
+                action: fl_storage::GateAction::Create,
+                condition: Some(fl_storage::GateCondition::SecuritySensitive),
+                policy: Some(fl_storage::GatePolicy::QueueAndContinue),
+                approved_by: None,
+                reason: None,
+            }),
+        );
+        let reject_ev = make_event(
+            4,
+            Some(reject.id),
+            EventKind::Gate(fl_storage::GateEvent {
+                gate_id: Uuid::from_u128(71),
+                action: fl_storage::GateAction::Reject,
+                condition: None,
+                policy: None,
+                approved_by: Some("admin".to_string()),
+                reason: Some("too risky".to_string()),
+            }),
+        );
+        let state3 = replay_state(&[reject, reject_ev]).expect("replay");
+        let gate3 = state3.gates.get(&Uuid::from_u128(71)).expect("gate");
+        assert_eq!(gate3.status, fl_collab::GateStatus::Rejected);
+    }
+
+    #[test]
+    fn lock_conflict_detection() {
+        let mut locks = std::collections::BTreeMap::new();
+        locks.insert(
+            Uuid::from_u128(1),
+            fl_collab::LockSummary {
+                id: Uuid::from_u128(1),
+                resource: "src/file.ts".to_string(),
+                holder: "agent-1".to_string(),
+                status: fl_collab::LockStatus::Held,
+                ttl: std::time::Duration::from_secs(600),
+                acquired_at: "1000000000000000000".to_string(),
+                released_at: None,
+            },
+        );
+
+        // Lock is held and not expired -> conflict
+        let now = 1000000000100000000u128; // 0.1s later
+        assert!(fl_collab::can_acquire_lock("src/file.ts", &locks, now).is_err());
+
+        // Different resource -> ok
+        assert!(fl_collab::can_acquire_lock("src/other.ts", &locks, now).is_ok());
+
+        // Lock expired -> ok
+        let far_future = 1000000000000000000u128 + 601_000_000_000; // 601s later (> 600s TTL)
+        assert!(fl_collab::can_acquire_lock("src/file.ts", &locks, far_future).is_ok());
+    }
+
+    #[test]
+    fn subscription_path_matching() {
+        let sub = fl_collab::SubscriptionSummary {
+            id: Uuid::from_u128(1),
+            actor: "agent".to_string(),
+            status: fl_collab::SubscriptionStatus::Active,
+            paths: vec!["src/api/*".to_string(), "README.md".to_string()],
+            symbols: Vec::new(),
+            modules: Vec::new(),
+            notify: fl_collab::SubscriptionNotify::Immediate,
+            created_at: "0".to_string(),
+            cancelled_at: None,
+        };
+
+        assert!(fl_collab::subscription_matches_path(&sub, "src/api/handler.ts"));
+        assert!(fl_collab::subscription_matches_path(&sub, "src/api/"));
+        assert!(fl_collab::subscription_matches_path(&sub, "README.md"));
+        assert!(!fl_collab::subscription_matches_path(&sub, "src/lib.rs"));
+    }
+
+    #[test]
+    fn gate_path_checking() {
+        let mut gates = std::collections::BTreeMap::new();
+        gates.insert(
+            Uuid::from_u128(1),
+            fl_collab::GateSummary {
+                id: Uuid::from_u128(1),
+                status: fl_collab::GateStatus::Active,
+                condition: fl_collab::GateConditionKind::FileTouched("src/payments/*".to_string()),
+                policy: fl_collab::GatePolicyKind::Block,
+                approved_by: None,
+                reason: None,
+                created_at: "0".to_string(),
+                resolved_at: None,
+            },
+        );
+
+        let blocking = fl_collab::check_gates_for_path("src/payments/stripe.ts", &gates);
+        assert_eq!(blocking.len(), 1);
+
+        let not_blocking = fl_collab::check_gates_for_path("src/utils.ts", &gates);
+        assert!(not_blocking.is_empty());
     }
 
     fn make_event(id: u128, parent_id: Option<Uuid>, kind: EventKind) -> Event {

@@ -5,9 +5,11 @@ pub mod refs;
 
 pub use event::{
     ApiCallRecord, CURRENT_EVENT_SCHEMA_VERSION, CheckpointEvent, DecisionAction, DecisionEvent,
-    Event, EventKind, EventRecord, ExplorationAction, ExplorationEvent, GitBridgeAction,
-    GitBridgeEvent, ResourceUsageEvent, SessionAction, SessionEvent, TaskAction, TaskEvent,
-    UndoEvent, UndoMode, event_signing_payload,
+    Event, EventKind, EventRecord, ExplorationAction, ExplorationEvent, GateAction, GateCondition,
+    GateEvent, GatePolicy, GitBridgeAction, GitBridgeEvent, LockAction, LockEvent, NotifyConfig,
+    PresenceAction, PresenceEvent, ResourceUsageEvent, SessionAction, SessionEvent,
+    SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
+    UndoMode, event_signing_payload,
 };
 pub use event_log::EventLog;
 pub use layout::{

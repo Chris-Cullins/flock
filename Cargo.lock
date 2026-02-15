@@ -361,6 +361,8 @@ name = "fl-collab"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -371,6 +373,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "fl-bridge-git",
+ "fl-collab",
  "fl-semantic",
  "fl-storage",
  "fl-workflow",
@@ -414,6 +417,7 @@ name = "fl-workflow"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fl-collab",
  "fl-storage",
  "uuid",
 ]

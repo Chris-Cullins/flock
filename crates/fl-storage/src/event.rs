@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -29,6 +29,10 @@ pub enum EventKind {
     Decision(DecisionEvent),
     ResourceUsage(ResourceUsageEvent),
     Task(TaskEvent),
+    Presence(PresenceEvent),
+    Lock(LockEvent),
+    Subscription(SubscriptionEvent),
+    Gate(GateEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,6 +173,114 @@ pub enum TaskAction {
     Complete,
     Fail,
     Link,
+}
+
+// --- Collaboration events ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PresenceEvent {
+    pub actor: String,
+    pub workspace: String,
+    pub action: PresenceAction,
+    #[serde(default)]
+    pub active_files: Vec<String>,
+    #[serde(default)]
+    pub intent: Option<String>,
+    /// TTL in seconds
+    pub ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PresenceAction {
+    Heartbeat,
+    Depart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockEvent {
+    pub lock_id: Uuid,
+    pub resource: String,
+    pub holder: String,
+    pub action: LockAction,
+    /// TTL in seconds
+    pub ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LockAction {
+    Acquire,
+    Release,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionEvent {
+    pub subscription_id: Uuid,
+    pub actor: String,
+    pub action: SubscriptionAction,
+    #[serde(default)]
+    pub filter: Option<SubscriptionFilter>,
+    #[serde(default)]
+    pub notify: Option<NotifyConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SubscriptionAction {
+    Subscribe,
+    Unsubscribe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionFilter {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub modules: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NotifyConfig {
+    Immediate,
+    Batched,
+    Digest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GateEvent {
+    pub gate_id: Uuid,
+    pub action: GateAction,
+    #[serde(default)]
+    pub condition: Option<GateCondition>,
+    #[serde(default)]
+    pub policy: Option<GatePolicy>,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GateAction {
+    Create,
+    Approve,
+    Reject,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GateCondition {
+    FileTouched(String),
+    SymbolModified(String),
+    ImpactExceeds(u32),
+    SecuritySensitive,
+    AgentConfidenceLow(u32),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GatePolicy {
+    Block,
+    QueueAndContinue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

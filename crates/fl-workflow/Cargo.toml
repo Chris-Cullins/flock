@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+fl-collab = { path = "../fl-collab" }
 fl-storage = { path = "../fl-storage" }
 uuid.workspace = true
