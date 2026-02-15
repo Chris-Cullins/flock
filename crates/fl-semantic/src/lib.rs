@@ -26,7 +26,22 @@ pub struct SemanticMergeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticMergeConflict {
     pub symbol: String,
-    pub detail: String,
+    #[serde(default)]
+    pub classification: SemanticConflictClassification,
+    #[serde(default, alias = "detail")]
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticConflictClassification {
+    #[default]
+    Unclassified,
+    DivergentEdit,
+    DeleteVsEdit,
+    ConcurrentAddition,
+    KindMismatch,
+    TextFallback,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +110,22 @@ enum SymbolKind {
     TypeAlias,
     Enum,
     Export,
+}
+
+impl SymbolKind {
+    fn label(self) -> &'static str {
+        match self {
+            SymbolKind::Function => "function",
+            SymbolKind::Class => "class",
+            SymbolKind::Method => "method",
+            SymbolKind::Constructor => "constructor",
+            SymbolKind::Field => "field",
+            SymbolKind::Interface => "interface",
+            SymbolKind::TypeAlias => "type",
+            SymbolKind::Enum => "enum",
+            SymbolKind::Export => "export",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -371,7 +402,8 @@ pub fn merge(
         if has_text_conflict {
             conflicts.push(SemanticMergeConflict {
                 symbol: "(text-merge)".to_string(),
-                detail: "text fallback produced conflict markers".to_string(),
+                classification: SemanticConflictClassification::TextFallback,
+                explanation: "text fallback produced conflict markers".to_string(),
             });
         }
 
@@ -398,7 +430,8 @@ pub fn merge(
         } else {
             conflicts.push(SemanticMergeConflict {
                 symbol: "(text-merge)".to_string(),
-                detail: "text merge produced unresolved conflicts".to_string(),
+                classification: SemanticConflictClassification::TextFallback,
+                explanation: "text merge produced unresolved conflicts".to_string(),
             });
         }
     }
@@ -463,14 +496,103 @@ fn detect_symbol_conflicts(
         let left_changed = left_state != base_state;
         let right_changed = right_state != base_state;
         if left_changed && right_changed && left_state != right_state {
-            conflicts.push(SemanticMergeConflict {
-                symbol: key.clone(),
-                detail: "both sides changed this semantic unit differently".to_string(),
-            });
+            conflicts.push(build_symbol_conflict(
+                &key,
+                base_state,
+                left_state,
+                right_state,
+            ));
         }
     }
 
     conflicts
+}
+
+fn build_symbol_conflict(
+    key: &str,
+    base_state: Option<(SymbolKind, &str)>,
+    left_state: Option<(SymbolKind, &str)>,
+    right_state: Option<(SymbolKind, &str)>,
+) -> SemanticMergeConflict {
+    let left_change = describe_symbol_change(base_state, left_state);
+    let right_change = describe_symbol_change(base_state, right_state);
+
+    let (classification, explanation) = if base_state.is_none()
+        && left_state.is_some()
+        && right_state.is_some()
+    {
+        (
+            SemanticConflictClassification::ConcurrentAddition,
+            format!(
+                "both branches introduced `{}` differently (left: {}; right: {}).",
+                key, left_change, right_change
+            ),
+        )
+    } else if left_state.is_none() || right_state.is_none() {
+        (
+            SemanticConflictClassification::DeleteVsEdit,
+            format!(
+                "one branch removed `{}` while the other changed it (left: {}; right: {}).",
+                key, left_change, right_change
+            ),
+        )
+    } else if let (Some((left_kind, _)), Some((right_kind, _))) = (left_state, right_state) {
+        if left_kind != right_kind {
+            (
+                SemanticConflictClassification::KindMismatch,
+                format!(
+                    "branches changed `{}` into different semantic kinds (left: {}; right: {}).",
+                    key, left_change, right_change
+                ),
+            )
+        } else {
+            (
+                SemanticConflictClassification::DivergentEdit,
+                format!(
+                    "both branches changed `{}` in different ways (left: {}; right: {}).",
+                    key, left_change, right_change
+                ),
+            )
+        }
+    } else {
+        (
+            SemanticConflictClassification::DivergentEdit,
+            format!(
+                "both branches changed `{}` in different ways (left: {}; right: {}).",
+                key, left_change, right_change
+            ),
+        )
+    };
+
+    SemanticMergeConflict {
+        symbol: key.to_string(),
+        classification,
+        explanation,
+    }
+}
+
+fn describe_symbol_change(
+    base_state: Option<(SymbolKind, &str)>,
+    side_state: Option<(SymbolKind, &str)>,
+) -> String {
+    match (base_state, side_state) {
+        (None, None) => "unchanged (absent)".to_string(),
+        (None, Some((kind, _))) => format!("added {}", kind.label()),
+        (Some((_base_kind, _)), None) => "removed symbol".to_string(),
+        (Some((base_kind, base_hash)), Some((side_kind, side_hash))) => {
+            if base_kind != side_kind {
+                format!(
+                    "changed kind {} -> {}",
+                    base_kind.label(),
+                    side_kind.label()
+                )
+            } else if base_hash != side_hash {
+                format!("modified {}", side_kind.label())
+            } else {
+                format!("kept {}", side_kind.label())
+            }
+        }
+    }
 }
 
 fn base_impact(symbol: &str) -> SemanticImpact {
@@ -1329,12 +1451,55 @@ mod tests {
         .expect("merge result should exist");
 
         assert!(!merged.conflicts.is_empty());
-        assert!(
-            merged
-                .conflicts
-                .iter()
-                .any(|conflict| conflict.symbol == "function:calculate")
-        );
+        assert!(merged.conflicts.iter().any(|conflict| {
+            conflict.symbol == "function:calculate"
+                && conflict.classification == SemanticConflictClassification::DivergentEdit
+                && conflict.explanation.contains("both branches changed")
+        }));
+    }
+
+    #[test]
+    fn semantic_merge_classifies_delete_vs_edit_conflict() {
+        let base = b"function calculate(amount: number): number { return amount; }\n";
+        let left = b"";
+        let right = b"function calculate(amount: number): number { return amount * 2; }\n";
+
+        let merged = merge(
+            Path::new("delete-vs-edit.ts"),
+            Some(base),
+            Some(left),
+            Some(right),
+        )
+        .expect("merge should succeed")
+        .expect("merge result should exist");
+
+        assert!(merged.conflicts.iter().any(|conflict| {
+            conflict.symbol == "function:calculate"
+                && conflict.classification == SemanticConflictClassification::DeleteVsEdit
+                && conflict.explanation.contains("removed")
+        }));
+    }
+
+    #[test]
+    fn semantic_merge_classifies_concurrent_addition_conflict() {
+        let base = b"";
+        let left = b"const fn = (amount: number) => amount + 1;\n";
+        let right = b"const fn = (amount: number) => amount + 2;\n";
+
+        let merged = merge(
+            Path::new("concurrent-add.ts"),
+            Some(base),
+            Some(left),
+            Some(right),
+        )
+        .expect("merge should succeed")
+        .expect("merge result should exist");
+
+        assert!(merged.conflicts.iter().any(|conflict| {
+            conflict.symbol == "function:fn"
+                && conflict.classification == SemanticConflictClassification::ConcurrentAddition
+                && conflict.explanation.contains("introduced")
+        }));
     }
 
     #[test]
@@ -1354,5 +1519,9 @@ mod tests {
 
         assert!(merged.parse_fallback);
         assert!(!merged.merged_source.is_empty());
+        assert!(merged.conflicts.iter().any(|conflict| {
+            conflict.classification == SemanticConflictClassification::TextFallback
+                && conflict.explanation.contains("text fallback")
+        }));
     }
 }

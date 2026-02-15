@@ -56,7 +56,7 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Add impact tracking (affected symbols/files/modules)
 - [x] Add compatibility checks for signature changes
 - [x] Implement semantic merge for TS/JS with text fallback
-- [ ] Implement semantic conflict classification and explanation
+- [x] Implement semantic conflict classification and explanation
 - [x] Add machine-readable semantic diff output (`--json`)
 - [ ] Add plugin trait/API for additional analyzers
 - [ ] Add analyzer process boundary (FFI or gRPC) and lifecycle management
