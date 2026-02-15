@@ -1,50 +1,77 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 320" width="300" height="320">
+  <defs>
+    <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FEFCF7"/>
+      <stop offset="100%" stop-color="#F0E8D8"/>
+    </linearGradient>
+    <linearGradient id="beakGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#F9B233"/>
+      <stop offset="100%" stop-color="#E8971A"/>
+    </linearGradient>
+    <linearGradient id="legGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F9B233"/>
+      <stop offset="100%" stop-color="#D4880F"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Shadow -->
+  <ellipse cx="150" cy="305" rx="65" ry="10" fill="#00000010"/>
+
+  <!-- Left foot -->
+  <path d="M115 290 L100 298 L108 302 L96 308 L115 300 L122 305 L115 290Z" fill="url(#legGrad)" stroke="#C47A0A" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Right foot -->
+  <path d="M175 290 L190 298 L182 302 L194 308 L175 300 L168 305 L175 290Z" fill="url(#legGrad)" stroke="#C47A0A" stroke-width="1.5" stroke-linejoin="round"/>
+
+  <!-- Left leg -->
+  <path d="M125 258 Q120 275 118 290" stroke="#E8971A" stroke-width="7" stroke-linecap="round" fill="none"/>
+  <!-- Right leg -->
+  <path d="M165 258 Q170 275 172 290" stroke="#E8971A" stroke-width="7" stroke-linecap="round" fill="none"/>
+
+  <!-- Tail -->
+  <path d="M195 175 Q225 155 220 140 Q230 150 235 138 Q232 158 215 175Z" fill="#E8DFC8" stroke="#C4B896" stroke-width="1.5" stroke-linejoin="round"/>
+
   <!-- Body -->
-  <ellipse cx="100" cy="130" rx="45" ry="35" fill="#F5F0E1" stroke="#2D2D2D" stroke-width="2.5"/>
+  <ellipse cx="150" cy="210" rx="70" ry="60" fill="url(#bodyGrad)" stroke="#D4C9A8" stroke-width="2"/>
 
   <!-- Wing -->
-  <path d="M70 120 Q55 130 60 148 Q70 155 85 145 Q80 130 70 120Z" fill="#E8E0CC" stroke="#2D2D2D" stroke-width="2"/>
-
-  <!-- Tail feathers -->
-  <path d="M140 115 Q160 100 155 108 Q165 95 158 112 Q170 102 155 118" fill="none" stroke="#2D2D2D" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M95 190 Q75 210 82 240 Q95 255 115 245 Q130 230 125 210 Q120 195 95 190Z" fill="#EDE5D0" stroke="#C4B896" stroke-width="1.8"/>
+  <!-- Wing detail lines -->
+  <path d="M92 205 Q100 215 98 230" fill="none" stroke="#C4B896" stroke-width="1" opacity="0.6"/>
+  <path d="M100 200 Q108 212 105 225" fill="none" stroke="#C4B896" stroke-width="1" opacity="0.6"/>
 
   <!-- Neck -->
-  <path d="M72 118 Q65 80 60 60 Q58 45 65 38" fill="none" stroke="#F5F0E1" stroke-width="22"/>
-  <path d="M72 118 Q65 80 60 60 Q58 45 65 38" fill="none" stroke="#2D2D2D" stroke-width="2.5" stroke-linecap="round"/>
-  <!-- Neck inner edge -->
-  <path d="M82 115 Q78 85 74 65 Q72 52 76 42" fill="none" stroke="#2D2D2D" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M155 165 Q152 130 148 105 Q145 80 140 60 Q138 50 142 42" fill="url(#bodyGrad)" stroke="#D4C9A8" stroke-width="2"/>
+  <path d="M175 170 Q172 135 168 108 Q165 85 162 65 Q160 52 163 44" fill="url(#bodyGrad)" stroke="#D4C9A8" stroke-width="2"/>
   <!-- Neck fill -->
-  <path d="M72 118 Q65 80 60 60 Q58 45 65 38 L76 42 Q72 52 74 65 Q78 85 82 115Z" fill="#F5F0E1"/>
+  <path d="M155 165 Q152 130 148 105 Q145 80 140 60 Q138 50 142 42 L163 44 Q160 52 162 65 Q165 85 168 108 Q172 135 175 170Z" fill="url(#bodyGrad)"/>
 
   <!-- Head -->
-  <ellipse cx="68" cy="35" rx="18" ry="14" fill="#F5F0E1" stroke="#2D2D2D" stroke-width="2.5"/>
+  <ellipse cx="152" cy="38" rx="24" ry="20" fill="url(#bodyGrad)" stroke="#D4C9A8" stroke-width="2"/>
 
-  <!-- Eye -->
-  <circle cx="62" cy="32" r="3.5" fill="#2D2D2D"/>
-  <circle cx="61" cy="31" r="1.2" fill="white"/>
+  <!-- Beak top -->
+  <path d="M130 35 L105 30 Q100 34 105 38 L130 40" fill="url(#beakGrad)" stroke="#C47A0A" stroke-width="1.5"/>
+  <!-- Beak bottom (slightly open - happy!) -->
+  <path d="M130 40 L110 42 Q108 44 110 45 L130 43" fill="#E8971A" stroke="#C47A0A" stroke-width="1.2"/>
+  <!-- Nostril -->
+  <ellipse cx="115" cy="34" rx="2" ry="1.5" fill="#C47A0A" opacity="0.5"/>
 
-  <!-- Beak -->
-  <path d="M50 36 L38 38 Q36 40 38 42 L50 40 Q48 38 50 36Z" fill="#F4A623" stroke="#2D2D2D" stroke-width="1.8"/>
+  <!-- Eye white -->
+  <ellipse cx="143" cy="33" rx="8" ry="8.5" fill="white" stroke="#D4C9A8" stroke-width="1"/>
+  <!-- Iris -->
+  <circle cx="141" cy="33" r="5.5" fill="#2D2926"/>
+  <!-- Pupil highlight -->
+  <circle cx="139" cy="31" r="2" fill="white"/>
+  <!-- Small secondary highlight -->
+  <circle cx="143" cy="35" r="0.8" fill="white" opacity="0.6"/>
 
-  <!-- Happy blush -->
-  <ellipse cx="56" cy="39" rx="4" ry="2.5" fill="#FFB4B4" opacity="0.5"/>
+  <!-- Eyebrow (friendly arch) -->
+  <path d="M134 23 Q143 19 152 23" fill="none" stroke="#B0A480" stroke-width="1.8" stroke-linecap="round"/>
 
-  <!-- Legs -->
-  <line x1="88" y1="160" x2="85" y2="178" stroke="#F4A623" stroke-width="3" stroke-linecap="round"/>
-  <line x1="108" y1="160" x2="111" y2="178" stroke="#F4A623" stroke-width="3" stroke-linecap="round"/>
+  <!-- Blush -->
+  <ellipse cx="133" cy="43" rx="6" ry="3.5" fill="#FFB4B4" opacity="0.35"/>
 
-  <!-- Feet -->
-  <path d="M75 178 L85 178 L92 183 L85 178 L88 185" fill="none" stroke="#F4A623" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M101 178 L111 178 L118 183 L111 178 L114 185" fill="none" stroke="#F4A623" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Tuft on head -->
+  <path d="M160 20 Q165 10 162 5" fill="none" stroke="#D4C9A8" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M155 19 Q157 8 152 3" fill="none" stroke="#D4C9A8" stroke-width="2" stroke-linecap="round"/>
 
-  <!-- Code bracket on body (subtle branding) -->
-  <text x="90" y="138" font-family="monospace" font-size="18" font-weight="bold" fill="#2D2D2D" opacity="0.15">{}</text>
-
-  <!-- Small version control branch lines above head -->
-  <circle cx="68" cy="12" r="2.5" fill="none" stroke="#6C63FF" stroke-width="1.5"/>
-  <line x1="68" y1="14.5" x2="68" y2="21" stroke="#6C63FF" stroke-width="1.5"/>
-  <circle cx="58" cy="8" r="2.5" fill="none" stroke="#F4A623" stroke-width="1.5"/>
-  <line x1="60" y1="9.8" x2="66" y2="12" stroke="#F4A623" stroke-width="1.5"/>
-  <circle cx="78" cy="8" r="2.5" fill="none" stroke="#4CAF50" stroke-width="1.5"/>
-  <line x1="76" y1="9.8" x2="70" y2="12" stroke="#4CAF50" stroke-width="1.5"/>
 </svg>
