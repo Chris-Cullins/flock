@@ -40,7 +40,7 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Implement push/pull bridge to git remotes
 - [x] Implement git import and export commands
 - [x] Implement shadow mode safety checks and recovery docs
-- [ ] Define jj import design and metadata mapping
+- [x] Define jj import design and metadata mapping
 
 ## 3. Semantic Layer (TS/JS First)
 

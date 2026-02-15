@@ -91,6 +91,7 @@ cargo run -p fl-cli -- refs delete workspace agent/a
 - First semantic analyzer is JS/TS AST (tree-sitter), as requested.
 - The analyzer detects functions (including arrow/function expressions assigned to vars), classes, constructors, methods, class fields, interfaces, type aliases, enums, and export/re-export statements.
 - This is an MVP foundation for layering in explorations, sessions, and native storage later.
+- jj import design and metadata mapping spec: `docs/jj-import-design.md`
 
 ## Shadow Mode Safety + Recovery
 
