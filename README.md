@@ -7,6 +7,7 @@ Initial Rust implementation of `fl` with:
 - checkpoint snapshots
 - checkpoint metadata includes deterministic snapshot Merkle roots
 - semantic diff for JavaScript/TypeScript (`.js`, `.jsx`, `.ts`, `.tsx`)
+- pluggable semantic analyzer API with a built-in tree-sitter TS/JS analyzer
 - exploration lifecycle commands (`start/list/promote/abandon`)
 - undo variants on the event timeline
 - git bridge commands (`commit/push/pull`) with event logging

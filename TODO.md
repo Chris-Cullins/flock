@@ -58,7 +58,7 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Implement semantic merge for TS/JS with text fallback
 - [x] Implement semantic conflict classification and explanation
 - [x] Add machine-readable semantic diff output (`--json`)
-- [ ] Add plugin trait/API for additional analyzers
+- [x] Add plugin trait/API for additional analyzers
 - [ ] Add analyzer process boundary (FFI or gRPC) and lifecycle management
 - [ ] Add first non-TS/JS fallback analyzer contract tests
 

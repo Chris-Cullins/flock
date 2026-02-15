@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -181,11 +182,157 @@ impl SourceLanguage {
     }
 }
 
+pub trait SemanticAnalyzerPlugin: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn supports_path(&self, path: &Path) -> bool;
+    fn diff(
+        &self,
+        path: &Path,
+        old_source: Option<&[u8]>,
+        new_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticFileDiff>>;
+    fn merge(
+        &self,
+        path: &Path,
+        base_source: Option<&[u8]>,
+        left_source: Option<&[u8]>,
+        right_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticMergeResult>>;
+}
+
+#[derive(Default, Clone)]
+pub struct AnalyzerRegistry {
+    analyzers: Vec<Arc<dyn SemanticAnalyzerPlugin>>,
+}
+
+impl AnalyzerRegistry {
+    pub fn new() -> Self {
+        Self {
+            analyzers: Vec::new(),
+        }
+    }
+
+    pub fn with_builtin() -> Self {
+        let mut registry = Self::new();
+        registry.register(TreeSitterTsJsAnalyzer::default());
+        registry
+    }
+
+    pub fn register<A>(&mut self, analyzer: A)
+    where
+        A: SemanticAnalyzerPlugin + 'static,
+    {
+        self.register_arc(Arc::new(analyzer));
+    }
+
+    pub fn register_arc(&mut self, analyzer: Arc<dyn SemanticAnalyzerPlugin>) {
+        self.analyzers.push(analyzer);
+    }
+
+    pub fn analyzers(&self) -> &[Arc<dyn SemanticAnalyzerPlugin>] {
+        &self.analyzers
+    }
+
+    pub fn supported_source(&self, path: &Path) -> bool {
+        self.resolve(path).is_some()
+    }
+
+    pub fn diff(
+        &self,
+        path: &Path,
+        old_source: Option<&[u8]>,
+        new_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticFileDiff>> {
+        let Some(analyzer) = self.resolve(path) else {
+            return Ok(None);
+        };
+
+        analyzer.diff(path, old_source, new_source)
+    }
+
+    pub fn merge(
+        &self,
+        path: &Path,
+        base_source: Option<&[u8]>,
+        left_source: Option<&[u8]>,
+        right_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticMergeResult>> {
+        let Some(analyzer) = self.resolve(path) else {
+            return Ok(None);
+        };
+
+        analyzer.merge(path, base_source, left_source, right_source)
+    }
+
+    fn resolve(&self, path: &Path) -> Option<&Arc<dyn SemanticAnalyzerPlugin>> {
+        // Latest registration wins so custom analyzers can override defaults.
+        self.analyzers
+            .iter()
+            .rev()
+            .find(|analyzer| analyzer.supports_path(path))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TreeSitterTsJsAnalyzer;
+
+impl SemanticAnalyzerPlugin for TreeSitterTsJsAnalyzer {
+    fn id(&self) -> &'static str {
+        "tree-sitter-ts-js"
+    }
+
+    fn supports_path(&self, path: &Path) -> bool {
+        SourceLanguage::from_path(path).is_some()
+    }
+
+    fn diff(
+        &self,
+        path: &Path,
+        old_source: Option<&[u8]>,
+        new_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticFileDiff>> {
+        tree_sitter_diff(path, old_source, new_source)
+    }
+
+    fn merge(
+        &self,
+        path: &Path,
+        base_source: Option<&[u8]>,
+        left_source: Option<&[u8]>,
+        right_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticMergeResult>> {
+        tree_sitter_merge(path, base_source, left_source, right_source)
+    }
+}
+
+static DEFAULT_ANALYZER_REGISTRY: OnceLock<AnalyzerRegistry> = OnceLock::new();
+
+pub fn default_analyzer_registry() -> &'static AnalyzerRegistry {
+    DEFAULT_ANALYZER_REGISTRY.get_or_init(AnalyzerRegistry::with_builtin)
+}
+
 pub fn supported_source(path: &Path) -> bool {
-    SourceLanguage::from_path(path).is_some()
+    default_analyzer_registry().supported_source(path)
 }
 
 pub fn diff(
+    path: &Path,
+    old_source: Option<&[u8]>,
+    new_source: Option<&[u8]>,
+) -> Result<Option<SemanticFileDiff>> {
+    default_analyzer_registry().diff(path, old_source, new_source)
+}
+
+pub fn merge(
+    path: &Path,
+    base_source: Option<&[u8]>,
+    left_source: Option<&[u8]>,
+    right_source: Option<&[u8]>,
+) -> Result<Option<SemanticMergeResult>> {
+    default_analyzer_registry().merge(path, base_source, left_source, right_source)
+}
+
+fn tree_sitter_diff(
     path: &Path,
     old_source: Option<&[u8]>,
     new_source: Option<&[u8]>,
@@ -347,7 +494,7 @@ pub fn diff(
     }))
 }
 
-pub fn merge(
+fn tree_sitter_merge(
     path: &Path,
     base_source: Option<&[u8]>,
     left_source: Option<&[u8]>,
@@ -391,8 +538,8 @@ pub fn merge(
         }));
     }
 
-    let left_diff = diff(path, Some(base_source), Some(left_source))?;
-    let right_diff = diff(path, Some(base_source), Some(right_source))?;
+    let left_diff = tree_sitter_diff(path, Some(base_source), Some(left_source))?;
+    let right_diff = tree_sitter_diff(path, Some(base_source), Some(right_source))?;
     let parse_fallback =
         parse_fallback_used(left_diff.as_ref()) || parse_fallback_used(right_diff.as_ref());
 
@@ -1218,6 +1365,110 @@ fn node_match_hash(node: Node, source: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct StubAnalyzer {
+        extension: &'static str,
+        language: &'static str,
+    }
+
+    impl SemanticAnalyzerPlugin for StubAnalyzer {
+        fn id(&self) -> &'static str {
+            self.language
+        }
+
+        fn supports_path(&self, path: &Path) -> bool {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value == self.extension)
+                .unwrap_or(false)
+        }
+
+        fn diff(
+            &self,
+            path: &Path,
+            old_source: Option<&[u8]>,
+            new_source: Option<&[u8]>,
+        ) -> Result<Option<SemanticFileDiff>> {
+            let old_source = old_source.unwrap_or_default();
+            let new_source = new_source.unwrap_or_default();
+            if old_source == new_source {
+                return Ok(None);
+            }
+
+            Ok(Some(SemanticFileDiff {
+                path: path.to_string_lossy().to_string(),
+                language: self.language.to_string(),
+                parse_fallback: false,
+                changes: vec![SemanticChange {
+                    kind: SemanticChangeKind::Modified,
+                    symbol: "stub:symbol".to_string(),
+                    risk: SemanticRisk::Low,
+                    impact: SemanticImpact::default(),
+                    compatibility: SemanticCompatibility::default(),
+                }],
+            }))
+        }
+
+        fn merge(
+            &self,
+            path: &Path,
+            _base_source: Option<&[u8]>,
+            _left_source: Option<&[u8]>,
+            _right_source: Option<&[u8]>,
+        ) -> Result<Option<SemanticMergeResult>> {
+            Ok(Some(SemanticMergeResult {
+                path: path.to_string_lossy().to_string(),
+                language: self.language.to_string(),
+                parse_fallback: false,
+                merged_source: "stub-merge".to_string(),
+                conflicts: Vec::new(),
+            }))
+        }
+    }
+
+    #[test]
+    fn plugin_registry_dispatches_custom_analyzer() {
+        let mut registry = AnalyzerRegistry::new();
+        registry.register(StubAnalyzer {
+            extension: "py",
+            language: "python-stub",
+        });
+
+        let diff = registry
+            .diff(Path::new("main.py"), Some(b"old"), Some(b"new"))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert_eq!(diff.language, "python-stub");
+        assert!(registry.supported_source(Path::new("main.py")));
+        assert!(!registry.supported_source(Path::new("main.go")));
+    }
+
+    #[test]
+    fn latest_plugin_registration_overrides_default_analyzer() {
+        let mut registry = AnalyzerRegistry::with_builtin();
+        registry.register(StubAnalyzer {
+            extension: "ts",
+            language: "override-ts",
+        });
+
+        let diff = registry
+            .diff(
+                Path::new("override.ts"),
+                Some(b"function oldName() {}"),
+                Some(b"function newName() {}"),
+            )
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert_eq!(diff.language, "override-ts");
+        assert!(
+            diff.changes
+                .iter()
+                .any(|change| change.symbol == "stub:symbol")
+        );
+    }
 
     #[test]
     fn detects_modified_function() {
