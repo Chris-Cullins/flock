@@ -10,6 +10,7 @@ pub use fl_storage::{RefKind, RepoRef, WorkspaceRefConfig};
 pub use repo::{
     ExplorationStatus, ExplorationSummary, FsckReport, ImpactReport, ReplayedState, Repo,
     ReviewStats, ReviewSummary, ShadowSafetyCheck, ShadowSafetyReport, UndoRequest, UndoResult,
+    WorkspaceInfo,
 };
 pub use semantic::{
     SemanticChange, SemanticChangeKind, SemanticCompatibility, SemanticCompatibilityStatus,

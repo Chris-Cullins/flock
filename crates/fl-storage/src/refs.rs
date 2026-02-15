@@ -20,6 +20,12 @@ pub enum RefKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceRefConfig {
     pub auto_rebase: bool,
+    #[serde(default)]
+    pub base_snapshot_id: Option<Uuid>,
+    #[serde(default)]
+    pub max_snapshots: Option<usize>,
+    #[serde(default)]
+    pub max_events: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

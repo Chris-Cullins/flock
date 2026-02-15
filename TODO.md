@@ -76,17 +76,17 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## 5. Explorations and Workspaces
 
-- [ ] Implement exploration model with lifecycle states
-- [ ] Add exploration commands:
+- [x] Implement exploration model with lifecycle states
+- [x] Add exploration commands:
   - [x] `fl explore start`
   - [x] `fl explore list`
-  - [ ] `fl explore compare`
+  - [x] `fl explore compare`
   - [x] `fl explore promote`
   - [x] `fl explore abandon`
-- [ ] Add TTL and background pruning for abandoned/expired explorations
-- [ ] Add workspace isolation model (base snapshot + overlay events)
-- [ ] Add workspace resource limits and policy enforcement
-- [ ] Add checkpoint/rollback shortcuts for agents
+- [x] Add TTL and background pruning for abandoned/expired explorations (`fl explore prune`)
+- [x] Add workspace isolation model (base snapshot + overlay events)
+- [x] Add workspace resource limits and policy enforcement
+- [x] Add checkpoint/rollback shortcuts for agents (`fl quick-save`, `fl quick-restore`)
 
 ## 6. Agent Sessions and Provenance
 

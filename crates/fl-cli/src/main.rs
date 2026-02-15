@@ -82,6 +82,15 @@ enum Command {
         #[command(subcommand)]
         command: RefsCommand,
     },
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    QuickSave {
+        #[arg(long)]
+        tag: Option<String>,
+    },
+    QuickRestore,
 }
 
 #[derive(Debug, Subcommand)]
@@ -96,6 +105,16 @@ enum ExploreCommand {
     },
     Abandon {
         id: String,
+    },
+    Compare {
+        left: String,
+        right: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Prune {
+        #[arg(long, default_value = "7d")]
+        older_than: String,
     },
 }
 
@@ -135,6 +154,26 @@ enum RefsCommand {
     Delete {
         kind: RefKindArg,
         name: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    Create {
+        name: String,
+        #[arg(long)]
+        auto_rebase: bool,
+    },
+    List,
+    Info {
+        name: String,
+    },
+    Limits {
+        name: String,
+        #[arg(long)]
+        max_snapshots: Option<usize>,
+        #[arg(long)]
+        max_events: Option<usize>,
     },
 }
 
@@ -595,6 +634,38 @@ fn main() -> Result<()> {
                         exploration.id, exploration.title
                     );
                 }
+                ExploreCommand::Compare { left, right, json } => {
+                    let left_id = parse_uuid(&left)?;
+                    let right_id = right.as_deref().map(parse_uuid).transpose()?;
+                    let diffs = repo.compare_explorations(left_id, right_id)?;
+
+                    if diffs.is_empty() {
+                        if json {
+                            println!("[]");
+                        } else {
+                            println!("No differences.");
+                        }
+                        return Ok(());
+                    }
+
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&diffs)?);
+                        return Ok(());
+                    }
+
+                    for diff in &diffs {
+                        print_semantic_file_diff(diff);
+                    }
+                }
+                ExploreCommand::Prune { older_than } => {
+                    let duration = parse_duration_spec(&older_than)?;
+                    let pruned = repo.prune_explorations(duration)?;
+                    println!(
+                        "pruned {} abandoned exploration{}",
+                        pruned,
+                        if pruned == 1 { "" } else { "s" }
+                    );
+                }
             }
         }
         Command::Undo { n, to, since, file } => {
@@ -753,6 +824,102 @@ fn main() -> Result<()> {
                         println!("ref {} not found", name);
                     }
                 }
+            }
+        }
+        Command::Workspace { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                WorkspaceCommand::Create { name, auto_rebase } => {
+                    let ws = repo.create_workspace(name, auto_rebase)?;
+                    let config = ws.workspace.as_ref().unwrap();
+                    println!(
+                        "workspace {} created -> {} (auto-rebase={}, base={})",
+                        ws.name,
+                        ws.target_event_id,
+                        config.auto_rebase,
+                        config
+                            .base_snapshot_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                }
+                WorkspaceCommand::List => {
+                    let workspaces = repo.list_workspaces()?;
+                    if workspaces.is_empty() {
+                        println!("No workspaces.");
+                        return Ok(());
+                    }
+                    for ws in workspaces {
+                        let config = ws.workspace.as_ref().unwrap();
+                        println!(
+                            "{}  {}  auto-rebase={}",
+                            ws.name, ws.target_event_id, config.auto_rebase
+                        );
+                    }
+                }
+                WorkspaceCommand::Info { name } => {
+                    let info = repo.workspace_info(&name)?;
+                    let config = info.workspace.workspace.as_ref().unwrap();
+                    println!("Workspace: {}", info.workspace.name);
+                    println!("  Target event: {}", info.workspace.target_event_id);
+                    println!("  Auto-rebase: {}", config.auto_rebase);
+                    println!(
+                        "  Base snapshot: {}",
+                        config
+                            .base_snapshot_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "none".to_string())
+                    );
+                    println!("  Events: {}", info.event_count);
+                    println!("  Checkpoints: {}", info.checkpoint_count);
+                    println!("  Snapshots: {}", info.snapshot_count);
+                    if let Some(max) = config.max_snapshots {
+                        println!("  Max snapshots: {}", max);
+                    }
+                    if let Some(max) = config.max_events {
+                        println!("  Max events: {}", max);
+                    }
+                    if !info.limits_exceeded.is_empty() {
+                        println!("  Warnings:");
+                        for warning in &info.limits_exceeded {
+                            println!("    ! {}", warning);
+                        }
+                    }
+                }
+                WorkspaceCommand::Limits {
+                    name,
+                    max_snapshots,
+                    max_events,
+                } => {
+                    if max_snapshots.is_none() && max_events.is_none() {
+                        bail!("specify at least one of --max-snapshots or --max-events");
+                    }
+                    let ws = repo.set_workspace_limits(&name, max_snapshots, max_events)?;
+                    let config = ws.workspace.as_ref().unwrap();
+                    println!("workspace {} limits updated:", ws.name);
+                    if let Some(max) = config.max_snapshots {
+                        println!("  max-snapshots: {}", max);
+                    }
+                    if let Some(max) = config.max_events {
+                        println!("  max-events: {}", max);
+                    }
+                }
+            }
+        }
+        Command::QuickSave { tag } => {
+            let repo = Repo::discover(cwd)?;
+            let event = repo.quick_save(tag)?;
+            let EventKind::Checkpoint(payload) = event.kind else {
+                bail!("unexpected event type")
+            };
+            println!("quick-save {} ({})", payload.label, event.id);
+        }
+        Command::QuickRestore => {
+            let repo = Repo::discover(cwd)?;
+            let result = repo.quick_restore()?;
+            println!("restored to before event {}", result.target_event_id);
+            if let Some(cp) = result.restored_checkpoint_event {
+                println!("new checkpoint: {}", cp);
             }
         }
     }

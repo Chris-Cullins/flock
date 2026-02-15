@@ -76,6 +76,40 @@ pub struct ReviewSummary {
     pub stats: ReviewStats,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    pub workspace: RepoRef,
+    pub event_count: usize,
+    pub checkpoint_count: usize,
+    pub snapshot_count: usize,
+    pub limits_exceeded: Vec<String>,
+}
+
+fn check_workspace_limits(
+    config: &WorkspaceRefConfig,
+    event_count: usize,
+    snapshot_count: usize,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(max) = config.max_snapshots {
+        if snapshot_count > max {
+            warnings.push(format!(
+                "snapshot limit exceeded: {} > {}",
+                snapshot_count, max
+            ));
+        }
+    }
+    if let Some(max) = config.max_events {
+        if event_count > max {
+            warnings.push(format!(
+                "event limit exceeded: {} > {}",
+                event_count, max
+            ));
+        }
+    }
+    warnings
+}
+
 #[derive(Debug, Clone)]
 pub struct Repo {
     root: PathBuf,
@@ -211,6 +245,9 @@ impl Repo {
         let workspace = match kind {
             RefKind::Workspace => Some(WorkspaceRefConfig {
                 auto_rebase: auto_rebase.unwrap_or(false),
+                base_snapshot_id: None,
+                max_snapshots: None,
+                max_events: None,
             }),
             RefKind::Branch | RefKind::Tag => {
                 if auto_rebase.is_some() {
@@ -732,6 +769,268 @@ impl Repo {
             .into_iter()
             .find(|entry| entry.id == id)
             .ok_or_else(|| anyhow!("failed to reload exploration {}", id))
+    }
+
+    /// Compare two explorations by diffing their base checkpoint snapshots.
+    /// If `right_id` is None, compares the left exploration's base against current working dir.
+    pub fn compare_explorations(
+        &self,
+        left_id: Uuid,
+        right_id: Option<Uuid>,
+    ) -> Result<Vec<SemanticFileDiff>> {
+        self.assert_initialized()?;
+
+        let explorations = self.list_explorations()?;
+
+        let left = explorations
+            .iter()
+            .find(|e| e.id == left_id)
+            .ok_or_else(|| anyhow!("exploration {} not found", left_id))?;
+
+        let left_snapshot_id = self.exploration_snapshot_id(left)?;
+
+        if let Some(right_id) = right_id {
+            let right = explorations
+                .iter()
+                .find(|e| e.id == right_id)
+                .ok_or_else(|| anyhow!("exploration {} not found", right_id))?;
+
+            let right_snapshot_id = self.exploration_snapshot_id(right)?;
+
+            self.diff_two_snapshots(left_snapshot_id, right_snapshot_id)
+        } else {
+            self.diff_snapshot_against_working_dir(left_snapshot_id)
+        }
+    }
+
+    /// Diff two snapshots against each other.
+    fn diff_two_snapshots(
+        &self,
+        left_snapshot_id: Uuid,
+        right_snapshot_id: Uuid,
+    ) -> Result<Vec<SemanticFileDiff>> {
+        let left_root = self.snapshot_path(left_snapshot_id);
+        let right_root = self.snapshot_path(right_snapshot_id);
+
+        let left_files = collect_source_files(&left_root, false)?;
+        let right_files = collect_source_files(&right_root, false)?;
+
+        let mut all_paths: BTreeSet<PathBuf> = left_files;
+        all_paths.extend(right_files.iter().cloned());
+
+        let mut diffs = Vec::new();
+        for rel_path in &all_paths {
+            let left_path = left_root.join(rel_path);
+            let right_path = right_root.join(rel_path);
+
+            let before = fs::read(&left_path).ok();
+            let after = fs::read(&right_path).ok();
+
+            let diff = semantic_diff(rel_path, before.as_deref(), after.as_deref())?;
+            if let Some(diff) = diff {
+                diffs.push(diff);
+            }
+        }
+
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(diffs)
+    }
+
+    /// Get the snapshot ID for an exploration's base checkpoint.
+    fn exploration_snapshot_id(&self, exploration: &ExplorationSummary) -> Result<Uuid> {
+        let base_id = exploration.base_checkpoint_event.ok_or_else(|| {
+            anyhow!(
+                "exploration {} has no base checkpoint",
+                exploration.id
+            )
+        })?;
+        let event = self.event_by_id(base_id)?;
+        let EventKind::Checkpoint(payload) = event.kind else {
+            bail!(
+                "base checkpoint event {} is not a checkpoint",
+                base_id
+            )
+        };
+        Ok(payload.snapshot_id)
+    }
+
+    /// Prune abandoned explorations older than the given TTL duration.
+    /// Returns the number of explorations pruned.
+    pub fn prune_explorations(&self, max_age: std::time::Duration) -> Result<usize> {
+        self.assert_initialized()?;
+
+        let now_nanos: u128 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before unix epoch")?
+            .as_nanos();
+
+        let explorations = self.list_explorations()?;
+        let mut pruned = 0;
+
+        for exploration in &explorations {
+            if exploration.status != ExplorationStatus::Abandoned {
+                continue;
+            }
+
+            let updated_nanos: u128 = exploration
+                .updated_at
+                .parse()
+                .unwrap_or(0);
+            let age_nanos = now_nanos.saturating_sub(updated_nanos);
+
+            if age_nanos >= max_age.as_nanos() {
+                // Clean up snapshot if exploration had a base checkpoint
+                if let Some(base_id) = exploration.base_checkpoint_event {
+                    if let Ok(event) = self.event_by_id(base_id) {
+                        if let EventKind::Checkpoint(payload) = event.kind {
+                            let snapshot_path = self.snapshot_path(payload.snapshot_id);
+                            if snapshot_path.is_dir() {
+                                let _ = fs::remove_dir_all(&snapshot_path);
+                            }
+                        }
+                    }
+                }
+                pruned += 1;
+            }
+        }
+
+        Ok(pruned)
+    }
+
+    /// Create an isolated workspace with its own base snapshot.
+    pub fn create_workspace(
+        &self,
+        name: String,
+        auto_rebase: bool,
+    ) -> Result<RepoRef> {
+        self.assert_initialized()?;
+
+        // Capture current state as the workspace base
+        let checkpoint = self
+            .latest_checkpoint()
+            .ok_or_else(|| anyhow!("cannot create workspace: no checkpoint exists; run `fl checkpoint` first"))?;
+        let EventKind::Checkpoint(payload) = checkpoint.kind else {
+            bail!("latest checkpoint event is malformed")
+        };
+
+        let workspace_ref = RepoRef {
+            kind: RefKind::Workspace,
+            name: name.clone(),
+            target_event_id: checkpoint.id,
+            workspace: Some(WorkspaceRefConfig {
+                auto_rebase,
+                base_snapshot_id: Some(payload.snapshot_id),
+                max_snapshots: None,
+                max_events: None,
+            }),
+        };
+
+        let store = RefStore::for_root(self.root());
+        store.upsert(workspace_ref.clone())?;
+
+        Ok(workspace_ref)
+    }
+
+    /// List all workspaces.
+    pub fn list_workspaces(&self) -> Result<Vec<RepoRef>> {
+        self.assert_initialized()?;
+
+        let refs = self.list_refs()?;
+        Ok(refs
+            .into_iter()
+            .filter(|r| r.kind == RefKind::Workspace)
+            .collect())
+    }
+
+    /// Get workspace info including resource usage.
+    pub fn workspace_info(&self, name: &str) -> Result<WorkspaceInfo> {
+        self.assert_initialized()?;
+
+        let refs = self.list_refs()?;
+        let ws_ref = refs
+            .iter()
+            .find(|r| r.kind == RefKind::Workspace && r.name == name)
+            .ok_or_else(|| anyhow!("workspace `{}` not found", name))?
+            .clone();
+
+        if ws_ref.workspace.is_none() {
+            bail!("workspace `{}` has no config", name);
+        }
+
+        let events = self.list_events()?;
+        let checkpoints = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Checkpoint(_)))
+            .count();
+
+        // Count snapshots on disk
+        let snapshot_dir = self.root.join(SNAPSHOT_DIR);
+        let snapshot_count = if snapshot_dir.is_dir() {
+            fs::read_dir(&snapshot_dir)
+                .map(|entries| entries.filter_map(|e| e.ok()).count())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let limits_exceeded = check_workspace_limits(
+            ws_ref.workspace.as_ref().unwrap(),
+            events.len(),
+            snapshot_count,
+        );
+
+        Ok(WorkspaceInfo {
+            workspace: ws_ref,
+            event_count: events.len(),
+            checkpoint_count: checkpoints,
+            snapshot_count,
+            limits_exceeded,
+        })
+    }
+
+    /// Set resource limits on a workspace.
+    pub fn set_workspace_limits(
+        &self,
+        name: &str,
+        max_snapshots: Option<usize>,
+        max_events: Option<usize>,
+    ) -> Result<RepoRef> {
+        self.assert_initialized()?;
+
+        let store = RefStore::for_root(self.root());
+        let refs = store.read_all()?;
+        let mut ws_ref = refs
+            .iter()
+            .find(|r| r.kind == RefKind::Workspace && r.name == name)
+            .ok_or_else(|| anyhow!("workspace `{}` not found", name))?
+            .clone();
+
+        let config = ws_ref
+            .workspace
+            .as_mut()
+            .ok_or_else(|| anyhow!("workspace `{}` has no config", name))?;
+
+        if let Some(ms) = max_snapshots {
+            config.max_snapshots = Some(ms);
+        }
+        if let Some(me) = max_events {
+            config.max_events = Some(me);
+        }
+
+        store.upsert(ws_ref.clone())?;
+        Ok(ws_ref)
+    }
+
+    /// Quick save: create a checkpoint with auto-generated label, optimized for agent use.
+    pub fn quick_save(&self, tag: Option<String>) -> Result<Event> {
+        self.assert_initialized()?;
+        let label = tag.unwrap_or_else(|| format!("quick-{}", Uuid::new_v4().simple()));
+        self.create_checkpoint_with_lineage(label, Some("quick save".to_string()), None)
+    }
+
+    /// Quick restore: undo to the last checkpoint, optimized for agent use.
+    pub fn quick_restore(&self) -> Result<UndoResult> {
+        self.undo(UndoRequest::Last)
     }
 
     pub fn undo(&self, request: UndoRequest) -> Result<UndoResult> {
@@ -3915,6 +4214,162 @@ mod tests {
         assert!(
             format!("{:#}", err).contains("merkle root mismatch"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn explore_compare_shows_differences_between_explorations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Base state
+        let file = dir.path().join("app.ts");
+        fs::write(&file, "function greet() { return 'hello'; }").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        // Start first exploration
+        let exp1 = repo
+            .start_exploration("exp-alpha".to_string())
+            .expect("start exp1");
+
+        // Modify and checkpoint (so exp1 has a base snapshot)
+        fs::write(&file, "function greet() { return 'hi'; }").expect("write");
+        repo.create_checkpoint(Some("exp1-work".to_string()))
+            .expect("checkpoint");
+
+        // Start second exploration (its base is the latest checkpoint)
+        let exp2 = repo
+            .start_exploration("exp-beta".to_string())
+            .expect("start exp2");
+
+        // Compare exp1 vs exp2 (different base snapshots)
+        let diffs = repo
+            .compare_explorations(exp1.id, Some(exp2.id))
+            .expect("compare");
+        // The base snapshots differ, so there should be a diff
+        assert!(
+            !diffs.is_empty(),
+            "comparing explorations with different bases should show diffs"
+        );
+
+        // Compare exp1 against working dir
+        let diffs_wd = repo
+            .compare_explorations(exp1.id, None)
+            .expect("compare vs working dir");
+        assert!(
+            !diffs_wd.is_empty(),
+            "comparing exploration against modified working dir should show diffs"
+        );
+    }
+
+    #[test]
+    fn prune_explorations_removes_old_abandoned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        let file = dir.path().join("hello.ts");
+        fs::write(&file, "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        let exp = repo
+            .start_exploration("to-prune".to_string())
+            .expect("start");
+        repo.abandon_exploration(exp.id).expect("abandon");
+
+        // Prune with 0 duration = prune everything abandoned
+        let pruned = repo
+            .prune_explorations(std::time::Duration::from_secs(0))
+            .expect("prune");
+        assert_eq!(pruned, 1);
+    }
+
+    #[test]
+    fn quick_save_and_restore_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        let file = dir.path().join("data.ts");
+        fs::write(&file, "export const v = 1;").expect("write");
+        repo.create_checkpoint(Some("initial".to_string()))
+            .expect("checkpoint");
+
+        // Quick save
+        fs::write(&file, "export const v = 2;").expect("modify");
+        let save_event = repo.quick_save(Some("my-save".to_string())).expect("quick save");
+        let EventKind::Checkpoint(payload) = &save_event.kind else {
+            panic!("expected checkpoint");
+        };
+        assert!(payload.label.contains("my-save"));
+
+        // Modify further
+        fs::write(&file, "export const v = 3;").expect("modify again");
+
+        // Quick restore - should undo back to the quick-save point
+        let result = repo.quick_restore().expect("quick restore");
+        assert_eq!(result.target_event_id, save_event.id);
+    }
+
+    #[test]
+    fn workspace_create_and_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        let file = dir.path().join("main.ts");
+        fs::write(&file, "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        let ws = repo
+            .create_workspace("feature-a".to_string(), true)
+            .expect("create workspace");
+        assert_eq!(ws.name, "feature-a");
+        let config = ws.workspace.as_ref().unwrap();
+        assert!(config.auto_rebase);
+        assert!(config.base_snapshot_id.is_some());
+
+        let workspaces = repo.list_workspaces().expect("list workspaces");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].name, "feature-a");
+    }
+
+    #[test]
+    fn workspace_info_and_limits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        let file = dir.path().join("main.ts");
+        fs::write(&file, "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        repo.create_workspace("ws1".to_string(), false)
+            .expect("create workspace");
+
+        let info = repo.workspace_info("ws1").expect("workspace info");
+        assert_eq!(info.workspace.name, "ws1");
+        assert!(info.event_count > 0);
+        assert!(info.limits_exceeded.is_empty());
+
+        // Set very low limits that will be exceeded
+        repo.set_workspace_limits("ws1", Some(0), Some(0))
+            .expect("set limits");
+
+        let info = repo.workspace_info("ws1").expect("workspace info after limits");
+        let config = info.workspace.workspace.as_ref().unwrap();
+        assert_eq!(config.max_snapshots, Some(0));
+        assert_eq!(config.max_events, Some(0));
+        // Both limits should be exceeded
+        assert!(
+            info.limits_exceeded.len() >= 2,
+            "expected at least 2 limit warnings, got: {:?}",
+            info.limits_exceeded
         );
     }
 }
