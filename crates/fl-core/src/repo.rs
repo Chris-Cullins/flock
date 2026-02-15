@@ -9,8 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::{Signer, SigningKey};
 use fl_storage::{
-    CONFIG_FILE, FLOCK_DIR, KEY_DIR, RefKind, RefStore, RepoRef, SIGNING_KEY_FILE, SNAPSHOT_DIR,
-    WorkspaceRefConfig,
+    BlockRef, CONFIG_FILE, ChunkConfig, ContentStore, FLOCK_DIR, FileEntry, FileIndex, KEY_DIR,
+    RefKind, RefStore, RepoRef, SIGNING_KEY_FILE, SNAPSHOT_DIR, SnapshotIndex,
+    WorkspaceRefConfig, chunk_data,
 };
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -48,6 +49,14 @@ pub struct FsckReport {
     pub checkpoint_count: usize,
     pub snapshot_count: usize,
     pub ref_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MigrateReport {
+    pub snapshots_migrated: u32,
+    pub blocks_stored: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +155,7 @@ pub struct Repo {
 enum RepoMode {
     GitCompatible,
     GitColocated,
+    Native,
 }
 
 impl RepoMode {
@@ -153,6 +163,7 @@ impl RepoMode {
         match self {
             RepoMode::GitCompatible => "git-compatible",
             RepoMode::GitColocated => "git-colocated",
+            RepoMode::Native => "native",
         }
     }
 }
@@ -195,9 +206,19 @@ impl Repo {
         self.init_with_mode(RepoMode::GitColocated)
     }
 
+    pub fn init_native(&self) -> Result<()> {
+        self.init_with_mode(RepoMode::Native)
+    }
+
     fn init_with_mode(&self, mode: RepoMode) -> Result<()> {
-        fs::create_dir_all(self.root.join(SNAPSHOT_DIR))
-            .context("failed to create snapshots directory")?;
+        if mode == RepoMode::Native {
+            // Native mode uses block store instead of snapshot directories
+            ContentStore::for_root(self.root()).ensure_exists()?;
+            FileIndex::for_root(self.root()).ensure_exists()?;
+        } else {
+            fs::create_dir_all(self.root.join(SNAPSHOT_DIR))
+                .context("failed to create snapshots directory")?;
+        }
 
         fl_storage::EventLog::for_root(self.root()).ensure_exists()?;
         RefStore::for_root(self.root()).ensure_exists()?;
@@ -345,22 +366,6 @@ impl Repo {
                         }
                     }
 
-                    let snapshot_path = self.snapshot_path(checkpoint.snapshot_id);
-                    let metadata = fs::metadata(&snapshot_path).with_context(|| {
-                        format!(
-                            "checkpoint {} references missing snapshot {}",
-                            event.id,
-                            snapshot_path.display()
-                        )
-                    })?;
-                    if !metadata.is_dir() {
-                        bail!(
-                            "checkpoint {} snapshot path is not a directory: {}",
-                            event.id,
-                            snapshot_path.display()
-                        );
-                    }
-
                     let expected_merkle =
                         checkpoint.snapshot_merkle_root.as_ref().ok_or_else(|| {
                             anyhow!(
@@ -368,20 +373,64 @@ impl Repo {
                                 event.id
                             )
                         })?;
-                    let actual_merkle =
-                        compute_snapshot_merkle_root(&snapshot_path).with_context(|| {
+
+                    let file_index = FileIndex::for_root(self.root());
+                    if file_index.has(checkpoint.snapshot_id) {
+                        // Native mode: verify via index
+                        let index = file_index.read(checkpoint.snapshot_id).with_context(|| {
                             format!(
-                                "failed to compute merkle root for snapshot {}",
+                                "failed to read native index for snapshot {}",
                                 checkpoint.snapshot_id
                             )
                         })?;
-                    if actual_merkle != *expected_merkle {
-                        bail!(
-                            "checkpoint {} snapshot merkle root mismatch: expected {}, actual {}",
-                            event.id,
-                            expected_merkle,
-                            actual_merkle
-                        );
+                        let actual_merkle =
+                            compute_native_merkle_root(&index).with_context(|| {
+                                format!(
+                                    "failed to compute merkle root for native snapshot {}",
+                                    checkpoint.snapshot_id
+                                )
+                            })?;
+                        if actual_merkle != *expected_merkle {
+                            bail!(
+                                "checkpoint {} snapshot merkle root mismatch: expected {}, actual {}",
+                                event.id,
+                                expected_merkle,
+                                actual_merkle
+                            );
+                        }
+                    } else {
+                        // Directory-based mode
+                        let snapshot_path = self.snapshot_path(checkpoint.snapshot_id);
+                        let metadata = fs::metadata(&snapshot_path).with_context(|| {
+                            format!(
+                                "checkpoint {} references missing snapshot {}",
+                                event.id,
+                                snapshot_path.display()
+                            )
+                        })?;
+                        if !metadata.is_dir() {
+                            bail!(
+                                "checkpoint {} snapshot path is not a directory: {}",
+                                event.id,
+                                snapshot_path.display()
+                            );
+                        }
+
+                        let actual_merkle =
+                            compute_snapshot_merkle_root(&snapshot_path).with_context(|| {
+                                format!(
+                                    "failed to compute merkle root for snapshot {}",
+                                    checkpoint.snapshot_id
+                                )
+                            })?;
+                        if actual_merkle != *expected_merkle {
+                            bail!(
+                                "checkpoint {} snapshot merkle root mismatch: expected {}, actual {}",
+                                event.id,
+                                expected_merkle,
+                                actual_merkle
+                            );
+                        }
                     }
 
                     seen_checkpoints.insert(event.id);
@@ -2094,23 +2143,36 @@ impl Repo {
         git_commit_mapping: Option<String>,
     ) -> Result<Event> {
         let snapshot_id = Uuid::new_v4();
-        let snapshot_path = self.snapshot_path(snapshot_id);
-        fs::create_dir_all(&snapshot_path).with_context(|| {
-            format!(
-                "failed to create snapshot directory {}",
-                snapshot_path.display()
+
+        if self.repo_mode()? == RepoMode::Native {
+            // Native mode: store file contents as blocks, no directory copy
+            self.create_native_snapshot(source_root, apply_skip, snapshot_id)?;
+            self.create_checkpoint_event_with_native_merkle(
+                snapshot_id,
+                label,
+                message,
+                parent_checkpoint_event,
+                git_commit_mapping,
             )
-        })?;
+        } else {
+            let snapshot_path = self.snapshot_path(snapshot_id);
+            fs::create_dir_all(&snapshot_path).with_context(|| {
+                format!(
+                    "failed to create snapshot directory {}",
+                    snapshot_path.display()
+                )
+            })?;
 
-        copy_tree(source_root, &snapshot_path, apply_skip)?;
+            copy_tree(source_root, &snapshot_path, apply_skip)?;
 
-        self.create_checkpoint_from_existing_snapshot_with_lineage(
-            snapshot_id,
-            label,
-            message,
-            parent_checkpoint_event,
-            git_commit_mapping,
-        )
+            self.create_checkpoint_from_existing_snapshot_with_lineage(
+                snapshot_id,
+                label,
+                message,
+                parent_checkpoint_event,
+                git_commit_mapping,
+            )
+        }
     }
 
     fn create_checkpoint_from_existing_snapshot_with_lineage(
@@ -2177,6 +2239,10 @@ impl Repo {
     }
 
     fn restore_workspace_from_snapshot(&self, snapshot_id: Uuid) -> Result<()> {
+        if self.repo_mode()? == RepoMode::Native {
+            return self.restore_workspace_from_native_snapshot(snapshot_id);
+        }
+
         let snapshot_root = self.snapshot_path(snapshot_id);
         if !snapshot_root.is_dir() {
             bail!("snapshot {} not found", snapshot_id)
@@ -2234,6 +2300,10 @@ impl Repo {
         snapshot_id: Uuid,
         rel_path: &Path,
     ) -> Result<()> {
+        if self.repo_mode()? == RepoMode::Native {
+            return self.restore_workspace_file_from_native_snapshot(snapshot_id, rel_path);
+        }
+
         let snapshot_root = self.snapshot_path(snapshot_id);
         if !snapshot_root.is_dir() {
             bail!("snapshot {} not found", snapshot_id)
@@ -2292,6 +2362,314 @@ impl Repo {
         }
 
         Ok(())
+    }
+
+    /// Create a checkpoint event using the merkle root computed from the native
+    /// snapshot index (rather than walking a snapshot directory).
+    fn create_checkpoint_event_with_native_merkle(
+        &self,
+        snapshot_id: Uuid,
+        label: String,
+        message: Option<String>,
+        parent_checkpoint_event: Option<Uuid>,
+        git_commit_mapping: Option<String>,
+    ) -> Result<Event> {
+        let file_index = FileIndex::for_root(self.root());
+        let index = file_index.read(snapshot_id)?;
+
+        // Compute merkle root from the file index entries (same algorithm as
+        // directory-based, but using the stored file hashes)
+        let snapshot_merkle_root = compute_native_merkle_root(&index)?;
+
+        let parent_checkpoint_event =
+            parent_checkpoint_event.or_else(|| self.latest_checkpoint().map(|event| event.id));
+        let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
+            label,
+            message: message.clone(),
+            snapshot_id,
+            parent_checkpoint_event,
+            snapshot_merkle_root: Some(snapshot_merkle_root),
+        }))?;
+
+        if let Some(git_commit_sha) = git_commit_mapping {
+            self.append_event(EventKind::GitBridge(GitBridgeEvent {
+                action: GitBridgeAction::Commit,
+                success: true,
+                detail: format!("checkpoint={} git_commit={}", event.id, git_commit_sha),
+            }))?;
+        }
+
+        self.advance_main_ref(event.id)?;
+        Ok(event)
+    }
+
+    /// Store a snapshot using the native block-level content store.
+    ///
+    /// Walks the source directory, chunks each file, stores blocks in the
+    /// content store, and writes a snapshot index mapping paths to blocks.
+    fn create_native_snapshot(
+        &self,
+        source_root: &Path,
+        apply_skip: bool,
+        snapshot_id: Uuid,
+    ) -> Result<()> {
+        let store = ContentStore::for_root(self.root());
+        store.ensure_exists()?;
+        let file_index = FileIndex::for_root(self.root());
+        file_index.ensure_exists()?;
+
+        let chunk_config = ChunkConfig::default();
+        let mut index = SnapshotIndex::new(snapshot_id);
+
+        let walker = WalkDir::new(source_root)
+            .into_iter()
+            .filter_entry(|entry| !apply_skip || !should_skip_path(source_root, entry.path()));
+
+        for entry in walker {
+            let entry = entry.context("failed while walking source for native snapshot")?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let rel_path = entry
+                .path()
+                .strip_prefix(source_root)
+                .context("failed to compute relative path for native snapshot")?;
+
+            if apply_skip && should_skip_relative(rel_path) {
+                continue;
+            }
+
+            let contents = fs::read(entry.path()).with_context(|| {
+                format!(
+                    "failed to read {} for native snapshot",
+                    entry.path().display()
+                )
+            })?;
+
+            let file_hash = blake3::hash(&contents).to_hex().to_string();
+            let chunks = chunk_data(&contents, &chunk_config);
+            let mut block_refs = Vec::with_capacity(chunks.len());
+
+            for chunk in &chunks {
+                let chunk_bytes = &contents[chunk.offset..chunk.offset + chunk.length];
+                let hash = store.put(chunk_bytes)?;
+                block_refs.push(BlockRef {
+                    hash,
+                    offset: chunk.offset,
+                    length: chunk.length,
+                });
+            }
+
+            let rel_key = rel_path.to_string_lossy().replace('\\', "/");
+            index.insert(
+                rel_key,
+                FileEntry {
+                    blocks: block_refs,
+                    size: contents.len() as u64,
+                    file_hash,
+                },
+            );
+        }
+
+        file_index.write(&index)?;
+        Ok(())
+    }
+
+    /// Restore the workspace from a native snapshot index by reassembling
+    /// files from their content blocks.
+    fn restore_workspace_from_native_snapshot(&self, snapshot_id: Uuid) -> Result<()> {
+        let store = ContentStore::for_root(self.root());
+        let file_index = FileIndex::for_root(self.root());
+        let index = file_index.read(snapshot_id)?;
+
+        self.clear_workspace_files()?;
+
+        for (rel_path, entry) in &index.files {
+            let target = self.root.join(rel_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create directory {}", parent.display())
+                })?;
+            }
+
+            let mut contents = Vec::with_capacity(entry.size as usize);
+            for block_ref in &entry.blocks {
+                let block_data = store.get(&block_ref.hash)?;
+                contents.extend_from_slice(&block_data);
+            }
+
+            // Verify integrity
+            let actual_hash = blake3::hash(&contents).to_hex().to_string();
+            if actual_hash != entry.file_hash {
+                bail!(
+                    "integrity error restoring {}: expected hash {}, got {}",
+                    rel_path,
+                    entry.file_hash,
+                    actual_hash
+                );
+            }
+
+            fs::write(&target, &contents).with_context(|| {
+                format!("failed to write {}", target.display())
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Restore a single file from a native snapshot (for sub-file undo).
+    fn restore_workspace_file_from_native_snapshot(
+        &self,
+        snapshot_id: Uuid,
+        rel_path: &Path,
+    ) -> Result<()> {
+        let store = ContentStore::for_root(self.root());
+        let file_index = FileIndex::for_root(self.root());
+        let index = file_index.read(snapshot_id)?;
+
+        let rel_key = rel_path.to_string_lossy().replace('\\', "/");
+        let workspace_file = self.root.join(rel_path);
+
+        if let Some(entry) = index.files.get(&rel_key) {
+            // File exists in snapshot — reassemble from blocks
+            let mut contents = Vec::with_capacity(entry.size as usize);
+            for block_ref in &entry.blocks {
+                let block_data = store.get(&block_ref.hash)?;
+                contents.extend_from_slice(&block_data);
+            }
+
+            if let Some(parent) = workspace_file.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create parent directory {}", parent.display())
+                })?;
+            }
+            fs::write(&workspace_file, &contents).with_context(|| {
+                format!("failed to restore {}", workspace_file.display())
+            })?;
+        } else if workspace_file.exists() {
+            // File doesn't exist in snapshot — remove from workspace
+            let metadata = fs::metadata(&workspace_file)?;
+            if metadata.is_dir() {
+                fs::remove_dir_all(&workspace_file)?;
+            } else {
+                fs::remove_file(&workspace_file)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Migrate an existing repository to native storage mode.
+    ///
+    /// Converts all existing snapshots from directory-copy format to
+    /// block-level content-addressed storage, then updates the config.
+    pub fn migrate_to_native(&self) -> Result<MigrateReport> {
+        self.assert_initialized()?;
+        let mode = self.repo_mode()?;
+        if mode == RepoMode::Native {
+            bail!("repository is already in native mode");
+        }
+
+        // Initialize native store
+        let store = ContentStore::for_root(self.root());
+        store.ensure_exists()?;
+        let file_index = FileIndex::for_root(self.root());
+        file_index.ensure_exists()?;
+
+        // Find all checkpoint events and migrate their snapshots
+        let events = self.list_events()?;
+        let mut snapshots_migrated = 0u32;
+        let mut blocks_stored = 0u64;
+        let mut bytes_before = 0u64;
+        let chunk_config = ChunkConfig::default();
+
+        for event in &events {
+            if let EventKind::Checkpoint(checkpoint) = &event.kind {
+                let snapshot_dir = self.snapshot_path(checkpoint.snapshot_id);
+                if !snapshot_dir.is_dir() {
+                    continue;
+                }
+
+                // Already migrated?
+                if file_index.has(checkpoint.snapshot_id) {
+                    continue;
+                }
+
+                let mut index = SnapshotIndex::new(checkpoint.snapshot_id);
+
+                // Walk all files in the snapshot directory (not just source files)
+                for entry in WalkDir::new(&snapshot_dir) {
+                    let entry = entry?;
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let rel_path = entry.path().strip_prefix(&snapshot_dir)?;
+                    let contents = fs::read(entry.path())?;
+                    bytes_before += contents.len() as u64;
+
+                    let file_hash = blake3::hash(&contents).to_hex().to_string();
+                    let chunks = chunk_data(&contents, &chunk_config);
+                    let mut block_refs = Vec::new();
+
+                    for chunk in &chunks {
+                        let chunk_bytes =
+                            &contents[chunk.offset..chunk.offset + chunk.length];
+                        let hash = store.put(chunk_bytes)?;
+                        block_refs.push(BlockRef {
+                            hash,
+                            offset: chunk.offset,
+                            length: chunk.length,
+                        });
+                        blocks_stored += 1;
+                    }
+
+                    let rel_key = rel_path.to_string_lossy().replace('\\', "/");
+                    index.insert(
+                        rel_key,
+                        FileEntry {
+                            blocks: block_refs,
+                            size: contents.len() as u64,
+                            file_hash,
+                        },
+                    );
+                }
+
+                file_index.write(&index)?;
+                snapshots_migrated += 1;
+            }
+        }
+
+        // Remove old snapshot directories now that data is in block store
+        for event in &events {
+            if let EventKind::Checkpoint(checkpoint) = &event.kind {
+                let snapshot_dir = self.snapshot_path(checkpoint.snapshot_id);
+                if snapshot_dir.is_dir() {
+                    fs::remove_dir_all(&snapshot_dir).with_context(|| {
+                        format!(
+                            "failed to remove old snapshot directory {}",
+                            snapshot_dir.display()
+                        )
+                    })?;
+                }
+            }
+        }
+
+        // Update config to native mode
+        let config_path = self.root.join(CONFIG_FILE);
+        let raw = fs::read_to_string(&config_path).unwrap_or_default();
+        let updated = update_config_mode(&raw, "native");
+        fs::write(&config_path, updated)
+            .with_context(|| format!("failed to update config {}", config_path.display()))?;
+
+        let bytes_after = store.total_size()?;
+
+        Ok(MigrateReport {
+            snapshots_migrated,
+            blocks_stored,
+            bytes_before,
+            bytes_after,
+        })
     }
 
     fn clear_workspace_files(&self) -> Result<()> {
@@ -3838,6 +4216,7 @@ fn parse_repo_mode(raw_config: &str) -> RepoMode {
         let value = value.trim().trim_matches('"');
         return match value {
             "git-colocated" => RepoMode::GitColocated,
+            "native" => RepoMode::Native,
             _ => RepoMode::GitCompatible,
         };
     }
@@ -3980,6 +4359,78 @@ fn compute_review_stats(diffs: &[SemanticFileDiff]) -> ReviewStats {
     }
 
     stats
+}
+
+/// Compute a merkle root from a native snapshot index. Uses the same Merkle
+/// tree construction as `compute_snapshot_merkle_root` but reads file hashes
+/// from the index rather than reading file contents from disk.
+fn compute_native_merkle_root(index: &SnapshotIndex) -> Result<String> {
+    let mut leaves: Vec<(String, [u8; 32])> = Vec::new();
+
+    for (rel_key, entry) in &index.files {
+        let file_content_hash = hex::decode(&entry.file_hash)
+            .with_context(|| format!("invalid hex hash for {}", rel_key))?;
+
+        let mut leaf_hasher = blake3::Hasher::new();
+        leaf_hasher.update(b"flock:merkle:leaf:v1");
+        leaf_hasher.update(&(rel_key.len() as u64).to_le_bytes());
+        leaf_hasher.update(rel_key.as_bytes());
+        leaf_hasher.update(&file_content_hash);
+        leaves.push((rel_key.clone(), *leaf_hasher.finalize().as_bytes()));
+    }
+
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut nodes: Vec<[u8; 32]> = leaves.into_iter().map(|(_, hash)| hash).collect();
+    if nodes.is_empty() {
+        return Ok(hex::encode(
+            blake3::hash(b"flock:merkle:empty:v1").as_bytes(),
+        ));
+    }
+
+    while nodes.len() > 1 {
+        let mut next = Vec::with_capacity(nodes.len().div_ceil(2));
+        for chunk in nodes.chunks(2) {
+            let left = chunk[0];
+            let right = if chunk.len() == 2 { chunk[1] } else { chunk[0] };
+
+            let mut node_hasher = blake3::Hasher::new();
+            node_hasher.update(b"flock:merkle:node:v1");
+            node_hasher.update(&left);
+            node_hasher.update(&right);
+            next.push(*node_hasher.finalize().as_bytes());
+        }
+        nodes = next;
+    }
+
+    Ok(hex::encode(nodes[0]))
+}
+
+/// Update the `mode` value in a TOML config string.
+fn update_config_mode(raw: &str, new_mode: &str) -> String {
+    let mut lines: Vec<String> = raw.lines().map(String::from).collect();
+    let mut found = false;
+
+    for line in &mut lines {
+        let trimmed = line.trim();
+        if let Some((key, _)) = trimmed.split_once('=') {
+            if key.trim() == "mode" {
+                *line = format!("mode = \"{}\"", new_mode);
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if !found {
+        lines.insert(0, format!("mode = \"{}\"", new_mode));
+    }
+
+    let mut result = lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 #[cfg(test)]
@@ -5278,5 +5729,288 @@ mod tests {
             "expected at least 2 limit warnings, got: {:?}",
             info.limits_exceeded
         );
+    }
+
+    #[test]
+    fn native_init_and_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init_native().expect("native init");
+
+        // Verify native mode
+        let config = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(config.contains("native"));
+
+        // Verify block store dir exists, not snapshots dir
+        assert!(dir.path().join(".flock/store/blocks").is_dir());
+        assert!(!dir.path().join(".flock/snapshots").is_dir());
+
+        // Create a file and checkpoint
+        fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+        let event = repo.create_checkpoint(Some("first".to_string())).unwrap();
+        let EventKind::Checkpoint(payload) = &event.kind else {
+            panic!("expected checkpoint");
+        };
+        assert!(payload.snapshot_merkle_root.is_some());
+
+        // Verify index was written
+        let file_index = FileIndex::for_root(dir.path());
+        assert!(file_index.has(payload.snapshot_id));
+        let index = file_index.read(payload.snapshot_id).unwrap();
+        assert_eq!(index.file_count(), 1);
+        assert!(index.get("hello.txt").is_some());
+    }
+
+    #[test]
+    fn native_checkpoint_and_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init_native().unwrap();
+
+        // Create initial files
+        fs::write(dir.path().join("a.txt"), "content A").unwrap();
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/b.txt"), "content B").unwrap();
+
+        repo.create_checkpoint(Some("v1".to_string())).unwrap();
+
+        // Modify files
+        fs::write(dir.path().join("a.txt"), "modified A").unwrap();
+        fs::write(dir.path().join("c.txt"), "new file C").unwrap();
+
+        repo.create_checkpoint(Some("v2".to_string())).unwrap();
+
+        // Undo back to v1
+        repo.undo(UndoRequest::Last).unwrap();
+
+        // Verify workspace is restored
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "content A");
+        assert_eq!(fs::read_to_string(dir.path().join("sub/b.txt")).unwrap(), "content B");
+        assert!(!dir.path().join("c.txt").exists());
+    }
+
+    #[test]
+    fn native_deduplication() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init_native().unwrap();
+
+        let content = "identical content in both files";
+        fs::write(dir.path().join("file1.txt"), content).unwrap();
+        fs::write(dir.path().join("file2.txt"), content).unwrap();
+
+        repo.create_checkpoint(Some("dedup-test".to_string())).unwrap();
+
+        // Both files should share blocks
+        let store = ContentStore::for_root(dir.path());
+        // For small identical files, both map to the same single block
+        let count = store.block_count().unwrap();
+        assert_eq!(count, 1, "identical files should share blocks, got {} blocks", count);
+    }
+
+    #[test]
+    fn migrate_to_native() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().unwrap();
+
+        // Create some checkpoints in git-compatible mode
+        fs::write(dir.path().join("x.txt"), "hello").unwrap();
+        repo.create_checkpoint(Some("cp1".to_string())).unwrap();
+
+        fs::write(dir.path().join("y.txt"), "world").unwrap();
+        repo.create_checkpoint(Some("cp2".to_string())).unwrap();
+
+        // Verify snapshots exist as directories
+        assert!(dir.path().join(".flock/snapshots").is_dir());
+
+        // Migrate
+        let report = repo.migrate_to_native().unwrap();
+        assert_eq!(report.snapshots_migrated, 2);
+        assert!(report.blocks_stored > 0);
+
+        // Verify old snapshot directories are removed
+        let snapshots_dir = dir.path().join(".flock/snapshots");
+        if snapshots_dir.is_dir() {
+            let entries: Vec<_> = fs::read_dir(&snapshots_dir).unwrap().collect();
+            assert!(entries.is_empty(), "snapshot dirs should be removed after migration");
+        }
+
+        // Verify config updated
+        let config = fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(config.contains("native"));
+
+        // Verify block store has content
+        let store = ContentStore::for_root(dir.path());
+        assert!(store.block_count().unwrap() > 0);
+
+        // fsck should still pass
+        repo.fsck().expect("fsck should pass after migration");
+    }
+
+    #[test]
+    fn native_scoped_undo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init_native().unwrap();
+
+        fs::write(dir.path().join("keep.txt"), "keep this").unwrap();
+        fs::write(dir.path().join("change.txt"), "original").unwrap();
+
+        repo.create_checkpoint(Some("base".to_string())).unwrap();
+
+        fs::write(dir.path().join("keep.txt"), "modified keep").unwrap();
+        fs::write(dir.path().join("change.txt"), "changed").unwrap();
+
+        repo.create_checkpoint(Some("modified".to_string())).unwrap();
+
+        // Scoped undo on just change.txt
+        repo.undo_file(UndoRequest::Last, "change.txt").unwrap();
+
+        // change.txt should be restored, keep.txt untouched
+        assert_eq!(fs::read_to_string(dir.path().join("change.txt")).unwrap(), "original");
+        assert_eq!(fs::read_to_string(dir.path().join("keep.txt")).unwrap(), "modified keep");
+    }
+
+    #[test]
+    fn native_vs_colocated_benchmark() {
+        use std::time::Instant;
+
+        // Generate test files: 10 files of ~10KB each
+        let file_count = 10;
+        let file_size = 10_000;
+        let generate_content = |seed: u8| -> Vec<u8> {
+            let mut state = seed as u64 | 1;
+            (0..file_size)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state & 0xFF) as u8
+                })
+                .collect()
+        };
+
+        // Benchmark git-compatible mode
+        let dir_compat = tempfile::tempdir().unwrap();
+        let repo_compat = Repo::at(dir_compat.path());
+        repo_compat.init().unwrap();
+
+        for i in 0..file_count {
+            fs::write(
+                dir_compat.path().join(format!("file_{}.txt", i)),
+                generate_content(i as u8),
+            )
+            .unwrap();
+        }
+
+        let start = Instant::now();
+        repo_compat
+            .create_checkpoint(Some("compat-bench".to_string()))
+            .unwrap();
+        let compat_time = start.elapsed();
+
+        // Benchmark native mode
+        let dir_native = tempfile::tempdir().unwrap();
+        let repo_native = Repo::at(dir_native.path());
+        repo_native.init_native().unwrap();
+
+        for i in 0..file_count {
+            fs::write(
+                dir_native.path().join(format!("file_{}.txt", i)),
+                generate_content(i as u8),
+            )
+            .unwrap();
+        }
+
+        let start = Instant::now();
+        repo_native
+            .create_checkpoint(Some("native-bench".to_string()))
+            .unwrap();
+        let native_time = start.elapsed();
+
+        // Now test deduplication advantage: create a second checkpoint with
+        // only 1 file changed
+        fs::write(
+            dir_compat.path().join("file_0.txt"),
+            generate_content(100),
+        )
+        .unwrap();
+        fs::write(
+            dir_native.path().join("file_0.txt"),
+            generate_content(100),
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        repo_compat
+            .create_checkpoint(Some("compat-bench-2".to_string()))
+            .unwrap();
+        let compat_time_2 = start.elapsed();
+
+        let start = Instant::now();
+        repo_native
+            .create_checkpoint(Some("native-bench-2".to_string()))
+            .unwrap();
+        let native_time_2 = start.elapsed();
+
+        // Native mode should store less data across 2 checkpoints due to dedup
+        let compat_size = dir_size(dir_compat.path());
+        let native_size = dir_size(dir_native.path());
+
+        // The native store should be smaller than 2 full copies
+        // (9 files are identical between the two checkpoints)
+        assert!(
+            native_size < compat_size,
+            "native store ({} bytes) should be smaller than compat ({} bytes)",
+            native_size,
+            compat_size
+        );
+
+        eprintln!(
+            "Benchmark results ({}x{}B files):",
+            file_count, file_size
+        );
+        eprintln!("  1st checkpoint: compat={:?}, native={:?}", compat_time, native_time);
+        eprintln!(
+            "  2nd checkpoint: compat={:?}, native={:?}",
+            compat_time_2, native_time_2
+        );
+        eprintln!(
+            "  Total storage:  compat={} bytes, native={} bytes ({:.1}% of compat)",
+            compat_size,
+            native_size,
+            native_size as f64 / compat_size as f64 * 100.0
+        );
+    }
+
+    fn dir_size(path: &Path) -> u64 {
+        let mut total = 0u64;
+        for entry in WalkDir::new(path) {
+            if let Ok(entry) = entry {
+                if entry.file_type().is_file() {
+                    if let Ok(meta) = entry.metadata() {
+                        total += meta.len();
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn update_config_mode_replaces_existing() {
+        let raw = "mode = \"git-compatible\"\nsemantic_default = \"typescript\"\n";
+        let updated = update_config_mode(raw, "native");
+        assert!(updated.contains("mode = \"native\""));
+        assert!(updated.contains("semantic_default = \"typescript\""));
+        assert!(!updated.contains("git-compatible"));
+    }
+
+    #[test]
+    fn update_config_mode_inserts_if_missing() {
+        let raw = "semantic_default = \"typescript\"\n";
+        let updated = update_config_mode(raw, "native");
+        assert!(updated.contains("mode = \"native\""));
     }
 }

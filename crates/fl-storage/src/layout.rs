@@ -7,3 +7,8 @@ pub const REFS_FILE: &str = ".flock/refs/refs.json";
 pub const KEY_DIR: &str = ".flock/keys";
 pub const SIGNING_KEY_FILE: &str = ".flock/keys/ed25519.sk";
 pub const CONFIG_FILE: &str = ".flock/config.toml";
+
+// Native storage engine paths
+pub const STORE_DIR: &str = ".flock/store";
+pub const STORE_BLOCKS_DIR: &str = ".flock/store/blocks";
+pub const STORE_INDEX_DIR: &str = ".flock/store/index";

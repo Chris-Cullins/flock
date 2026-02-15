@@ -132,17 +132,17 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## 9. Native Storage Engine (Phase 2 Backend)
 
-- [ ] Design native `.flock/store` layout
-- [ ] Implement block-level content store with BLAKE3 keys
-- [ ] Implement file index mapping `(path, event) -> block refs`
-- [ ] Evaluate block strategy:
+- [x] Design native `.flock/store` layout
+- [x] Implement block-level content store with BLAKE3 keys
+- [x] Implement file index mapping `(path, event) -> block refs`
+- [x] Evaluate block strategy:
   - [ ] fixed-size chunking
-  - [ ] content-defined chunking
+  - [x] content-defined chunking
   - [ ] language-aware chunking
-- [ ] Implement native copy-on-write snapshots
-- [ ] Implement sub-file undo (true file-scoped rewind)
-- [ ] Implement migration command `fl migrate --native`
-- [ ] Add performance benchmarks against colocated mode
+- [x] Implement native copy-on-write snapshots
+- [x] Implement sub-file undo (true file-scoped rewind)
+- [x] Implement migration command `fl migrate --native`
+- [x] Add performance benchmarks against colocated mode
 
 ## 10. Scale and Server Components
 

@@ -23,6 +23,8 @@ enum Command {
     Init {
         #[arg(long)]
         colocated: bool,
+        #[arg(long)]
+        native: bool,
     },
     Checkpoint {
         #[arg(short = 'm', long = "message")]
@@ -132,6 +134,10 @@ enum Command {
     Gate {
         #[command(subcommand)]
         command: GateCommand,
+    },
+    Migrate {
+        #[arg(long)]
+        native: bool,
     },
 }
 
@@ -454,9 +460,13 @@ fn main() -> Result<()> {
     let cwd = env::current_dir()?;
 
     match cli.command {
-        Command::Init { colocated } => {
+        Command::Init { colocated, native } => {
             let repo = Repo::at(cwd);
-            if colocated {
+            if colocated && native {
+                bail!("--colocated and --native are mutually exclusive");
+            } else if native {
+                repo.init_native()?;
+            } else if colocated {
                 repo.init_colocated()?;
             } else {
                 repo.init()?;
@@ -2018,6 +2028,31 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Migrate { native } => {
+            if !native {
+                bail!("specify --native to migrate to native block-level storage");
+            }
+            let repo = Repo::discover(cwd)?;
+            let report = repo.migrate_to_native()?;
+            println!(
+                "migrated {} snapshot{} to native storage",
+                report.snapshots_migrated,
+                if report.snapshots_migrated == 1 { "" } else { "s" }
+            );
+            println!(
+                "  blocks stored: {}",
+                report.blocks_stored
+            );
+            if report.bytes_before > 0 {
+                let ratio = report.bytes_after as f64 / report.bytes_before as f64;
+                println!(
+                    "  storage: {} -> {} ({:.1}%)",
+                    format_bytes(report.bytes_before),
+                    format_bytes(report.bytes_after),
+                    ratio * 100.0
+                );
+            }
+        }
     }
 
     Ok(())
@@ -2124,6 +2159,18 @@ fn build_undo_request(
 
 fn parse_uuid(value: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("invalid UUID `{}`", value))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
 }
 
 fn task_to_json(task: &fl_core::TaskSummary) -> serde_json::Value {

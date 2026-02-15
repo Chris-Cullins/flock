@@ -404,12 +404,14 @@ name = "fl-storage"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",
  "tempfile",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
