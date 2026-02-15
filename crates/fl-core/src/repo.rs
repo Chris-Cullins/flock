@@ -188,6 +188,7 @@ impl Repo {
         let store = RefStore::for_root(self.root());
         store.ensure_exists()?;
         store.upsert(reference.clone())?;
+        self.sync_ref_to_git_if_colocated(&reference)?;
         Ok(reference)
     }
 
@@ -197,7 +198,11 @@ impl Repo {
         let normalized_name = normalize_ref_name(name)?;
         let store = RefStore::for_root(self.root());
         store.ensure_exists()?;
-        store.delete(kind, &normalized_name)
+        let removed = store.delete(kind, &normalized_name)?;
+        if removed {
+            self.delete_git_ref_if_colocated(kind, &normalized_name)?;
+        }
+        Ok(removed)
     }
 
     pub fn replay_state(&self) -> Result<ReplayedState> {
@@ -1145,12 +1150,88 @@ impl Repo {
     fn advance_main_ref(&self, checkpoint_event_id: Uuid) -> Result<()> {
         let store = RefStore::for_root(self.root());
         store.ensure_exists()?;
-        store.upsert(RepoRef {
+        let reference = RepoRef {
             kind: RefKind::Branch,
             name: "main".to_string(),
             target_event_id: checkpoint_event_id,
             workspace: None,
-        })
+        };
+        store.upsert(reference.clone())?;
+        self.sync_ref_to_git_if_colocated(&reference)
+    }
+
+    fn sync_ref_to_git_if_colocated(&self, reference: &RepoRef) -> Result<()> {
+        if self.repo_mode()? != RepoMode::GitColocated {
+            return Ok(());
+        }
+
+        self.assert_git_initialized()?;
+        let git_ref = git_ref_name(reference.kind, &reference.name);
+        let commit = self.resolve_git_commit_for_event(reference.target_event_id)?;
+        self.run_git(&["update-ref", &git_ref, &commit])?;
+        Ok(())
+    }
+
+    fn delete_git_ref_if_colocated(&self, kind: RefKind, name: &str) -> Result<()> {
+        if self.repo_mode()? != RepoMode::GitColocated {
+            return Ok(());
+        }
+
+        self.assert_git_initialized()?;
+        let git_ref = git_ref_name(kind, name);
+
+        // Ignore missing refs so Flock metadata remains the source of truth.
+        let _ = self.run_git(&["update-ref", "-d", &git_ref]);
+        Ok(())
+    }
+
+    fn resolve_git_commit_for_event(&self, event_id: Uuid) -> Result<String> {
+        let events = self.list_events()?;
+        let target_index = events
+            .iter()
+            .position(|event| event.id == event_id)
+            .ok_or_else(|| anyhow!("event {} not found", event_id))?;
+
+        let checkpoint_id = events[..=target_index]
+            .iter()
+            .rev()
+            .find_map(|event| match event.kind {
+                EventKind::Checkpoint(_) => Some(event.id),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot map ref target {} to git: no checkpoint exists at or before the target event",
+                    event_id
+                )
+            })?;
+
+        self.git_commit_for_checkpoint(checkpoint_id, &events)
+    }
+
+    fn git_commit_for_checkpoint(
+        &self,
+        checkpoint_event_id: Uuid,
+        events: &[Event],
+    ) -> Result<String> {
+        for event in events {
+            let EventKind::GitBridge(bridge) = &event.kind else {
+                continue;
+            };
+            if bridge.action != GitBridgeAction::Commit {
+                continue;
+            }
+
+            if let Some(commit) = parse_checkpoint_git_mapping(&bridge.detail, checkpoint_event_id)
+            {
+                return Ok(commit);
+            }
+        }
+
+        bail!(
+            "checkpoint {} has no git commit mapping event; cannot sync git refs",
+            checkpoint_event_id
+        )
     }
 
     fn ensure_signing_key(&self) -> Result<()> {
@@ -1358,6 +1439,36 @@ fn normalize_ref_name(raw_name: &str) -> Result<String> {
     }
 
     Ok(name.to_string())
+}
+
+fn git_ref_name(kind: RefKind, name: &str) -> String {
+    match kind {
+        RefKind::Branch => format!("refs/flock/branches/{name}"),
+        RefKind::Tag => format!("refs/flock/tags/{name}"),
+        RefKind::Workspace => format!("refs/flock/workspaces/{name}"),
+    }
+}
+
+fn parse_checkpoint_git_mapping(detail: &str, checkpoint_id: Uuid) -> Option<String> {
+    let mut mapped_checkpoint = None;
+    let mut mapped_commit = None;
+    let checkpoint_id = checkpoint_id.to_string();
+
+    for token in detail.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        match key {
+            "checkpoint" => mapped_checkpoint = Some(value),
+            "git_commit" => mapped_commit = Some(value),
+            _ => {}
+        }
+    }
+
+    if mapped_checkpoint == Some(checkpoint_id.as_str()) {
+        return mapped_commit.map(ToOwned::to_owned);
+    }
+    None
 }
 
 fn parse_repo_mode(raw_config: &str) -> RepoMode {
@@ -1887,6 +1998,129 @@ mod tests {
             .expect("commit mapping event should exist");
         assert!(mapping.contains(&checkpoint.id.to_string()));
         assert!(mapping.contains(&head));
+    }
+
+    #[test]
+    fn colocated_checkpoint_updates_main_git_ref_mapping() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = dir.path().join("main-ref.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        let head = repo
+            .run_git(&["rev-parse", "HEAD"])
+            .expect("head should resolve");
+        let mapped = repo
+            .run_git(&["rev-parse", "refs/flock/branches/main"])
+            .expect("main mapping should resolve");
+
+        assert_eq!(mapped.trim(), head.trim());
+    }
+
+    #[test]
+    fn colocated_refs_set_and_delete_sync_git_ref_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = dir.path().join("refs-sync.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        let checkpoint = repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        let head = repo
+            .run_git(&["rev-parse", "HEAD"])
+            .expect("head should resolve");
+        let head = head.trim().to_string();
+
+        repo.upsert_ref(
+            RefKind::Branch,
+            "release/1".to_string(),
+            checkpoint.id.to_string(),
+            None,
+        )
+        .expect("branch ref should sync");
+        repo.upsert_ref(
+            RefKind::Tag,
+            "v1.0.0".to_string(),
+            checkpoint.id.to_string(),
+            None,
+        )
+        .expect("tag ref should sync");
+        repo.upsert_ref(
+            RefKind::Workspace,
+            "agent/a".to_string(),
+            checkpoint.id.to_string(),
+            Some(true),
+        )
+        .expect("workspace ref should sync");
+
+        let branch_sha = repo
+            .run_git(&["rev-parse", &git_ref_name(RefKind::Branch, "release/1")])
+            .expect("branch git ref should resolve");
+        let tag_sha = repo
+            .run_git(&["rev-parse", &git_ref_name(RefKind::Tag, "v1.0.0")])
+            .expect("tag git ref should resolve");
+        let workspace_sha = repo
+            .run_git(&["rev-parse", &git_ref_name(RefKind::Workspace, "agent/a")])
+            .expect("workspace git ref should resolve");
+
+        assert_eq!(branch_sha.trim(), head);
+        assert_eq!(tag_sha.trim(), head);
+        assert_eq!(workspace_sha.trim(), head);
+
+        repo.delete_ref(RefKind::Workspace, "agent/a")
+            .expect("workspace should delete");
+        assert!(
+            repo.run_git(&["rev-parse", &git_ref_name(RefKind::Workspace, "agent/a")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn colocated_ref_target_non_checkpoint_maps_to_previous_checkpoint_commit() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = dir.path().join("workspace-map.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        let head = repo
+            .run_git(&["rev-parse", "HEAD"])
+            .expect("head should resolve");
+        let head = head.trim().to_string();
+
+        repo.start_exploration("scratch".to_string())
+            .expect("exploration should start");
+        let exploration_event_id = repo
+            .list_events()
+            .expect("events should load")
+            .last()
+            .expect("exploration event should exist")
+            .id;
+
+        repo.upsert_ref(
+            RefKind::Workspace,
+            "agent/b".to_string(),
+            exploration_event_id.to_string(),
+            Some(false),
+        )
+        .expect("workspace ref should map");
+
+        let mapped = repo
+            .run_git(&["rev-parse", &git_ref_name(RefKind::Workspace, "agent/b")])
+            .expect("workspace git ref should resolve");
+        assert_eq!(mapped.trim(), head);
     }
 
     #[test]

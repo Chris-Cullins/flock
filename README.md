@@ -12,6 +12,10 @@ Initial Rust implementation of `fl` with:
 - git bridge command stubs (`commit/push/pull`)
 - optional git-colocated mode (`--colocated`) with checkpoint-to-git commit mapping
 - repository refs abstraction (`branch`, `tag`, `workspace`)
+- colocated ref mirroring into git refs:
+  - branches: `refs/flock/branches/<name>`
+  - tags: `refs/flock/tags/<name>`
+  - workspaces: `refs/flock/workspaces/<name>`
 
 Workspace crates:
 
