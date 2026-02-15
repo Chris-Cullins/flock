@@ -59,8 +59,8 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Implement semantic conflict classification and explanation
 - [x] Add machine-readable semantic diff output (`--json`)
 - [x] Add plugin trait/API for additional analyzers
-- [ ] Add analyzer process boundary (FFI or gRPC) and lifecycle management
-- [ ] Add first non-TS/JS fallback analyzer contract tests
+- [x] Add analyzer process boundary (FFI or gRPC) and lifecycle management
+- [x] Add first non-TS/JS fallback analyzer contract tests
 
 ## 4. Developer Experience (CLI + Review)
 

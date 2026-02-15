@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
@@ -182,8 +185,225 @@ impl SourceLanguage {
     }
 }
 
+pub const ANALYZER_PROCESS_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
+pub struct ProcessAnalyzerConfig {
+    pub id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub extensions: Vec<String>,
+}
+
+impl ProcessAnalyzerConfig {
+    pub fn new(id: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            command: command.into(),
+            args: Vec::new(),
+            extensions: Vec::new(),
+        }
+    }
+
+    pub fn with_args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_extensions(
+        mut self,
+        extensions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.extensions = extensions.into_iter().map(Into::into).collect();
+        self
+    }
+
+    fn supports_path(&self, path: &Path) -> bool {
+        if self.extensions.is_empty() {
+            return true;
+        }
+
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        self.extensions
+            .iter()
+            .any(|candidate| candidate == extension)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnalyzerProcessRequest {
+    Initialize {
+        protocol_version: u32,
+    },
+    SupportsPath {
+        path: String,
+    },
+    Diff {
+        path: String,
+        old_source: Option<Vec<u8>>,
+        new_source: Option<Vec<u8>>,
+    },
+    Merge {
+        path: String,
+        base_source: Option<Vec<u8>>,
+        left_source: Option<Vec<u8>>,
+        right_source: Option<Vec<u8>>,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnalyzerProcessResponse {
+    Initialized {
+        protocol_version: u32,
+        analyzer_ids: Vec<String>,
+    },
+    SupportsPath {
+        supported: bool,
+    },
+    Diff {
+        diff: Option<SemanticFileDiff>,
+    },
+    Merge {
+        merge: Option<SemanticMergeResult>,
+    },
+    ShutdownAck,
+    Error {
+        message: String,
+    },
+}
+
+pub fn serve_analyzer_process(registry: AnalyzerRegistry) -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut writer = BufWriter::new(stdout.lock());
+    let mut line = String::new();
+    let mut initialized = false;
+
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .context("failed to read analyzer process request")?
+            == 0
+        {
+            break;
+        }
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let request: AnalyzerProcessRequest = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                write_process_response(
+                    &mut writer,
+                    &AnalyzerProcessResponse::Error {
+                        message: format!("invalid request payload: {error}"),
+                    },
+                )?;
+                continue;
+            }
+        };
+
+        let mut should_shutdown = false;
+        let response = match request {
+            AnalyzerProcessRequest::Initialize { protocol_version } => {
+                if protocol_version != ANALYZER_PROCESS_PROTOCOL_VERSION {
+                    AnalyzerProcessResponse::Error {
+                        message: format!(
+                            "protocol mismatch: expected {}, got {}",
+                            ANALYZER_PROCESS_PROTOCOL_VERSION, protocol_version
+                        ),
+                    }
+                } else {
+                    initialized = true;
+                    AnalyzerProcessResponse::Initialized {
+                        protocol_version,
+                        analyzer_ids: registry
+                            .analyzers()
+                            .iter()
+                            .map(|analyzer| analyzer.id().to_string())
+                            .collect(),
+                    }
+                }
+            }
+            AnalyzerProcessRequest::Shutdown => {
+                should_shutdown = true;
+                AnalyzerProcessResponse::ShutdownAck
+            }
+            _ if !initialized => AnalyzerProcessResponse::Error {
+                message: "analyzer process must be initialized first".to_string(),
+            },
+            AnalyzerProcessRequest::SupportsPath { path } => {
+                AnalyzerProcessResponse::SupportsPath {
+                    supported: registry.supported_source(Path::new(&path)),
+                }
+            }
+            AnalyzerProcessRequest::Diff {
+                path,
+                old_source,
+                new_source,
+            } => match registry.diff(
+                Path::new(&path),
+                old_source.as_deref(),
+                new_source.as_deref(),
+            ) {
+                Ok(diff) => AnalyzerProcessResponse::Diff { diff },
+                Err(error) => AnalyzerProcessResponse::Error {
+                    message: error.to_string(),
+                },
+            },
+            AnalyzerProcessRequest::Merge {
+                path,
+                base_source,
+                left_source,
+                right_source,
+            } => match registry.merge(
+                Path::new(&path),
+                base_source.as_deref(),
+                left_source.as_deref(),
+                right_source.as_deref(),
+            ) {
+                Ok(merge) => AnalyzerProcessResponse::Merge { merge },
+                Err(error) => AnalyzerProcessResponse::Error {
+                    message: error.to_string(),
+                },
+            },
+        };
+
+        write_process_response(&mut writer, &response)?;
+        if should_shutdown {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_process_response(
+    writer: &mut impl Write,
+    response: &AnalyzerProcessResponse,
+) -> Result<()> {
+    serde_json::to_writer(&mut *writer, response)
+        .context("failed to serialize process response")?;
+    writer
+        .write_all(b"\n")
+        .context("failed to write process response newline")?;
+    writer
+        .flush()
+        .context("failed to flush process response output")
+}
+
 pub trait SemanticAnalyzerPlugin: Send + Sync {
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
     fn supports_path(&self, path: &Path) -> bool;
     fn diff(
         &self,
@@ -198,6 +418,10 @@ pub trait SemanticAnalyzerPlugin: Send + Sync {
         left_source: Option<&[u8]>,
         right_source: Option<&[u8]>,
     ) -> Result<Option<SemanticMergeResult>>;
+
+    fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default, Clone)]
@@ -231,6 +455,15 @@ impl AnalyzerRegistry {
 
     pub fn analyzers(&self) -> &[Arc<dyn SemanticAnalyzerPlugin>] {
         &self.analyzers
+    }
+
+    pub fn shutdown_all(&self) -> Result<()> {
+        for analyzer in &self.analyzers {
+            analyzer
+                .shutdown()
+                .with_context(|| format!("failed to shutdown analyzer `{}`", analyzer.id()))?;
+        }
+        Ok(())
     }
 
     pub fn supported_source(&self, path: &Path) -> bool {
@@ -277,7 +510,7 @@ impl AnalyzerRegistry {
 pub struct TreeSitterTsJsAnalyzer;
 
 impl SemanticAnalyzerPlugin for TreeSitterTsJsAnalyzer {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "tree-sitter-ts-js"
     }
 
@@ -302,6 +535,353 @@ impl SemanticAnalyzerPlugin for TreeSitterTsJsAnalyzer {
         right_source: Option<&[u8]>,
     ) -> Result<Option<SemanticMergeResult>> {
         tree_sitter_merge(path, base_source, left_source, right_source)
+    }
+}
+
+pub struct ProcessSemanticAnalyzer {
+    config: ProcessAnalyzerConfig,
+    state: Mutex<ProcessAnalyzerState>,
+}
+
+impl ProcessSemanticAnalyzer {
+    pub fn new(config: ProcessAnalyzerConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(ProcessAnalyzerState::Stopped),
+        }
+    }
+
+    pub fn shutdown_process(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process analyzer state lock poisoned"))?;
+        Self::shutdown_locked(&mut state)
+    }
+
+    fn send_with_retry(&self, request: AnalyzerProcessRequest) -> Result<AnalyzerProcessResponse> {
+        let mut last_error = None;
+        for _ in 0..2 {
+            match self.send_once(&request) {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    last_error = Some(error);
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("process analyzer state lock poisoned"))?;
+                    Self::shutdown_locked(&mut state)?;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("process analyzer request failed")))
+    }
+
+    fn send_once(&self, request: &AnalyzerProcessRequest) -> Result<AnalyzerProcessResponse> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("process analyzer state lock poisoned"))?;
+
+        if matches!(*state, ProcessAnalyzerState::Stopped) {
+            *state = ProcessAnalyzerState::Running(AnalyzerProcessHandle::spawn(&self.config)?);
+        }
+
+        let ProcessAnalyzerState::Running(handle) = &mut *state else {
+            bail!("process analyzer did not enter running state");
+        };
+        handle.request(request)
+    }
+
+    fn shutdown_locked(state: &mut ProcessAnalyzerState) -> Result<()> {
+        let ProcessAnalyzerState::Running(handle) = state else {
+            return Ok(());
+        };
+
+        let shutdown_result = handle.shutdown();
+        *state = ProcessAnalyzerState::Stopped;
+        shutdown_result
+    }
+}
+
+impl SemanticAnalyzerPlugin for ProcessSemanticAnalyzer {
+    fn id(&self) -> &str {
+        &self.config.id
+    }
+
+    fn supports_path(&self, path: &Path) -> bool {
+        self.config.supports_path(path)
+    }
+
+    fn diff(
+        &self,
+        path: &Path,
+        old_source: Option<&[u8]>,
+        new_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticFileDiff>> {
+        if !self.supports_path(path) {
+            return Ok(None);
+        }
+
+        let response = self.send_with_retry(AnalyzerProcessRequest::Diff {
+            path: path.to_string_lossy().to_string(),
+            old_source: old_source.map(|value| value.to_vec()),
+            new_source: new_source.map(|value| value.to_vec()),
+        })?;
+
+        match response {
+            AnalyzerProcessResponse::Diff { diff } => Ok(diff),
+            AnalyzerProcessResponse::Error { message } => {
+                bail!("process analyzer `{}` diff failed: {message}", self.id())
+            }
+            other => bail!(
+                "process analyzer `{}` returned unexpected diff response: {:?}",
+                self.id(),
+                other
+            ),
+        }
+    }
+
+    fn merge(
+        &self,
+        path: &Path,
+        base_source: Option<&[u8]>,
+        left_source: Option<&[u8]>,
+        right_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticMergeResult>> {
+        if !self.supports_path(path) {
+            return Ok(None);
+        }
+
+        let response = self.send_with_retry(AnalyzerProcessRequest::Merge {
+            path: path.to_string_lossy().to_string(),
+            base_source: base_source.map(|value| value.to_vec()),
+            left_source: left_source.map(|value| value.to_vec()),
+            right_source: right_source.map(|value| value.to_vec()),
+        })?;
+
+        match response {
+            AnalyzerProcessResponse::Merge { merge } => Ok(merge),
+            AnalyzerProcessResponse::Error { message } => {
+                bail!("process analyzer `{}` merge failed: {message}", self.id())
+            }
+            other => bail!(
+                "process analyzer `{}` returned unexpected merge response: {:?}",
+                self.id(),
+                other
+            ),
+        }
+    }
+
+    fn shutdown(&self) -> Result<()> {
+        self.shutdown_process()
+    }
+}
+
+enum ProcessAnalyzerState {
+    Stopped,
+    Running(AnalyzerProcessHandle),
+}
+
+struct AnalyzerProcessHandle {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl AnalyzerProcessHandle {
+    fn spawn(config: &ProcessAnalyzerConfig) -> Result<Self> {
+        let mut command = Command::new(&config.command);
+        command
+            .args(&config.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn analyzer process `{}`", config.command))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("analyzer process stdin was not piped")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("analyzer process stdout was not piped")?;
+        let mut handle = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+
+        let response = handle.request(&AnalyzerProcessRequest::Initialize {
+            protocol_version: ANALYZER_PROCESS_PROTOCOL_VERSION,
+        })?;
+        match response {
+            AnalyzerProcessResponse::Initialized {
+                protocol_version, ..
+            } if protocol_version == ANALYZER_PROCESS_PROTOCOL_VERSION => Ok(handle),
+            AnalyzerProcessResponse::Initialized {
+                protocol_version, ..
+            } => bail!(
+                "analyzer process protocol mismatch: expected {}, got {}",
+                ANALYZER_PROCESS_PROTOCOL_VERSION,
+                protocol_version
+            ),
+            AnalyzerProcessResponse::Error { message } => {
+                bail!("analyzer process initialization failed: {message}")
+            }
+            other => bail!(
+                "analyzer process returned unexpected initialization response: {:?}",
+                other
+            ),
+        }
+    }
+
+    fn request(&mut self, request: &AnalyzerProcessRequest) -> Result<AnalyzerProcessResponse> {
+        serde_json::to_writer(&mut self.stdin, request)
+            .context("failed to write analyzer process request")?;
+        self.stdin
+            .write_all(b"\n")
+            .context("failed to write analyzer process request newline")?;
+        self.stdin
+            .flush()
+            .context("failed to flush analyzer process request")?;
+
+        let mut line = String::new();
+        if self
+            .stdout
+            .read_line(&mut line)
+            .context("failed to read analyzer process response")?
+            == 0
+        {
+            let status = self
+                .child
+                .try_wait()
+                .context("failed to read analyzer process status")?
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "running".to_string());
+            bail!("analyzer process closed stdout unexpectedly (status: {status})");
+        }
+
+        serde_json::from_str(&line).context("failed to parse analyzer process response")
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        let _ = self.request(&AnalyzerProcessRequest::Shutdown);
+        self.terminate()
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        if self
+            .child
+            .try_wait()
+            .context("failed to query analyzer process state")?
+            .is_none()
+        {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AnalyzerProcessHandle {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FallbackTextAnalyzer {
+    id: String,
+    language: String,
+    extensions: BTreeSet<String>,
+}
+
+impl FallbackTextAnalyzer {
+    pub fn new(
+        id: impl Into<String>,
+        language: impl Into<String>,
+        extensions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            language: language.into(),
+            extensions: extensions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl SemanticAnalyzerPlugin for FallbackTextAnalyzer {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn supports_path(&self, path: &Path) -> bool {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        self.extensions.contains(extension)
+    }
+
+    fn diff(
+        &self,
+        path: &Path,
+        old_source: Option<&[u8]>,
+        new_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticFileDiff>> {
+        let old_source = old_source.unwrap_or_default();
+        let new_source = new_source.unwrap_or_default();
+        if old_source == new_source {
+            return Ok(None);
+        }
+
+        Ok(Some(SemanticFileDiff {
+            path: path.to_string_lossy().to_string(),
+            language: self.language.clone(),
+            parse_fallback: true,
+            changes: vec![SemanticChange {
+                kind: SemanticChangeKind::StyleOnly,
+                symbol: "(fallback text change)".to_string(),
+                risk: SemanticRisk::Medium,
+                impact: SemanticImpact::default(),
+                compatibility: SemanticCompatibility::default(),
+            }],
+        }))
+    }
+
+    fn merge(
+        &self,
+        path: &Path,
+        base_source: Option<&[u8]>,
+        left_source: Option<&[u8]>,
+        right_source: Option<&[u8]>,
+    ) -> Result<Option<SemanticMergeResult>> {
+        let base_source = base_source.unwrap_or_default();
+        let left_source = left_source.unwrap_or_default();
+        let right_source = right_source.unwrap_or_default();
+        let (merged_source, has_conflicts) = text_merge(base_source, left_source, right_source);
+        let conflicts = if has_conflicts {
+            vec![SemanticMergeConflict {
+                symbol: "(fallback text merge)".to_string(),
+                classification: SemanticConflictClassification::TextFallback,
+                explanation: "fallback text merge produced unresolved conflicts".to_string(),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        Ok(Some(SemanticMergeResult {
+            path: path.to_string_lossy().to_string(),
+            language: self.language.clone(),
+            parse_fallback: true,
+            merged_source,
+            conflicts,
+        }))
     }
 }
 
@@ -1373,7 +1953,7 @@ mod tests {
     }
 
     impl SemanticAnalyzerPlugin for StubAnalyzer {
-        fn id(&self) -> &'static str {
+        fn id(&self) -> &str {
             self.language
         }
 
@@ -1468,6 +2048,57 @@ mod tests {
                 .iter()
                 .any(|change| change.symbol == "stub:symbol")
         );
+    }
+
+    #[test]
+    fn fallback_analyzer_contract_diff_for_python() {
+        let analyzer = FallbackTextAnalyzer::new("python-fallback", "python", ["py"]);
+        assert!(analyzer.supports_path(Path::new("main.py")));
+        assert!(!analyzer.supports_path(Path::new("main.ts")));
+
+        let unchanged = analyzer
+            .diff(
+                Path::new("main.py"),
+                Some(b"print('hello')\n"),
+                Some(b"print('hello')\n"),
+            )
+            .expect("diff should succeed");
+        assert!(unchanged.is_none());
+
+        let changed = analyzer
+            .diff(
+                Path::new("main.py"),
+                Some(b"print('hello')\n"),
+                Some(b"print('hi')\n"),
+            )
+            .expect("diff should succeed")
+            .expect("diff should exist");
+        assert!(changed.parse_fallback);
+        assert_eq!(changed.language, "python");
+        assert!(changed.changes.iter().any(|change| {
+            change.kind == SemanticChangeKind::StyleOnly
+                && change.symbol == "(fallback text change)"
+                && change.risk == SemanticRisk::Medium
+        }));
+    }
+
+    #[test]
+    fn fallback_analyzer_contract_merge_for_python() {
+        let analyzer = FallbackTextAnalyzer::new("python-fallback", "python", ["py"]);
+        let base = b"value = 1\n";
+        let left = b"value = 2\n";
+        let right = b"value = 3\n";
+
+        let merged = analyzer
+            .merge(Path::new("main.py"), Some(base), Some(left), Some(right))
+            .expect("merge should succeed")
+            .expect("merge result should exist");
+        assert!(merged.parse_fallback);
+        assert_eq!(merged.language, "python");
+        assert!(merged.conflicts.iter().any(|conflict| {
+            conflict.classification == SemanticConflictClassification::TextFallback
+                && conflict.explanation.contains("fallback text merge")
+        }));
     }
 
     #[test]

@@ -8,6 +8,8 @@ Initial Rust implementation of `fl` with:
 - checkpoint metadata includes deterministic snapshot Merkle roots
 - semantic diff for JavaScript/TypeScript (`.js`, `.jsx`, `.ts`, `.tsx`)
 - pluggable semantic analyzer API with a built-in tree-sitter TS/JS analyzer
+- analyzer process boundary (JSON-over-stdio) with process lifecycle controls
+- fallback text analyzer contract coverage for non-TS/JS languages (first `.py` target)
 - exploration lifecycle commands (`start/list/promote/abandon`)
 - undo variants on the event timeline
 - git bridge commands (`commit/push/pull`) with event logging
@@ -93,6 +95,7 @@ cargo run -p fl-cli -- refs delete workspace agent/a
 - The analyzer detects functions (including arrow/function expressions assigned to vars), classes, constructors, methods, class fields, interfaces, type aliases, enums, and export/re-export statements.
 - Semantic diffs include callable signature compatibility checks (compatible, potentially-breaking, breaking) for function/method changes.
 - Semantic merge conflicts now include machine-readable classifications (`divergent_edit`, `delete_vs_edit`, `concurrent_addition`, `kind_mismatch`, `text_fallback`) with branch-aware explanations.
+- `fl-semantic` now includes a subprocess analyzer protocol (`serve_analyzer_process`) and a process-backed analyzer plugin (`ProcessSemanticAnalyzer`) for out-of-process language analyzers.
 - This is an MVP foundation for layering in explorations, sessions, and native storage later.
 - jj import design and metadata mapping spec: `docs/jj-import-design.md`
 

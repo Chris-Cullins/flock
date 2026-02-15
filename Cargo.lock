@@ -390,6 +390,7 @@ dependencies = [
  "blake3",
  "diffy",
  "serde",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
