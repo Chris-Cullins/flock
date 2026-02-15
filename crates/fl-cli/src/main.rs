@@ -236,7 +236,9 @@ fn main() -> Result<()> {
                         SemanticChangeKind::Added => "+",
                         SemanticChangeKind::Removed => "-",
                         SemanticChangeKind::Modified => "~",
-                        SemanticChangeKind::TextOnly => "=",
+                        SemanticChangeKind::Renamed => "R",
+                        SemanticChangeKind::Moved => "M",
+                        SemanticChangeKind::StyleOnly => "=",
                     };
                     println!("  {} {}", marker, change.symbol);
                 }

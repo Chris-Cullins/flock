@@ -50,8 +50,8 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [x] Exported declarations and re-exports
   - [x] Interfaces, type aliases, enums
   - [x] Class fields and constructors
-- [ ] Add semantic change taxonomy:
-  - [ ] Added, Removed, Modified, Renamed, Moved, StyleOnly
+- [x] Add semantic change taxonomy:
+  - [x] Added, Removed, Modified, Renamed, Moved, StyleOnly
 - [ ] Add risk scoring (Low/Medium/High)
 - [ ] Add impact tracking (affected symbols/files/modules)
 - [ ] Add compatibility checks for signature changes
