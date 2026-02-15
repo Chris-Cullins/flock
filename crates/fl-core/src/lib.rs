@@ -11,4 +11,6 @@ pub use repo::{
     ExplorationStatus, ExplorationSummary, FsckReport, ReplayedState, Repo, ShadowSafetyCheck,
     ShadowSafetyReport, UndoRequest, UndoResult,
 };
-pub use semantic::{SemanticChange, SemanticChangeKind, SemanticFileDiff, SemanticRisk};
+pub use semantic::{
+    SemanticChange, SemanticChangeKind, SemanticFileDiff, SemanticImpact, SemanticRisk,
+};

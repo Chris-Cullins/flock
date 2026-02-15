@@ -432,7 +432,7 @@ impl Repo {
         let current_files = collect_source_files(self.root(), true)?;
 
         let mut all_paths: BTreeSet<PathBuf> = snapshot_files;
-        all_paths.extend(current_files);
+        all_paths.extend(current_files.iter().cloned());
 
         let mut diffs = Vec::new();
         for rel_path in all_paths {
@@ -448,6 +448,7 @@ impl Repo {
             }
         }
 
+        enrich_semantic_impacts(self.root(), &current_files, &mut diffs)?;
         diffs.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(diffs)
     }
@@ -2000,6 +2001,260 @@ fn collect_source_files(root: &Path, apply_skip: bool) -> Result<BTreeSet<PathBu
     Ok(files)
 }
 
+fn enrich_semantic_impacts(
+    repo_root: &Path,
+    current_files: &BTreeSet<PathBuf>,
+    diffs: &mut [SemanticFileDiff],
+) -> Result<()> {
+    if diffs.is_empty() {
+        return Ok(());
+    }
+
+    let reverse_dependencies = build_reverse_dependency_index(repo_root, current_files)?;
+    for diff in diffs {
+        let changed_path = PathBuf::from(&diff.path);
+        let impacted_files = collect_impacted_files(&changed_path, &reverse_dependencies);
+        let impacted_file_values: Vec<String> = impacted_files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        let impacted_module_values: Vec<String> = impacted_files
+            .iter()
+            .map(|path| module_name_for_path(path))
+            .collect();
+
+        for change in &mut diff.changes {
+            extend_unique(
+                &mut change.impact.files,
+                impacted_file_values.iter().cloned(),
+            );
+            extend_unique(
+                &mut change.impact.modules,
+                impacted_module_values.iter().cloned(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn extend_unique(target: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
+    let mut combined = BTreeSet::new();
+    for value in target.drain(..) {
+        if !value.trim().is_empty() {
+            combined.insert(value);
+        }
+    }
+    for value in values {
+        if !value.trim().is_empty() {
+            combined.insert(value);
+        }
+    }
+    *target = combined.into_iter().collect();
+}
+
+fn collect_impacted_files(
+    changed_file: &Path,
+    reverse_dependencies: &HashMap<PathBuf, BTreeSet<PathBuf>>,
+) -> BTreeSet<PathBuf> {
+    let mut impacted = BTreeSet::new();
+    let mut stack = vec![changed_file.to_path_buf()];
+    impacted.insert(changed_file.to_path_buf());
+
+    while let Some(current) = stack.pop() {
+        let Some(dependents) = reverse_dependencies.get(&current) else {
+            continue;
+        };
+
+        for dependent in dependents {
+            if impacted.insert(dependent.clone()) {
+                stack.push(dependent.clone());
+            }
+        }
+    }
+
+    impacted
+}
+
+fn build_reverse_dependency_index(
+    repo_root: &Path,
+    current_files: &BTreeSet<PathBuf>,
+) -> Result<HashMap<PathBuf, BTreeSet<PathBuf>>> {
+    let mut reverse = HashMap::<PathBuf, BTreeSet<PathBuf>>::new();
+
+    for importer in current_files {
+        let source_path = repo_root.join(importer);
+        let source = fs::read_to_string(&source_path).with_context(|| {
+            format!(
+                "failed to read source file while building semantic impact graph: {}",
+                source_path.display()
+            )
+        })?;
+
+        for specifier in extract_local_import_specifiers(&source) {
+            for target in resolve_import_targets(importer, &specifier, current_files) {
+                reverse.entry(target).or_default().insert(importer.clone());
+            }
+        }
+    }
+
+    Ok(reverse)
+}
+
+fn extract_local_import_specifiers(source: &str) -> Vec<String> {
+    let mut specifiers = BTreeSet::new();
+    collect_specifiers_for_token(
+        source,
+        "from",
+        |source, token_end| parse_quoted_literal(source, token_end).map(|(value, _)| value),
+        &mut specifiers,
+    );
+    collect_specifiers_for_token(
+        source,
+        "require(",
+        |source, token_end| parse_quoted_literal(source, token_end).map(|(value, _)| value),
+        &mut specifiers,
+    );
+    collect_specifiers_for_token(
+        source,
+        "import(",
+        |source, token_end| parse_quoted_literal(source, token_end).map(|(value, _)| value),
+        &mut specifiers,
+    );
+
+    specifiers
+        .into_iter()
+        .filter(|value| {
+            value.starts_with("./") || value.starts_with("../") || value.starts_with('/')
+        })
+        .collect()
+}
+
+fn collect_specifiers_for_token(
+    source: &str,
+    token: &str,
+    parser: impl Fn(&str, usize) -> Option<String>,
+    output: &mut BTreeSet<String>,
+) {
+    let bytes = source.as_bytes();
+    let mut start = 0usize;
+
+    while let Some(offset) = source[start..].find(token) {
+        let token_start = start + offset;
+        let token_end = token_start + token.len();
+
+        if token == "from"
+            && (is_identifier_byte(bytes.get(token_start.wrapping_sub(1)).copied())
+                || is_identifier_byte(bytes.get(token_end).copied()))
+        {
+            start = token_end;
+            continue;
+        }
+
+        if let Some(value) = parser(source, token_end) {
+            let normalized = value
+                .split(['?', '#'])
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !normalized.is_empty() {
+                output.insert(normalized);
+            }
+        }
+
+        start = token_end;
+    }
+}
+
+fn parse_quoted_literal(source: &str, mut index: usize) -> Option<(String, usize)> {
+    let bytes = source.as_bytes();
+    while matches!(bytes.get(index), Some(ch) if ch.is_ascii_whitespace()) {
+        index += 1;
+    }
+
+    let quote = match bytes.get(index).copied() {
+        Some(b'"') | Some(b'\'') => bytes[index],
+        _ => return None,
+    };
+
+    let mut cursor = index + 1;
+    while let Some(ch) = bytes.get(cursor).copied() {
+        if ch == quote && bytes.get(cursor.wrapping_sub(1)).copied() != Some(b'\\') {
+            let value = source[index + 1..cursor].to_string();
+            return Some((value, cursor + 1));
+        }
+        cursor += 1;
+    }
+
+    None
+}
+
+fn is_identifier_byte(byte: Option<u8>) -> bool {
+    matches!(byte, Some(ch) if ch.is_ascii_alphanumeric() || ch == b'_')
+}
+
+fn resolve_import_targets(
+    importer: &Path,
+    specifier: &str,
+    current_files: &BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let base = if specifier.starts_with('/') {
+        PathBuf::from(specifier.trim_start_matches('/'))
+    } else {
+        importer
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(specifier)
+    };
+    let base = normalize_relative_path(&base);
+
+    let mut candidates = Vec::new();
+    if base.extension().is_some() {
+        candidates.push(base);
+    } else {
+        for ext in ["ts", "tsx", "js", "jsx"] {
+            candidates.push(base.with_extension(ext));
+            candidates.push(base.join(format!("index.{ext}")));
+        }
+    }
+
+    let mut resolved = BTreeSet::new();
+    for candidate in candidates {
+        if current_files.contains(&candidate) {
+            resolved.insert(candidate);
+        }
+    }
+
+    resolved.into_iter().collect()
+}
+
+fn normalize_relative_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    normalized
+}
+
+fn module_name_for_path(path: &Path) -> String {
+    let Some(parent) = path.parent() else {
+        return "(root)".to_string();
+    };
+    if parent.as_os_str().is_empty() {
+        "(root)".to_string()
+    } else {
+        parent.to_string_lossy().to_string()
+    }
+}
+
 fn compute_snapshot_merkle_root(snapshot_root: &Path) -> Result<String> {
     let mut leaves: Vec<(String, [u8; 32])> = Vec::new();
 
@@ -2256,6 +2511,61 @@ mod tests {
                 .iter()
                 .any(|change| change.kind == crate::semantic::SemanticChangeKind::Modified)
         );
+    }
+
+    #[test]
+    fn semantic_diff_tracks_impacted_files_and_modules() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let source_dir = dir.path().join("src");
+        fs::create_dir_all(&source_dir).expect("source dir should be created");
+        let lib_file = source_dir.join("lib.ts");
+        let app_file = source_dir.join("app.ts");
+
+        fs::write(&lib_file, "export function add(a, b) { return a + b; }")
+            .expect("lib seed write should succeed");
+        fs::write(
+            &app_file,
+            "import { add } from './lib'; export const total = add(1, 2);",
+        )
+        .expect("app seed write should succeed");
+
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint should succeed");
+
+        fs::write(&lib_file, "export function add(a, b) { return a - b; }")
+            .expect("lib update should succeed");
+
+        let diffs = repo
+            .semantic_diff_from_latest_checkpoint()
+            .expect("semantic diff should succeed");
+        let lib_diff = diffs
+            .iter()
+            .find(|diff| diff.path == "src/lib.ts")
+            .expect("lib diff should exist");
+        let modified = lib_diff
+            .changes
+            .iter()
+            .find(|change| change.kind == crate::semantic::SemanticChangeKind::Modified)
+            .expect("modified semantic change should exist");
+
+        assert!(
+            modified
+                .impact
+                .files
+                .iter()
+                .any(|path| path == "src/lib.ts")
+        );
+        assert!(
+            modified
+                .impact
+                .files
+                .iter()
+                .any(|path| path == "src/app.ts")
+        );
+        assert!(modified.impact.modules.iter().any(|module| module == "src"));
     }
 
     #[test]

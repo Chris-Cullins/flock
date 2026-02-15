@@ -18,6 +18,18 @@ pub struct SemanticChange {
     pub kind: SemanticChangeKind,
     pub symbol: String,
     pub risk: SemanticRisk,
+    #[serde(default)]
+    pub impact: SemanticImpact,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SemanticImpact {
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub modules: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +146,7 @@ pub fn diff(
                         kind: SemanticChangeKind::Modified,
                         symbol: key.clone(),
                         risk: score_risk(SemanticChangeKind::Modified, &key),
+                        impact: base_impact(&key),
                     })
                 }
                 _ => {}
@@ -193,6 +206,7 @@ pub fn diff(
                     kind: relocation_kind(&old_key, key),
                     symbol: format!("{old_key} -> {key}"),
                     risk: score_relocation_risk(&old_key, key),
+                    impact: base_impact(&format!("{old_key} -> {key}")),
                 });
             }
         }
@@ -202,6 +216,7 @@ pub fn diff(
                 kind: SemanticChangeKind::Removed,
                 symbol: key.clone(),
                 risk: score_risk(SemanticChangeKind::Removed, key),
+                impact: base_impact(key),
             });
         }
 
@@ -210,6 +225,7 @@ pub fn diff(
                 kind: SemanticChangeKind::Added,
                 symbol: key.clone(),
                 risk: score_risk(SemanticChangeKind::Added, key),
+                impact: base_impact(key),
             });
         }
 
@@ -218,6 +234,7 @@ pub fn diff(
                 kind: SemanticChangeKind::StyleOnly,
                 symbol: "(style-only change)".to_string(),
                 risk: SemanticRisk::Low,
+                impact: base_impact("(style-only change)"),
             });
         }
 
@@ -237,8 +254,40 @@ pub fn diff(
             kind: SemanticChangeKind::StyleOnly,
             symbol: "(parser fallback)".to_string(),
             risk: SemanticRisk::High,
+            impact: base_impact("(parser fallback)"),
         }],
     }))
+}
+
+fn base_impact(symbol: &str) -> SemanticImpact {
+    SemanticImpact {
+        symbols: impact_symbols(symbol),
+        files: Vec::new(),
+        modules: Vec::new(),
+    }
+}
+
+fn impact_symbols(symbol: &str) -> Vec<String> {
+    let mut symbols = BTreeSet::new();
+    for part in symbol.split("->") {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = trimmed
+            .split_once(':')
+            .map(|(_, value)| value.trim())
+            .unwrap_or(trimmed);
+        if !value.is_empty() {
+            symbols.insert(value.to_string());
+        }
+    }
+
+    if symbols.is_empty() {
+        symbols.insert(symbol.to_string());
+    }
+
+    symbols.into_iter().collect()
 }
 
 fn symbol_leaf_name(key: &str) -> &str {
@@ -685,6 +734,11 @@ mod tests {
 
         assert!(diff.changes.iter().any(|c| {
             c.kind == SemanticChangeKind::Renamed && c.symbol == "function:add -> function:sum"
+        }));
+        assert!(diff.changes.iter().any(|c| {
+            c.kind == SemanticChangeKind::Renamed
+                && c.impact.symbols.iter().any(|value| value == "add")
+                && c.impact.symbols.iter().any(|value| value == "sum")
         }));
     }
 

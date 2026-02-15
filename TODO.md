@@ -44,7 +44,7 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 ## 3. Semantic Layer (TS/JS First)
 
-- [ ] Expand TS/JS symbol extraction beyond declarations:
+- [x] Expand TS/JS symbol extraction beyond declarations:
   - [x] Arrow functions assigned to const/let
   - [x] Function expressions
   - [x] Exported declarations and re-exports
@@ -53,7 +53,7 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Add semantic change taxonomy:
   - [x] Added, Removed, Modified, Renamed, Moved, StyleOnly
 - [x] Add risk scoring (Low/Medium/High)
-- [ ] Add impact tracking (affected symbols/files/modules)
+- [x] Add impact tracking (affected symbols/files/modules)
 - [ ] Add compatibility checks for signature changes
 - [ ] Implement semantic merge for TS/JS with text fallback
 - [ ] Implement semantic conflict classification and explanation

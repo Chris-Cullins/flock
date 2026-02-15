@@ -246,6 +246,19 @@ fn main() -> Result<()> {
                         SemanticRisk::High => "high",
                     };
                     println!("  {} [{}] {}", marker, risk, change.symbol);
+                    let mut impact_fields = Vec::new();
+                    if !change.impact.symbols.is_empty() {
+                        impact_fields.push(format!("symbols={}", change.impact.symbols.join(", ")));
+                    }
+                    if !change.impact.files.is_empty() {
+                        impact_fields.push(format!("files={}", change.impact.files.join(", ")));
+                    }
+                    if !change.impact.modules.is_empty() {
+                        impact_fields.push(format!("modules={}", change.impact.modules.join(", ")));
+                    }
+                    if !impact_fields.is_empty() {
+                        println!("    impact: {}", impact_fields.join(" | "));
+                    }
                 }
                 if diff.parse_fallback {
                     println!("  ! parser fallback used");
