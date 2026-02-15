@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <!-- Body -->
+  <ellipse cx="100" cy="130" rx="45" ry="35" fill="#F5F0E1" stroke="#2D2D2D" stroke-width="2.5"/>
+
+  <!-- Wing -->
+  <path d="M70 120 Q55 130 60 148 Q70 155 85 145 Q80 130 70 120Z" fill="#E8E0CC" stroke="#2D2D2D" stroke-width="2"/>
+
+  <!-- Tail feathers -->
+  <path d="M140 115 Q160 100 155 108 Q165 95 158 112 Q170 102 155 118" fill="none" stroke="#2D2D2D" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Neck -->
+  <path d="M72 118 Q65 80 60 60 Q58 45 65 38" fill="none" stroke="#F5F0E1" stroke-width="22"/>
+  <path d="M72 118 Q65 80 60 60 Q58 45 65 38" fill="none" stroke="#2D2D2D" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Neck inner edge -->
+  <path d="M82 115 Q78 85 74 65 Q72 52 76 42" fill="none" stroke="#2D2D2D" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Neck fill -->
+  <path d="M72 118 Q65 80 60 60 Q58 45 65 38 L76 42 Q72 52 74 65 Q78 85 82 115Z" fill="#F5F0E1"/>
+
+  <!-- Head -->
+  <ellipse cx="68" cy="35" rx="18" ry="14" fill="#F5F0E1" stroke="#2D2D2D" stroke-width="2.5"/>
+
+  <!-- Eye -->
+  <circle cx="62" cy="32" r="3.5" fill="#2D2D2D"/>
+  <circle cx="61" cy="31" r="1.2" fill="white"/>
+
+  <!-- Beak -->
+  <path d="M50 36 L38 38 Q36 40 38 42 L50 40 Q48 38 50 36Z" fill="#F4A623" stroke="#2D2D2D" stroke-width="1.8"/>
+
+  <!-- Happy blush -->
+  <ellipse cx="56" cy="39" rx="4" ry="2.5" fill="#FFB4B4" opacity="0.5"/>
+
+  <!-- Legs -->
+  <line x1="88" y1="160" x2="85" y2="178" stroke="#F4A623" stroke-width="3" stroke-linecap="round"/>
+  <line x1="108" y1="160" x2="111" y2="178" stroke="#F4A623" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Feet -->
+  <path d="M75 178 L85 178 L92 183 L85 178 L88 185" fill="none" stroke="#F4A623" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M101 178 L111 178 L118 183 L111 178 L114 185" fill="none" stroke="#F4A623" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Code bracket on body (subtle branding) -->
+  <text x="90" y="138" font-family="monospace" font-size="18" font-weight="bold" fill="#2D2D2D" opacity="0.15">{}</text>
+
+  <!-- Small version control branch lines above head -->
+  <circle cx="68" cy="12" r="2.5" fill="none" stroke="#6C63FF" stroke-width="1.5"/>
+  <line x1="68" y1="14.5" x2="68" y2="21" stroke="#6C63FF" stroke-width="1.5"/>
+  <circle cx="58" cy="8" r="2.5" fill="none" stroke="#F4A623" stroke-width="1.5"/>
+  <line x1="60" y1="9.8" x2="66" y2="12" stroke="#F4A623" stroke-width="1.5"/>
+  <circle cx="78" cy="8" r="2.5" fill="none" stroke="#4CAF50" stroke-width="1.5"/>
+  <line x1="76" y1="9.8" x2="70" y2="12" stroke="#4CAF50" stroke-width="1.5"/>
+</svg>
