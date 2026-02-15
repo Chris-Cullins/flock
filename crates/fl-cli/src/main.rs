@@ -298,19 +298,19 @@ fn main() -> Result<()> {
             let repo = Repo::discover(cwd)?;
             match command {
                 GitCommand::Commit { message } => {
-                    let out = repo.git_commit_stub(message)?;
+                    let out = repo.git_commit(message)?;
                     if !out.is_empty() {
                         println!("{}", out);
                     }
                 }
                 GitCommand::Push { remote, branch } => {
-                    let out = repo.git_push_stub(remote, branch)?;
+                    let out = repo.git_push(remote, branch)?;
                     if !out.is_empty() {
                         println!("{}", out);
                     }
                 }
                 GitCommand::Pull { remote, branch } => {
-                    let out = repo.git_pull_stub(remote, branch)?;
+                    let out = repo.git_pull(remote, branch)?;
                     if !out.is_empty() {
                         println!("{}", out);
                     }

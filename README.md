@@ -9,13 +9,14 @@ Initial Rust implementation of `fl` with:
 - semantic diff for JavaScript/TypeScript (`.js`, `.jsx`, `.ts`, `.tsx`)
 - exploration lifecycle commands (`start/list/promote/abandon`)
 - undo variants on the event timeline
-- git bridge command stubs (`commit/push/pull`)
+- git bridge commands (`commit/push/pull`) with event logging
 - optional git-colocated mode (`--colocated`) with checkpoint-to-git commit mapping
 - repository refs abstraction (`branch`, `tag`, `workspace`)
 - colocated ref mirroring into git refs:
   - branches: `refs/flock/branches/<name>`
   - tags: `refs/flock/tags/<name>`
   - workspaces: `refs/flock/workspaces/<name>`
+- colocated push/pull bridge sync for `refs/flock/*` to/from git remotes
 
 Workspace crates:
 
@@ -67,7 +68,7 @@ cargo run -p fl-cli -- undo --to <event-id-or-prefix>
 cargo run -p fl-cli -- undo --since 5m
 cargo run -p fl-cli -- undo --file src/app.ts
 
-# git bridge stubs (pass-through to git + event logging)
+# git bridge commands
 cargo run -p fl-cli -- git commit -m \"checkpoint from fl\"
 cargo run -p fl-cli -- git push
 cargo run -p fl-cli -- git pull

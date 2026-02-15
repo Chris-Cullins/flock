@@ -650,68 +650,55 @@ impl Repo {
         })
     }
 
-    pub fn git_commit_stub(&self, message: String) -> Result<String> {
-        self.assert_initialized()?;
-        self.assert_git_initialized()?;
-
-        self.run_git(&["add", "-A"])?;
-        let detail = self.run_git(&["commit", "-m", &message])?;
-
-        self.append_event(EventKind::GitBridge(GitBridgeEvent {
-            action: GitBridgeAction::Commit,
-            success: true,
-            detail: detail.clone(),
-        }))?;
-
-        Ok(detail)
+    pub fn git_commit(&self, message: String) -> Result<String> {
+        self.run_git_bridge_action(GitBridgeAction::Commit, || {
+            self.run_git(&["add", "-A"])?;
+            self.run_git(&["commit", "-m", &message])
+        })
     }
 
-    pub fn git_push_stub(&self, remote: Option<String>, branch: Option<String>) -> Result<String> {
-        self.assert_initialized()?;
-        self.assert_git_initialized()?;
+    pub fn git_push(&self, remote: Option<String>, branch: Option<String>) -> Result<String> {
+        self.run_git_bridge_action(GitBridgeAction::Push, || {
+            let remote = self.resolve_git_remote_name(remote.as_deref())?;
+            let branch = self.resolve_git_branch_name(branch.as_deref())?;
 
-        let mut args = vec!["push".to_string()];
-        if let Some(remote) = remote {
-            args.push(remote);
-        }
-        if let Some(branch) = branch {
-            args.push(branch);
-        }
+            let mut details = Vec::new();
+            let branch_push = self
+                .run_git(&["push", &remote, &branch])
+                .with_context(|| format!("failed to push branch `{branch}` to `{remote}`"))?;
+            details.push(format!("push {remote} {branch}"));
+            details.push(branch_push);
 
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let detail = self.run_git(&arg_refs)?;
+            if self.repo_mode()? == RepoMode::GitColocated {
+                if let Some(flock_push) = self.push_colocated_refs_to_remote(&remote)? {
+                    details.push(flock_push);
+                }
+            }
 
-        self.append_event(EventKind::GitBridge(GitBridgeEvent {
-            action: GitBridgeAction::Push,
-            success: true,
-            detail: detail.clone(),
-        }))?;
-
-        Ok(detail)
+            Ok(join_non_empty_lines(details))
+        })
     }
 
-    pub fn git_pull_stub(&self, remote: Option<String>, branch: Option<String>) -> Result<String> {
-        self.assert_initialized()?;
-        self.assert_git_initialized()?;
+    pub fn git_pull(&self, remote: Option<String>, branch: Option<String>) -> Result<String> {
+        self.run_git_bridge_action(GitBridgeAction::Pull, || {
+            let remote = self.resolve_git_remote_name(remote.as_deref())?;
+            let branch = self.resolve_git_branch_name(branch.as_deref())?;
 
-        let mut args = vec!["pull".to_string()];
-        if let Some(remote) = remote {
-            args.push(remote);
-        }
-        if let Some(branch) = branch {
-            args.push(branch);
-        }
+            let mut details = Vec::new();
+            let branch_pull = self
+                .run_git(&["pull", "--ff-only", &remote, &branch])
+                .with_context(|| format!("failed to pull branch `{branch}` from `{remote}`"))?;
+            details.push(format!("pull --ff-only {remote} {branch}"));
+            details.push(branch_pull);
 
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let detail = self.run_git(&arg_refs)?;
+            if self.repo_mode()? == RepoMode::GitColocated {
+                if let Some(flock_fetch) = self.fetch_colocated_refs_from_remote(&remote)? {
+                    details.push(flock_fetch);
+                }
+            }
 
-        self.append_event(EventKind::GitBridge(GitBridgeEvent {
-            action: GitBridgeAction::Pull,
-            success: true,
-            detail: detail.clone(),
-        }))?;
-
-        Ok(detail)
+            Ok(join_non_empty_lines(details))
+        })
     }
 
     fn create_checkpoint_with_lineage(
@@ -920,7 +907,7 @@ impl Repo {
     fn assert_git_initialized(&self) -> Result<()> {
         if !self.root.join(".git").is_dir() {
             bail!(
-                "git bridge stub requires an existing .git directory in {}",
+                "git bridge operations require an existing .git directory in {}",
                 self.root.display()
             );
         }
@@ -1045,6 +1032,156 @@ impl Repo {
 
     fn run_git(&self, args: &[&str]) -> Result<String> {
         fl_bridge_git::run_git(&self.root, args)
+    }
+
+    fn run_git_bridge_action<F>(&self, action: GitBridgeAction, operation: F) -> Result<String>
+    where
+        F: FnOnce() -> Result<String>,
+    {
+        self.assert_initialized()?;
+        self.assert_git_initialized()?;
+
+        match operation() {
+            Ok(detail) => {
+                self.append_git_bridge_event(action, true, detail.clone())?;
+                Ok(detail)
+            }
+            Err(err) => {
+                let failure_detail = format!("{:#}", err);
+                if let Err(log_err) =
+                    self.append_git_bridge_event(action.clone(), false, failure_detail)
+                {
+                    return Err(err.context(format!(
+                        "failed to record git bridge failure event: {log_err:#}"
+                    )));
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn append_git_bridge_event(
+        &self,
+        action: GitBridgeAction,
+        success: bool,
+        detail: String,
+    ) -> Result<()> {
+        self.append_event(EventKind::GitBridge(GitBridgeEvent {
+            action,
+            success,
+            detail,
+        }))?;
+        Ok(())
+    }
+
+    fn resolve_git_remote_name(&self, remote: Option<&str>) -> Result<String> {
+        if let Some(remote) = remote.map(str::trim).filter(|value| !value.is_empty()) {
+            return Ok(remote.to_string());
+        }
+
+        let output = self.run_git(&["remote"])?;
+        let remotes: Vec<&str> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        if remotes.is_empty() {
+            bail!("no git remotes configured; pass a remote name explicitly");
+        }
+
+        if remotes.len() == 1 {
+            return Ok(remotes[0].to_string());
+        }
+
+        if remotes.iter().any(|remote| *remote == "origin") {
+            return Ok("origin".to_string());
+        }
+
+        bail!(
+            "multiple git remotes found ({}); pass a remote name explicitly",
+            remotes.join(", ")
+        )
+    }
+
+    fn resolve_git_branch_name(&self, branch: Option<&str>) -> Result<String> {
+        if let Some(branch) = branch.map(str::trim).filter(|value| !value.is_empty()) {
+            return Ok(branch.to_string());
+        }
+
+        let current = self.run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+        let current = current.trim();
+        if current.is_empty() || current == "HEAD" {
+            bail!("branch not provided and repository is in detached HEAD state");
+        }
+
+        Ok(current.to_string())
+    }
+
+    fn push_colocated_refs_to_remote(&self, remote: &str) -> Result<Option<String>> {
+        let refs = self.list_local_colocated_refs()?;
+        if refs.is_empty() {
+            return Ok(None);
+        }
+
+        let mut args = vec!["push".to_string(), remote.to_string()];
+        args.extend(refs.iter().map(|git_ref| format!("{git_ref}:{git_ref}")));
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let detail = self.run_git(&arg_refs)?;
+        Ok(Some(format!(
+            "push {remote} refs/flock/*\n{}",
+            detail.trim()
+        )))
+    }
+
+    fn fetch_colocated_refs_from_remote(&self, remote: &str) -> Result<Option<String>> {
+        let refs = self.list_remote_colocated_refs(remote)?;
+        if refs.is_empty() {
+            return Ok(None);
+        }
+
+        let mut args = vec!["fetch".to_string(), remote.to_string()];
+        args.extend(refs.iter().map(|git_ref| format!("{git_ref}:{git_ref}")));
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let detail = self.run_git(&arg_refs)?;
+        Ok(Some(format!(
+            "fetch {remote} refs/flock/*\n{}",
+            detail.trim()
+        )))
+    }
+
+    fn list_local_colocated_refs(&self) -> Result<Vec<String>> {
+        let output = self.run_git(&["for-each-ref", "--format=%(refname)", "refs/flock/"])?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    fn list_remote_colocated_refs(&self, remote: &str) -> Result<Vec<String>> {
+        let output = self.run_git(&[
+            "ls-remote",
+            "--refs",
+            remote,
+            "refs/flock/branches/*",
+            "refs/flock/tags/*",
+            "refs/flock/workspaces/*",
+        ])?;
+
+        let mut refs = BTreeSet::new();
+        for line in output.lines() {
+            let Some((_, ref_name)) = line.split_once('\t') else {
+                continue;
+            };
+            let ref_name = ref_name.trim();
+            if !ref_name.is_empty() {
+                refs.insert(ref_name.to_string());
+            }
+        }
+
+        Ok(refs.into_iter().collect())
     }
 
     fn ensure_git_repository(&self) -> Result<()> {
@@ -1406,6 +1543,15 @@ fn merkle_path_key(rel_path: &Path) -> Result<String> {
     }
 
     Ok(parts.join("/"))
+}
+
+fn join_non_empty_lines(lines: Vec<String>) -> String {
+    lines
+        .into_iter()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 fn normalize_label(message: &str) -> String {
@@ -2121,6 +2267,191 @@ mod tests {
             .run_git(&["rev-parse", &git_ref_name(RefKind::Workspace, "agent/b")])
             .expect("workspace git ref should resolve");
         assert_eq!(mapped.trim(), head);
+    }
+
+    #[test]
+    fn git_push_syncs_branch_and_flock_refs_to_remote() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir should be created");
+        fl_bridge_git::run_git(remote_dir.path(), &["init", "--bare"])
+            .expect("remote bare repo should initialize");
+
+        let local_dir = tempfile::tempdir().expect("local tempdir should be created");
+        let repo = Repo::at(local_dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = local_dir.path().join("push-sync.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        let remote_path = remote_dir.path().to_string_lossy().to_string();
+
+        repo.run_git(&["remote", "add", "origin", &remote_path])
+            .expect("origin remote should be added");
+        let branch = repo
+            .run_git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .expect("branch should resolve")
+            .trim()
+            .to_string();
+        let head = repo
+            .run_git(&["rev-parse", "HEAD"])
+            .expect("head should resolve")
+            .trim()
+            .to_string();
+
+        repo.git_push(Some("origin".to_string()), Some(branch.clone()))
+            .expect("git push should succeed");
+
+        let remote_branch = fl_bridge_git::run_git(
+            remote_dir.path(),
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        )
+        .expect("remote branch should resolve");
+        let remote_flock_main = fl_bridge_git::run_git(
+            remote_dir.path(),
+            &["rev-parse", "refs/flock/branches/main"],
+        )
+        .expect("remote flock main ref should resolve");
+
+        assert_eq!(remote_branch.trim(), head);
+        assert_eq!(remote_flock_main.trim(), head);
+
+        let events = repo.list_events().expect("events should load");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Push,
+                    success: true,
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn git_pull_fetches_remote_branch_and_flock_refs() {
+        let remote_dir = tempfile::tempdir().expect("remote tempdir should be created");
+        fl_bridge_git::run_git(remote_dir.path(), &["init", "--bare"])
+            .expect("remote bare repo should initialize");
+
+        let source_dir = tempfile::tempdir().expect("source tempdir should be created");
+        let source_repo = Repo::at(source_dir.path());
+        source_repo
+            .init_colocated()
+            .expect("source colocated init should succeed");
+
+        let source_file = source_dir.path().join("pull-sync.ts");
+        fs::write(&source_file, "export const value = 1;").expect("write should succeed");
+        source_repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        let remote_path = remote_dir.path().to_string_lossy().to_string();
+        source_repo
+            .run_git(&["remote", "add", "origin", &remote_path])
+            .expect("origin remote should be added");
+        let branch = source_repo
+            .run_git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .expect("branch should resolve")
+            .trim()
+            .to_string();
+        source_repo
+            .git_push(Some("origin".to_string()), Some(branch.clone()))
+            .expect("initial push should succeed");
+
+        let clone_parent = tempfile::tempdir().expect("clone parent tempdir should be created");
+        let clone_path = clone_parent.path().join("clone");
+        let clone_path_string = clone_path.to_string_lossy().to_string();
+        fl_bridge_git::run_git(
+            clone_parent.path(),
+            &["clone", &remote_path, &clone_path_string],
+        )
+        .expect("clone should succeed");
+
+        let clone_repo = Repo::at(&clone_path);
+        clone_repo
+            .init_colocated()
+            .expect("clone colocated init should succeed");
+
+        fs::write(&source_file, "export const value = 2;").expect("write should succeed");
+        let cp2 = source_repo
+            .create_checkpoint(Some("cp2".to_string()))
+            .expect("second checkpoint should succeed");
+        source_repo
+            .upsert_ref(
+                RefKind::Workspace,
+                "agent/sync".to_string(),
+                cp2.id.to_string(),
+                Some(true),
+            )
+            .expect("workspace ref should sync to git refs namespace");
+        let expected_head = source_repo
+            .run_git(&["rev-parse", "HEAD"])
+            .expect("source head should resolve")
+            .trim()
+            .to_string();
+        source_repo
+            .git_push(Some("origin".to_string()), Some(branch.clone()))
+            .expect("second push should succeed");
+
+        clone_repo
+            .git_pull(Some("origin".to_string()), Some(branch))
+            .expect("git pull should succeed");
+
+        let clone_head = clone_repo
+            .run_git(&["rev-parse", "HEAD"])
+            .expect("clone head should resolve");
+        let clone_workspace_ref = clone_repo
+            .run_git(&["rev-parse", &git_ref_name(RefKind::Workspace, "agent/sync")])
+            .expect("clone workspace flock ref should resolve");
+
+        assert_eq!(clone_head.trim(), expected_head);
+        assert_eq!(clone_workspace_ref.trim(), expected_head);
+
+        let events = clone_repo.list_events().expect("events should load");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Pull,
+                    success: true,
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn git_push_failure_records_failed_event() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated()
+            .expect("colocated init should succeed");
+
+        let file = dir.path().join("push-fail.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        let err = repo
+            .git_push(Some("origin".to_string()), None)
+            .expect_err("push should fail without configured origin");
+        assert!(
+            format!("{:#}", err).contains("failed to push branch"),
+            "unexpected error: {err}"
+        );
+
+        let events = repo.list_events().expect("events should load");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Push,
+                    success: false,
+                    ..
+                })
+            )
+        }));
     }
 
     #[test]
