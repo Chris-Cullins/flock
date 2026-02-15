@@ -32,6 +32,8 @@ pub struct CheckpointEvent {
     pub label: String,
     pub message: Option<String>,
     pub snapshot_id: Uuid,
+    #[serde(default)]
+    pub parent_checkpoint_event: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

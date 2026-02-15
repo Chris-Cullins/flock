@@ -20,8 +20,8 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Implement append-only event log API with typed events and versioned schema
 - [x] Add event parent pointers and causal validation
 - [x] Add event signatures (ed25519)
-- [ ] Add event replay and deterministic state reconstruction
-- [ ] Add checkpoints as first-class events (commit-equivalent)
+- [x] Add event replay and deterministic state reconstruction
+- [x] Add checkpoints as first-class events (commit-equivalent)
 - [ ] Add undo events:
   - [x] `undo last`
   - [x] `undo --n`

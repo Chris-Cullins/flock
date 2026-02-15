@@ -23,7 +23,7 @@ impl fmt::Display for ExplorationStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplorationSummary {
     pub id: Uuid,
     pub title: String,
@@ -47,44 +47,131 @@ pub struct UndoResult {
     pub restored_checkpoint_event: Option<Uuid>,
 }
 
-pub fn replay_explorations(events: &[Event]) -> BTreeMap<Uuid, ExplorationSummary> {
-    let mut map = BTreeMap::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayedState {
+    pub latest_checkpoint_event_id: Option<Uuid>,
+    pub latest_checkpoint_snapshot_id: Option<Uuid>,
+    pub explorations: BTreeMap<Uuid, ExplorationSummary>,
+    pub applied_event_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReplayAccumulator {
+    latest_checkpoint_event_id: Option<Uuid>,
+    latest_checkpoint_snapshot_id: Option<Uuid>,
+    explorations: BTreeMap<Uuid, ExplorationSummary>,
+    applied_event_ids: Vec<Uuid>,
+}
+
+impl ReplayAccumulator {
+    fn into_state(self) -> ReplayedState {
+        ReplayedState {
+            latest_checkpoint_event_id: self.latest_checkpoint_event_id,
+            latest_checkpoint_snapshot_id: self.latest_checkpoint_snapshot_id,
+            explorations: self.explorations,
+            applied_event_ids: self.applied_event_ids,
+        }
+    }
+}
+
+pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
+    let checkpoints: BTreeMap<Uuid, Uuid> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Checkpoint(checkpoint) => Some((event.id, checkpoint.snapshot_id)),
+            _ => None,
+        })
+        .collect();
+
+    let mut state = ReplayAccumulator::default();
+    let mut state_before_event = BTreeMap::<Uuid, ReplayAccumulator>::new();
 
     for event in events {
-        let EventKind::Exploration(exploration) = &event.kind else {
-            continue;
-        };
+        if state_before_event.contains_key(&event.id) {
+            bail!("duplicate event id {} encountered during replay", event.id);
+        }
+        state_before_event.insert(event.id, state.clone());
 
-        match exploration.action {
-            ExplorationAction::Start => {
-                map.insert(
-                    exploration.exploration_id,
-                    ExplorationSummary {
-                        id: exploration.exploration_id,
-                        title: exploration.title.clone(),
-                        status: ExplorationStatus::Active,
-                        base_checkpoint_event: exploration.base_checkpoint_event,
-                        created_at: event.timestamp.clone(),
-                        updated_at: event.timestamp.clone(),
-                    },
-                );
+        match &event.kind {
+            EventKind::Checkpoint(checkpoint) => {
+                state.latest_checkpoint_event_id = Some(event.id);
+                state.latest_checkpoint_snapshot_id = Some(checkpoint.snapshot_id);
             }
-            ExplorationAction::Promote => {
-                if let Some(entry) = map.get_mut(&exploration.exploration_id) {
-                    entry.status = ExplorationStatus::Promoted;
-                    entry.updated_at = event.timestamp.clone();
+            EventKind::Exploration(exploration) => match exploration.action {
+                ExplorationAction::Start => {
+                    state.explorations.insert(
+                        exploration.exploration_id,
+                        ExplorationSummary {
+                            id: exploration.exploration_id,
+                            title: exploration.title.clone(),
+                            status: ExplorationStatus::Active,
+                            base_checkpoint_event: exploration.base_checkpoint_event,
+                            created_at: event.timestamp.clone(),
+                            updated_at: event.timestamp.clone(),
+                        },
+                    );
+                }
+                ExplorationAction::Promote => {
+                    if let Some(entry) = state.explorations.get_mut(&exploration.exploration_id) {
+                        entry.status = ExplorationStatus::Promoted;
+                        entry.updated_at = event.timestamp.clone();
+                    }
+                }
+                ExplorationAction::Abandon => {
+                    if let Some(entry) = state.explorations.get_mut(&exploration.exploration_id) {
+                        entry.status = ExplorationStatus::Abandoned;
+                        entry.updated_at = event.timestamp.clone();
+                    }
+                }
+            },
+            EventKind::Undo(undo) => {
+                if undo.target_event_id == event.id {
+                    bail!("undo event {} cannot target itself", event.id);
+                }
+
+                let rewound = state_before_event
+                    .get(&undo.target_event_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "undo event {} targets unknown event {}",
+                            event.id,
+                            undo.target_event_id
+                        )
+                    })?;
+                state = rewound;
+
+                if let Some(restored_checkpoint_event) = undo.restored_checkpoint_event {
+                    let snapshot_id = checkpoints
+                        .get(&restored_checkpoint_event)
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "undo event {} references unknown restored checkpoint {}",
+                                event.id,
+                                restored_checkpoint_event
+                            )
+                        })?;
+                    state.latest_checkpoint_event_id = Some(restored_checkpoint_event);
+                    state.latest_checkpoint_snapshot_id = Some(snapshot_id);
+                    if !state.applied_event_ids.contains(&restored_checkpoint_event) {
+                        state.applied_event_ids.push(restored_checkpoint_event);
+                    }
                 }
             }
-            ExplorationAction::Abandon => {
-                if let Some(entry) = map.get_mut(&exploration.exploration_id) {
-                    entry.status = ExplorationStatus::Abandoned;
-                    entry.updated_at = event.timestamp.clone();
-                }
-            }
+            EventKind::GitBridge(_) => {}
+        }
+
+        if !state.applied_event_ids.contains(&event.id) {
+            state.applied_event_ids.push(event.id);
         }
     }
 
-    map
+    Ok(state.into_state())
+}
+
+pub fn replay_explorations(events: &[Event]) -> Result<BTreeMap<Uuid, ExplorationSummary>> {
+    Ok(replay_state(events)?.explorations)
 }
 
 pub fn resolve_target_event<'a>(events: &'a [Event], request: &UndoRequest) -> Result<&'a Event> {
@@ -199,6 +286,8 @@ pub fn parse_duration_spec(input: &str) -> Result<Duration> {
 
 #[cfg(test)]
 mod tests {
+    use fl_storage::{CheckpointEvent, EventKind, ExplorationEvent, UndoEvent};
+
     use super::*;
 
     #[test]
@@ -206,5 +295,141 @@ mod tests {
         assert_eq!(parse_duration_spec("5m").expect("duration").as_secs(), 300);
         assert_eq!(parse_duration_spec("30").expect("duration").as_secs(), 30);
         assert!(parse_duration_spec("1w").is_err());
+    }
+
+    #[test]
+    fn replay_state_undo_removes_targeted_exploration_changes() {
+        let checkpoint_event = make_event(
+            1,
+            None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(10),
+                parent_checkpoint_event: None,
+            }),
+        );
+        let exploration_start = make_event(
+            2,
+            Some(checkpoint_event.id),
+            EventKind::Exploration(ExplorationEvent {
+                exploration_id: Uuid::from_u128(20),
+                title: "exp".to_string(),
+                base_checkpoint_event: Some(checkpoint_event.id),
+                action: ExplorationAction::Start,
+            }),
+        );
+        let undo = make_event(
+            3,
+            Some(exploration_start.id),
+            EventKind::Undo(UndoEvent {
+                target_event_id: exploration_start.id,
+                mode: UndoMode::Last,
+                restored_checkpoint_event: None,
+            }),
+        );
+
+        let state = replay_state(&[checkpoint_event, exploration_start, undo]).expect("replay");
+        assert_eq!(state.latest_checkpoint_event_id, Some(Uuid::from_u128(1)));
+        assert_eq!(
+            state.latest_checkpoint_snapshot_id,
+            Some(Uuid::from_u128(10))
+        );
+        assert!(state.explorations.is_empty());
+        assert_eq!(
+            state.applied_event_ids,
+            vec![Uuid::from_u128(1), Uuid::from_u128(3)]
+        );
+    }
+
+    #[test]
+    fn replay_state_uses_restored_checkpoint_from_undo_payload() {
+        let cp1 = make_event(
+            1,
+            None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(11),
+                parent_checkpoint_event: None,
+            }),
+        );
+        let cp2 = make_event(
+            2,
+            Some(cp1.id),
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp2".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(12),
+                parent_checkpoint_event: None,
+            }),
+        );
+        let restored = make_event(
+            3,
+            Some(cp2.id),
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "undo-cp2".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(13),
+                parent_checkpoint_event: None,
+            }),
+        );
+        let undo = make_event(
+            4,
+            Some(restored.id),
+            EventKind::Undo(UndoEvent {
+                target_event_id: cp2.id,
+                mode: UndoMode::Last,
+                restored_checkpoint_event: Some(restored.id),
+            }),
+        );
+
+        let state = replay_state(&[cp1, cp2, restored.clone(), undo]).expect("replay");
+        assert_eq!(state.latest_checkpoint_event_id, Some(restored.id));
+        assert_eq!(
+            state.latest_checkpoint_snapshot_id,
+            Some(Uuid::from_u128(13))
+        );
+    }
+
+    #[test]
+    fn replay_state_is_deterministic() {
+        let cp1 = make_event(
+            1,
+            None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(11),
+                parent_checkpoint_event: None,
+            }),
+        );
+        let cp2 = make_event(
+            2,
+            Some(cp1.id),
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp2".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(12),
+                parent_checkpoint_event: None,
+            }),
+        );
+
+        let events = vec![cp1, cp2];
+        let first = replay_state(&events).expect("first replay");
+        let second = replay_state(&events).expect("second replay");
+        assert_eq!(first, second);
+    }
+
+    fn make_event(id: u128, parent_id: Option<Uuid>, kind: EventKind) -> Event {
+        Event {
+            id: Uuid::from_u128(id),
+            timestamp: format!("1739571600000000{}", id),
+            actor: "tester".to_string(),
+            parent_id,
+            signer_public_key: None,
+            signature: None,
+            kind,
+        }
     }
 }

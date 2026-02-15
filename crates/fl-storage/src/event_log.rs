@@ -437,6 +437,7 @@ mod tests {
                 label: "checkpoint".to_string(),
                 message: Some("baseline".to_string()),
                 snapshot_id: Uuid::new_v4(),
+                parent_checkpoint_event: None,
             }),
         }
     }

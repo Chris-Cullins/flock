@@ -92,10 +92,20 @@ fn main() -> Result<()> {
         Command::Checkpoint { message } => {
             let repo = Repo::discover(cwd)?;
             let event = repo.create_checkpoint(message)?;
+            let checkpoint_id = event.id;
             let EventKind::Checkpoint(payload) = event.kind else {
                 bail!("unexpected event payload for checkpoint")
             };
-            println!("checkpoint {} ({})", payload.label, payload.snapshot_id);
+            println!(
+                "checkpoint {} ({}) id={} parent={}",
+                payload.label,
+                payload.snapshot_id,
+                checkpoint_id,
+                payload
+                    .parent_checkpoint_event
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
         }
         Command::Log => {
             let repo = Repo::discover(cwd)?;
@@ -104,8 +114,13 @@ fn main() -> Result<()> {
             for event in events {
                 match event.kind {
                     EventKind::Checkpoint(cp) => println!(
-                        "{}  checkpoint  {}  {}",
-                        event.timestamp, cp.label, cp.snapshot_id
+                        "{}  checkpoint  {}  {}  parent={}",
+                        event.timestamp,
+                        cp.label,
+                        cp.snapshot_id,
+                        cp.parent_checkpoint_event
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "none".to_string())
                     ),
                     EventKind::Exploration(exp) => println!(
                         "{}  exploration:{:?}  {}  {}",

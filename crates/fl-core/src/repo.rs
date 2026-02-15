@@ -15,12 +15,12 @@ use crate::event::{
     GitBridgeEvent, UndoEvent,
 };
 use crate::semantic::{SemanticFileDiff, diff as semantic_diff, supported_source};
-use fl_workflow::{
-    previous_checkpoint_before, replay_explorations, resolve_target_event, to_undo_mode,
-};
+use fl_workflow::{previous_checkpoint_before, replay_state, resolve_target_event, to_undo_mode};
 
 pub use fl_workflow::parse_duration_spec;
-pub use fl_workflow::{ExplorationStatus, ExplorationSummary, UndoRequest, UndoResult};
+pub use fl_workflow::{
+    ExplorationStatus, ExplorationSummary, ReplayedState, UndoRequest, UndoResult,
+};
 
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -87,12 +87,18 @@ impl Repo {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("checkpoint-{}", Uuid::new_v4().simple()));
 
-        self.create_checkpoint_with_label(label, message)
+        self.create_checkpoint_with_lineage(label, message, None)
     }
 
     pub fn list_events(&self) -> Result<Vec<Event>> {
         self.assert_initialized()?;
         fl_storage::EventLog::for_root(self.root()).read_all()
+    }
+
+    pub fn replay_state(&self) -> Result<ReplayedState> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        replay_state(&events)
     }
 
     pub fn semantic_diff_from_latest_checkpoint(&self) -> Result<Vec<SemanticFileDiff>> {
@@ -156,9 +162,8 @@ impl Repo {
     pub fn list_explorations(&self) -> Result<Vec<ExplorationSummary>> {
         self.assert_initialized()?;
 
-        let events = self.list_events()?;
         let mut entries: Vec<ExplorationSummary> =
-            replay_explorations(&events).into_values().collect();
+            self.replay_state()?.explorations.into_values().collect();
 
         entries.sort_by(|a, b| {
             a.created_at
@@ -187,9 +192,10 @@ impl Repo {
         }
 
         let message = format!("promote exploration {}", existing.title);
-        self.create_checkpoint_with_label(
+        self.create_checkpoint_with_lineage(
             format!("promote-{}", normalize_label(&existing.title)),
             Some(message),
+            None,
         )?;
 
         self.append_event(EventKind::Exploration(ExplorationEvent {
@@ -262,9 +268,10 @@ impl Repo {
 
             self.restore_workspace_from_snapshot(payload.snapshot_id)?;
 
-            let checkpoint_event = self.create_checkpoint_with_label(
+            let checkpoint_event = self.create_checkpoint_with_lineage(
                 format!("undo-{}", target.id.simple()),
                 Some(format!("undo target {}", target.id)),
+                Some(previous_checkpoint.id),
             )?;
             restored_checkpoint_event = Some(checkpoint_event.id);
         }
@@ -345,10 +352,11 @@ impl Repo {
         Ok(detail)
     }
 
-    fn create_checkpoint_with_label(
+    fn create_checkpoint_with_lineage(
         &self,
         label: String,
         message: Option<String>,
+        parent_checkpoint_event: Option<Uuid>,
     ) -> Result<Event> {
         let snapshot_id = Uuid::new_v4();
         let snapshot_path = self.snapshot_path(snapshot_id);
@@ -361,10 +369,14 @@ impl Repo {
 
         self.copy_workspace_to_snapshot(&snapshot_path)?;
 
+        let parent_checkpoint_event =
+            parent_checkpoint_event.or_else(|| self.latest_checkpoint().map(|event| event.id));
+
         let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
             label,
             message,
             snapshot_id,
+            parent_checkpoint_event,
         }))?;
         Ok(event)
     }
@@ -493,10 +505,9 @@ impl Repo {
 
     fn latest_checkpoint(&self) -> Option<Event> {
         let events = self.list_events().ok()?;
-        events
-            .into_iter()
-            .rev()
-            .find(|event| matches!(event.kind, EventKind::Checkpoint(_)))
+        let state = replay_state(&events).ok()?;
+        let checkpoint_id = state.latest_checkpoint_event_id?;
+        events.into_iter().find(|event| event.id == checkpoint_id)
     }
 
     fn copy_workspace_to_snapshot(&self, snapshot_root: &Path) -> Result<()> {
@@ -740,6 +751,30 @@ mod tests {
     }
 
     #[test]
+    fn checkpoints_record_parent_checkpoint_lineage() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let cp1 = repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("first checkpoint should succeed");
+        let cp2 = repo
+            .create_checkpoint(Some("cp2".to_string()))
+            .expect("second checkpoint should succeed");
+
+        let EventKind::Checkpoint(cp1_payload) = cp1.kind else {
+            panic!("first event should be checkpoint");
+        };
+        let EventKind::Checkpoint(cp2_payload) = cp2.kind else {
+            panic!("second event should be checkpoint");
+        };
+
+        assert_eq!(cp1_payload.parent_checkpoint_event, None);
+        assert_eq!(cp2_payload.parent_checkpoint_event, Some(cp1.id));
+    }
+
+    #[test]
     fn undo_last_checkpoint_restores_previous_snapshot() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let repo = Repo::at(dir.path());
@@ -758,6 +793,79 @@ mod tests {
 
         let current = fs::read_to_string(&file).expect("read should succeed");
         assert!(current.contains("const value = 1"));
+    }
+
+    #[test]
+    fn undo_generated_checkpoint_uses_rewound_checkpoint_as_parent() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("undo-lineage.ts");
+        fs::write(&file, "const value = 1;").expect("write should succeed");
+        let cp1 = repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        fs::write(&file, "const value = 2;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+
+        let undo_result = repo.undo(UndoRequest::Last).expect("undo should succeed");
+        let restored_checkpoint_id = undo_result
+            .restored_checkpoint_event
+            .expect("undo should emit restored checkpoint");
+
+        let events = repo.list_events().expect("list events should succeed");
+        let restored = events
+            .into_iter()
+            .find(|event| event.id == restored_checkpoint_id)
+            .expect("restored checkpoint event should exist");
+        let EventKind::Checkpoint(restored_payload) = restored.kind else {
+            panic!("restored event should be checkpoint");
+        };
+
+        assert_eq!(restored_payload.parent_checkpoint_event, Some(cp1.id));
+    }
+
+    #[test]
+    fn undo_last_exploration_event_is_reflected_in_replayed_state() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        repo.start_exploration("ephemeral".to_string())
+            .expect("start exploration should succeed");
+        repo.undo(UndoRequest::Last).expect("undo should succeed");
+
+        let explorations = repo
+            .list_explorations()
+            .expect("exploration replay should succeed");
+        assert!(explorations.is_empty());
+    }
+
+    #[test]
+    fn replay_state_prefers_restored_checkpoint_after_undo() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("checkpoint-undo.ts");
+        fs::write(&file, "const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        fs::write(&file, "const value = 2;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+
+        let result = repo.undo(UndoRequest::Last).expect("undo should succeed");
+        let replayed = repo.replay_state().expect("replay should succeed");
+
+        assert_eq!(
+            replayed.latest_checkpoint_event_id,
+            result.restored_checkpoint_event
+        );
     }
 
     #[test]
