@@ -1,0 +1,198 @@
+# Flock Build TODO
+
+This file tracks the full build-out from current scaffold to the complete architecture described in `/Users/chriscullins/src/flock/flock-architecture.md`.
+
+## 0. Project Foundations
+
+- [x] Create Rust workspace and split into `fl-core` and `fl-cli`
+- [x] Add `fl init`, `fl checkpoint`, `fl log`, `fl diff --semantic` commands
+- [x] Add initial `.flock` metadata layout (`event-log`, `snapshots`, `config.toml`)
+- [x] Add first semantic analyzer for TS/JS via tree-sitter
+- [ ] Define crate boundaries for long-term architecture:
+  - [ ] `fl-storage` (event log + content store)
+  - [ ] `fl-semantic` (language analyzers + semantic merge)
+  - [ ] `fl-workflow` (explorations, sessions, work queue)
+  - [ ] `fl-collab` (presence, locks, subscriptions, gates)
+  - [ ] `fl-bridge-git` (colocated mode + import/export)
+
+## 1. Core Storage Engine (Git-Compatible First)
+
+- [ ] Implement append-only event log API with typed events and versioned schema
+- [ ] Add event parent pointers and causal validation
+- [ ] Add event signatures (ed25519)
+- [ ] Add event replay and deterministic state reconstruction
+- [ ] Add checkpoints as first-class events (commit-equivalent)
+- [ ] Add undo events:
+  - [ ] `undo last`
+  - [ ] `undo --n`
+  - [ ] `undo --to`
+  - [ ] `undo --since`
+- [ ] Add file-scoped undo semantics in colocated mode (best-effort fallback)
+- [ ] Add repository refs abstraction (branches/tags/workspaces)
+- [ ] Add Merkle snapshot hash generation for checkpoints
+- [ ] Add storage integrity verifier command (`fl fsck`)
+
+## 2. Git/JJ Compatibility Layer
+
+- [ ] Implement git-colocated mode (`.git` + `.flock` sidecar)
+- [ ] Map checkpoint operations to git commits
+- [ ] Map Flock refs to git refs/bookmarks strategy
+- [ ] Implement push/pull bridge to git remotes
+- [ ] Implement git import and export commands
+- [ ] Implement shadow mode safety checks and recovery docs
+- [ ] Define jj import design and metadata mapping
+
+## 3. Semantic Layer (TS/JS First)
+
+- [ ] Expand TS/JS symbol extraction beyond declarations:
+  - [ ] Arrow functions assigned to const/let
+  - [ ] Function expressions
+  - [ ] Exported declarations and re-exports
+  - [ ] Interfaces, type aliases, enums
+  - [ ] Class fields and constructors
+- [ ] Add semantic change taxonomy:
+  - [ ] Added, Removed, Modified, Renamed, Moved, StyleOnly
+- [ ] Add risk scoring (Low/Medium/High)
+- [ ] Add impact tracking (affected symbols/files/modules)
+- [ ] Add compatibility checks for signature changes
+- [ ] Implement semantic merge for TS/JS with text fallback
+- [ ] Implement semantic conflict classification and explanation
+- [ ] Add machine-readable semantic diff output (`--json`)
+- [ ] Add plugin trait/API for additional analyzers
+- [ ] Add analyzer process boundary (FFI or gRPC) and lifecycle management
+- [ ] Add first non-TS/JS fallback analyzer contract tests
+
+## 4. Developer Experience (CLI + Review)
+
+- [ ] Implement `fl diff --intent`
+- [ ] Implement `fl impact <path-or-symbol>`
+- [ ] Implement `fl merge --dry-run --semantic`
+- [ ] Implement semantic review views:
+  - [ ] `fl review <exploration>` summary mode
+  - [ ] `fl review --expand <n>` drill-down mode
+  - [ ] `fl review --full` line diff fallback
+- [ ] Add TUI views for exploration trees and task graph
+- [ ] Add shell completion and command help polish
+
+## 5. Explorations and Workspaces
+
+- [ ] Implement exploration model with lifecycle states
+- [ ] Add exploration commands:
+  - [ ] `fl explore start`
+  - [ ] `fl explore list`
+  - [ ] `fl explore compare`
+  - [ ] `fl explore promote`
+  - [ ] `fl explore abandon`
+- [ ] Add TTL and background pruning for abandoned/expired explorations
+- [ ] Add workspace isolation model (base snapshot + overlay events)
+- [ ] Add workspace resource limits and policy enforcement
+- [ ] Add checkpoint/rollback shortcuts for agents
+
+## 6. Agent Sessions and Provenance
+
+- [ ] Implement session entity and linkage to explorations/tasks
+- [ ] Track decisions (kept/discarded + reason + confidence)
+- [ ] Add resource usage accounting (tokens, runtime, external API calls)
+- [ ] Implement provenance query commands
+- [ ] Implement session replay command
+
+## 7. Work Queue (Built-in Task Graph)
+
+- [ ] Implement task schema and DAG dependencies
+- [ ] Add task lifecycle commands:
+  - [ ] `fl task create`
+  - [ ] `fl task list`
+  - [ ] `fl task claim`
+  - [ ] `fl task done`
+  - [ ] `fl task show`
+  - [ ] `fl task graph`
+- [ ] Implement `fl ready` priority + dependency-unblocked selection
+- [ ] Add `--json` output for agent consumption
+- [ ] Link tasks to events/checkpoints/explorations
+- [ ] Add discovered-from relationships and auto-linking
+- [ ] Implement task compaction for old completed tasks
+
+## 8. Collaboration Layer
+
+- [ ] Implement presence model and heartbeat protocol
+- [ ] Add advisory lock API with TTL:
+  - [ ] `fl lock acquire`
+  - [ ] `fl lock list`
+  - [ ] `fl lock release`
+- [ ] Implement change subscriptions and notification filters
+- [ ] Implement human-in-the-loop gates and policies
+- [ ] Implement continuous auto-rebase for active workspaces
+- [ ] Implement conflict resolution workflow:
+  - [ ] detect
+  - [ ] classify
+  - [ ] suggest
+  - [ ] resolve
+  - [ ] verify
+  - [ ] record
+
+## 9. Native Storage Engine (Phase 2 Backend)
+
+- [ ] Design native `.flock/store` layout
+- [ ] Implement block-level content store with BLAKE3 keys
+- [ ] Implement file index mapping `(path, event) -> block refs`
+- [ ] Evaluate block strategy:
+  - [ ] fixed-size chunking
+  - [ ] content-defined chunking
+  - [ ] language-aware chunking
+- [ ] Implement native copy-on-write snapshots
+- [ ] Implement sub-file undo (true file-scoped rewind)
+- [ ] Implement migration command `fl migrate --native`
+- [ ] Add performance benchmarks against colocated mode
+
+## 10. Scale and Server Components
+
+- [ ] Define server architecture for enterprise features
+- [ ] Add authn/authz model and access control
+- [ ] Add real-time presence service
+- [ ] Add tiered storage policies (hot/warm/cool)
+- [ ] Add background jobs (compaction, pruning, indexing)
+- [ ] Add replication/sync protocol for events + blobs
+- [ ] Add observability (metrics, tracing, logs)
+
+## 11. Intelligence Layer
+
+- [ ] Implement natural-language history queries (`fl query`)
+- [ ] Build vector index for intents and semantic changes
+- [ ] Add AI-assisted intent extraction for commits/events
+- [ ] Add AI-assisted conflict resolution suggestions
+- [ ] Add confidence scoring and gate integration
+
+## 12. Security, Reliability, and Compliance
+
+- [ ] Threat model for agent and human actors
+- [ ] Encrypt sensitive metadata at rest (configurable)
+- [ ] Audit trail hardening and tamper-evidence checks
+- [ ] Offline mode behavior and reconnect reconciliation
+- [ ] Backup and restore strategy for `.flock` data
+- [ ] Disaster recovery playbooks
+
+## 13. QA and Performance
+
+- [ ] Unit and integration test matrix across core crates
+- [ ] Property tests for event replay invariants
+- [ ] Fuzzing for parsers and merge engine
+- [ ] Large-repo benchmarks and regression thresholds
+- [ ] Concurrency stress tests (10+ agents)
+- [ ] Compatibility tests across macOS/Linux/Windows
+
+## 14. Documentation and Adoption
+
+- [ ] Author migration guide from git and jj
+- [ ] Write architecture and data model reference docs
+- [ ] Publish command reference with examples
+- [ ] Provide starter workflows for TS monorepos
+- [ ] Add contribution guide and RFC process
+- [ ] Add release plan and versioning policy
+
+## Immediate Next Milestone (Suggested)
+
+- [ ] M1.1 Add `fl explore start/list/promote/abandon`
+- [ ] M1.2 Add semantic diff JSON output
+- [ ] M1.3 Improve TS/JS analyzer coverage (arrow functions, interfaces, types)
+- [ ] M1.4 Add `fl undo` basic variants on event timeline
+- [ ] M1.5 Add basic git-colocated commit/push/pull bridge stubs
