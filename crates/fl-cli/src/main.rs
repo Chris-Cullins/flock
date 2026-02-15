@@ -21,6 +21,7 @@ enum Command {
         message: Option<String>,
     },
     Log,
+    Fsck,
     Diff {
         #[arg(long)]
         semantic: bool,
@@ -181,6 +182,17 @@ fn main() -> Result<()> {
                     ),
                 }
             }
+        }
+        Command::Fsck => {
+            let repo = Repo::discover(cwd)?;
+            let report = repo.fsck()?;
+            println!(
+                "fsck ok: events={} checkpoints={} snapshots={} refs={}",
+                report.event_count,
+                report.checkpoint_count,
+                report.snapshot_count,
+                report.ref_count
+            );
         }
         Command::Diff { semantic, json } => {
             if !semantic {

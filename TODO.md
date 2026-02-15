@@ -30,7 +30,7 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Add file-scoped undo semantics in colocated mode (best-effort fallback)
 - [x] Add repository refs abstraction (branches/tags/workspaces)
 - [x] Add Merkle snapshot hash generation for checkpoints
-- [ ] Add storage integrity verifier command (`fl fsck`)
+- [x] Add storage integrity verifier command (`fl fsck`)
 
 ## 2. Git/JJ Compatibility Layer
 

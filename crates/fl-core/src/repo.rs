@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -24,6 +24,14 @@ pub use fl_workflow::parse_duration_spec;
 pub use fl_workflow::{
     ExplorationStatus, ExplorationSummary, ReplayedState, UndoRequest, UndoResult,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsckReport {
+    pub event_count: usize,
+    pub checkpoint_count: usize,
+    pub snapshot_count: usize,
+    pub ref_count: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -167,6 +175,195 @@ impl Repo {
         self.assert_initialized()?;
         let events = self.list_events()?;
         replay_state(&events)
+    }
+
+    pub fn fsck(&self) -> Result<FsckReport> {
+        self.assert_initialized()?;
+
+        let events = fl_storage::EventLog::for_root(self.root())
+            .read_all()
+            .context("event log integrity check failed")?;
+        let event_count = events.len();
+
+        let event_kinds: HashMap<Uuid, EventKind> = events
+            .iter()
+            .map(|event| (event.id, event.kind.clone()))
+            .collect();
+
+        let mut seen_checkpoints = BTreeSet::new();
+        let mut checkpoint_snapshot_ids = BTreeSet::new();
+        for event in &events {
+            match &event.kind {
+                EventKind::Checkpoint(checkpoint) => {
+                    if let Some(parent) = checkpoint.parent_checkpoint_event {
+                        if !seen_checkpoints.contains(&parent) {
+                            bail!(
+                                "checkpoint {} references unknown or non-ancestor parent checkpoint {}",
+                                event.id,
+                                parent
+                            );
+                        }
+                    }
+
+                    let snapshot_path = self.snapshot_path(checkpoint.snapshot_id);
+                    let metadata = fs::metadata(&snapshot_path).with_context(|| {
+                        format!(
+                            "checkpoint {} references missing snapshot {}",
+                            event.id,
+                            snapshot_path.display()
+                        )
+                    })?;
+                    if !metadata.is_dir() {
+                        bail!(
+                            "checkpoint {} snapshot path is not a directory: {}",
+                            event.id,
+                            snapshot_path.display()
+                        );
+                    }
+
+                    let expected_merkle =
+                        checkpoint.snapshot_merkle_root.as_ref().ok_or_else(|| {
+                            anyhow!(
+                                "checkpoint {} is missing snapshot merkle root metadata",
+                                event.id
+                            )
+                        })?;
+                    let actual_merkle =
+                        compute_snapshot_merkle_root(&snapshot_path).with_context(|| {
+                            format!(
+                                "failed to compute merkle root for snapshot {}",
+                                checkpoint.snapshot_id
+                            )
+                        })?;
+                    if actual_merkle != *expected_merkle {
+                        bail!(
+                            "checkpoint {} snapshot merkle root mismatch: expected {}, actual {}",
+                            event.id,
+                            expected_merkle,
+                            actual_merkle
+                        );
+                    }
+
+                    seen_checkpoints.insert(event.id);
+                    checkpoint_snapshot_ids.insert(checkpoint.snapshot_id);
+                }
+                EventKind::Exploration(exploration) => {
+                    if let Some(base_checkpoint) = exploration.base_checkpoint_event {
+                        let Some(base_kind) = event_kinds.get(&base_checkpoint) else {
+                            bail!(
+                                "exploration {} references missing base checkpoint {}",
+                                event.id,
+                                base_checkpoint
+                            );
+                        };
+                        if !matches!(base_kind, EventKind::Checkpoint(_)) {
+                            bail!(
+                                "exploration {} base checkpoint {} is not a checkpoint event",
+                                event.id,
+                                base_checkpoint
+                            );
+                        }
+                    }
+                }
+                EventKind::Undo(undo) => {
+                    let Some(_target_kind) = event_kinds.get(&undo.target_event_id) else {
+                        bail!(
+                            "undo event {} references missing target event {}",
+                            event.id,
+                            undo.target_event_id
+                        );
+                    };
+
+                    if let Some(restored_checkpoint) = undo.restored_checkpoint_event {
+                        let Some(restored_kind) = event_kinds.get(&restored_checkpoint) else {
+                            bail!(
+                                "undo event {} references missing restored checkpoint {}",
+                                event.id,
+                                restored_checkpoint
+                            );
+                        };
+                        if !matches!(restored_kind, EventKind::Checkpoint(_)) {
+                            bail!(
+                                "undo event {} restored checkpoint {} is not a checkpoint event",
+                                event.id,
+                                restored_checkpoint
+                            );
+                        }
+                    }
+                }
+                EventKind::GitBridge(_) => {}
+            }
+        }
+
+        let snapshot_root = self.root.join(SNAPSHOT_DIR);
+        if !snapshot_root.is_dir() {
+            bail!("snapshots directory missing: {}", snapshot_root.display());
+        }
+
+        let mut snapshot_count = 0usize;
+        for entry in fs::read_dir(&snapshot_root)
+            .with_context(|| format!("failed to read {}", snapshot_root.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("failed to read entry in {}", snapshot_root.display()))?;
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+
+            if !metadata.is_dir() {
+                bail!(
+                    "unexpected non-directory entry in snapshots directory: {}",
+                    path.display()
+                );
+            }
+
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow!("invalid snapshot directory name: {}", path.display()))?;
+            let snapshot_id = Uuid::parse_str(name).with_context(|| {
+                format!("snapshot directory name is not a UUID: {}", path.display())
+            })?;
+
+            if !checkpoint_snapshot_ids.contains(&snapshot_id) {
+                bail!(
+                    "snapshot {} is not referenced by any checkpoint event",
+                    snapshot_id
+                );
+            }
+
+            snapshot_count += 1;
+        }
+
+        let refs = RefStore::for_root(self.root())
+            .read_all()
+            .context("refs integrity check failed")?;
+        for reference in &refs {
+            let Some(target_kind) = event_kinds.get(&reference.target_event_id) else {
+                bail!(
+                    "ref {}:{:?} points to missing event {}",
+                    reference.name,
+                    reference.kind,
+                    reference.target_event_id
+                );
+            };
+
+            if reference.kind == RefKind::Tag && !matches!(target_kind, EventKind::Checkpoint(_)) {
+                bail!(
+                    "tag ref {} points to non-checkpoint event {}",
+                    reference.name,
+                    reference.target_event_id
+                );
+            }
+        }
+
+        Ok(FsckReport {
+            event_count,
+            checkpoint_count: seen_checkpoints.len(),
+            snapshot_count,
+            ref_count: refs.len(),
+        })
     }
 
     pub fn semantic_diff_from_latest_checkpoint(&self) -> Result<Vec<SemanticFileDiff>> {
@@ -1506,6 +1703,53 @@ mod tests {
                 .expect("refs should load")
                 .into_iter()
                 .all(|entry| !(entry.kind == RefKind::Workspace && entry.name == "agent/a"))
+        );
+    }
+
+    #[test]
+    fn fsck_passes_for_valid_repo() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("healthy.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        fs::write(&file, "export const value = 2;").expect("write should succeed");
+        repo.create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+        repo.undo(UndoRequest::Last).expect("undo should succeed");
+
+        let report = repo.fsck().expect("fsck should pass");
+        assert_eq!(report.event_count, 4);
+        assert_eq!(report.checkpoint_count, 3);
+        assert_eq!(report.snapshot_count, 3);
+        assert_eq!(report.ref_count, 1);
+    }
+
+    #[test]
+    fn fsck_detects_tampered_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("tamper.ts");
+        fs::write(&file, "export const value = 1;").expect("write should succeed");
+        let checkpoint = repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        let EventKind::Checkpoint(payload) = checkpoint.kind else {
+            panic!("checkpoint payload expected");
+        };
+
+        let snapshot_file = repo.snapshot_path(payload.snapshot_id).join("tamper.ts");
+        fs::write(&snapshot_file, "export const value = 999;").expect("tamper write should work");
+
+        let err = repo.fsck().expect_err("fsck should fail");
+        assert!(
+            format!("{:#}", err).contains("merkle root mismatch"),
+            "unexpected error: {err}"
         );
     }
 }

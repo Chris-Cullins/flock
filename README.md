@@ -43,6 +43,9 @@ cargo run -p fl-cli -- diff --semantic --json
 # inspect event log
 cargo run -p fl-cli -- log
 
+# verify storage integrity
+cargo run -p fl-cli -- fsck
+
 # exploration commands
 cargo run -p fl-cli -- explore start --title \"new-parser\"
 cargo run -p fl-cli -- explore list
