@@ -6,6 +6,7 @@ pub use event::{
     CheckpointEvent, Event, EventKind, ExplorationAction, ExplorationEvent, GitBridgeAction,
     GitBridgeEvent, UndoEvent, UndoMode,
 };
+pub use fl_storage::{RefKind, RepoRef, WorkspaceRefConfig};
 pub use repo::{
     ExplorationStatus, ExplorationSummary, ReplayedState, Repo, UndoRequest, UndoResult,
 };

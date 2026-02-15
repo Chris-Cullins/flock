@@ -6,7 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::{Signer, SigningKey};
-use fl_storage::{CONFIG_FILE, FLOCK_DIR, KEY_DIR, SIGNING_KEY_FILE, SNAPSHOT_DIR};
+use fl_storage::{
+    CONFIG_FILE, FLOCK_DIR, KEY_DIR, RefKind, RefStore, RepoRef, SIGNING_KEY_FILE, SNAPSHOT_DIR,
+    WorkspaceRefConfig,
+};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -62,6 +65,7 @@ impl Repo {
             .context("failed to create snapshots directory")?;
 
         fl_storage::EventLog::for_root(self.root()).ensure_exists()?;
+        RefStore::for_root(self.root()).ensure_exists()?;
         self.ensure_signing_key()?;
 
         let config = self.root.join(CONFIG_FILE);
@@ -93,6 +97,70 @@ impl Repo {
     pub fn list_events(&self) -> Result<Vec<Event>> {
         self.assert_initialized()?;
         fl_storage::EventLog::for_root(self.root()).read_all()
+    }
+
+    pub fn list_refs(&self) -> Result<Vec<RepoRef>> {
+        self.assert_initialized()?;
+
+        let store = RefStore::for_root(self.root());
+        store.ensure_exists()?;
+        let mut refs = store.read_all()?;
+        refs.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+        Ok(refs)
+    }
+
+    pub fn upsert_ref(
+        &self,
+        kind: RefKind,
+        name: String,
+        target_event_id_prefix: String,
+        auto_rebase: Option<bool>,
+    ) -> Result<RepoRef> {
+        self.assert_initialized()?;
+
+        let normalized_name = normalize_ref_name(&name)?;
+        let resolved_event_id = self.resolve_event_id_by_prefix(&target_event_id_prefix)?;
+        let target_event = self.event_by_id(resolved_event_id)?;
+
+        if kind == RefKind::Tag && !matches!(target_event.kind, EventKind::Checkpoint(_)) {
+            bail!(
+                "tag refs must target checkpoint events; event {} is not a checkpoint",
+                resolved_event_id
+            );
+        }
+
+        let workspace = match kind {
+            RefKind::Workspace => Some(WorkspaceRefConfig {
+                auto_rebase: auto_rebase.unwrap_or(false),
+            }),
+            RefKind::Branch | RefKind::Tag => {
+                if auto_rebase.is_some() {
+                    bail!("--auto-rebase is only valid for workspace refs");
+                }
+                None
+            }
+        };
+
+        let reference = RepoRef {
+            kind,
+            name: normalized_name,
+            target_event_id: resolved_event_id,
+            workspace,
+        };
+
+        let store = RefStore::for_root(self.root());
+        store.ensure_exists()?;
+        store.upsert(reference.clone())?;
+        Ok(reference)
+    }
+
+    pub fn delete_ref(&self, kind: RefKind, name: &str) -> Result<bool> {
+        self.assert_initialized()?;
+
+        let normalized_name = normalize_ref_name(name)?;
+        let store = RefStore::for_root(self.root());
+        store.ensure_exists()?;
+        store.delete(kind, &normalized_name)
     }
 
     pub fn replay_state(&self) -> Result<ReplayedState> {
@@ -441,6 +509,7 @@ impl Repo {
             snapshot_id,
             parent_checkpoint_event,
         }))?;
+        self.advance_main_ref(event.id)?;
         Ok(event)
     }
 
@@ -730,6 +799,48 @@ impl Repo {
         fl_bridge_git::run_git(&self.root, args)
     }
 
+    fn event_by_id(&self, event_id: Uuid) -> Result<Event> {
+        self.list_events()?
+            .into_iter()
+            .find(|event| event.id == event_id)
+            .ok_or_else(|| anyhow!("event {} not found", event_id))
+    }
+
+    fn resolve_event_id_by_prefix(&self, prefix: &str) -> Result<Uuid> {
+        let trimmed = prefix.trim();
+        if trimmed.is_empty() {
+            bail!("target event id cannot be empty");
+        }
+
+        let events = self.list_events()?;
+        if events.is_empty() {
+            bail!("cannot create refs: event log is empty");
+        }
+
+        let matches: Vec<Uuid> = events
+            .iter()
+            .filter(|event| event.id.to_string().starts_with(trimmed))
+            .map(|event| event.id)
+            .collect();
+
+        match matches.as_slice() {
+            [] => bail!("no event id matches `{}`", trimmed),
+            [event_id] => Ok(*event_id),
+            _ => bail!("event id prefix `{}` is ambiguous", trimmed),
+        }
+    }
+
+    fn advance_main_ref(&self, checkpoint_event_id: Uuid) -> Result<()> {
+        let store = RefStore::for_root(self.root());
+        store.ensure_exists()?;
+        store.upsert(RepoRef {
+            kind: RefKind::Branch,
+            name: "main".to_string(),
+            target_event_id: checkpoint_event_id,
+            workspace: None,
+        })
+    }
+
     fn ensure_signing_key(&self) -> Result<()> {
         let key_dir = self.root.join(KEY_DIR);
         fs::create_dir_all(&key_dir)
@@ -828,6 +939,29 @@ fn normalize_label(message: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_ascii_lowercase()
+}
+
+fn normalize_ref_name(raw_name: &str) -> Result<String> {
+    let name = raw_name.trim();
+    if name.is_empty() {
+        bail!("ref name cannot be empty");
+    }
+
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        bail!("ref name `{}` has invalid slash placement", name);
+    }
+
+    let valid = name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' || ch == '/');
+    if !valid {
+        bail!(
+            "ref name `{}` contains unsupported characters (allowed: A-Z, a-z, 0-9, -, _, ., /)",
+            name
+        );
+    }
+
+    Ok(name.to_string())
 }
 
 fn unix_timestamp_nanos() -> Result<String> {
@@ -1128,5 +1262,97 @@ mod tests {
         repo.init().expect("repo init should succeed");
 
         assert!(dir.path().join(SIGNING_KEY_FILE).is_file());
+    }
+
+    #[test]
+    fn checkpoints_advance_main_branch_ref() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let cp1 = repo
+            .create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+        let cp2 = repo
+            .create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+
+        let refs = repo.list_refs().expect("refs should load");
+        let main = refs
+            .into_iter()
+            .find(|entry| entry.kind == RefKind::Branch && entry.name == "main")
+            .expect("main branch ref should exist");
+
+        assert_ne!(main.target_event_id, cp1.id);
+        assert_eq!(main.target_event_id, cp2.id);
+    }
+
+    #[test]
+    fn tag_refs_require_checkpoint_target() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        repo.start_exploration("not-a-checkpoint".to_string())
+            .expect("exploration should start");
+        let exploration_event_id = repo
+            .list_events()
+            .expect("events should load")
+            .last()
+            .expect("exploration event should exist")
+            .id;
+
+        let err = repo
+            .upsert_ref(
+                RefKind::Tag,
+                "v0".to_string(),
+                exploration_event_id.to_string(),
+                None,
+            )
+            .expect_err("tag should reject non-checkpoint targets");
+
+        assert!(
+            format!("{:#}", err).contains("must target checkpoint"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workspace_ref_persists_auto_rebase_and_delete() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let checkpoint = repo
+            .create_checkpoint(Some("cp".to_string()))
+            .expect("checkpoint should succeed");
+        let workspace_ref = repo
+            .upsert_ref(
+                RefKind::Workspace,
+                "agent/a".to_string(),
+                checkpoint.id.to_string(),
+                Some(true),
+            )
+            .expect("workspace ref should be created");
+
+        assert_eq!(workspace_ref.kind, RefKind::Workspace);
+        assert!(
+            workspace_ref
+                .workspace
+                .as_ref()
+                .expect("workspace config should exist")
+                .auto_rebase
+        );
+
+        let removed = repo
+            .delete_ref(RefKind::Workspace, "agent/a")
+            .expect("delete should succeed");
+        assert!(removed);
+        assert!(
+            repo.list_refs()
+                .expect("refs should load")
+                .into_iter()
+                .all(|entry| !(entry.kind == RefKind::Workspace && entry.name == "agent/a"))
+        );
     }
 }

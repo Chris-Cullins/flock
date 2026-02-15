@@ -9,6 +9,7 @@ Initial Rust implementation of `fl` with:
 - exploration lifecycle commands (`start/list/promote/abandon`)
 - undo variants on the event timeline
 - git bridge command stubs (`commit/push/pull`)
+- repository refs abstraction (`branch`, `tag`, `workspace`)
 
 Workspace crates:
 
@@ -58,6 +59,13 @@ cargo run -p fl-cli -- undo --file src/app.ts
 cargo run -p fl-cli -- git commit -m \"checkpoint from fl\"
 cargo run -p fl-cli -- git push
 cargo run -p fl-cli -- git pull
+
+# refs commands
+cargo run -p fl-cli -- refs list
+cargo run -p fl-cli -- refs set branch main <event-id-or-prefix>
+cargo run -p fl-cli -- refs set tag v1 <checkpoint-event-id-or-prefix>
+cargo run -p fl-cli -- refs set workspace agent/a <event-id-or-prefix> --auto-rebase
+cargo run -p fl-cli -- refs delete workspace agent/a
 ```
 
 ## Notes

@@ -1,9 +1,9 @@
 use std::env;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use fl_core::repo::parse_duration_spec;
-use fl_core::{EventKind, Repo, SemanticChangeKind, UndoRequest};
+use fl_core::{EventKind, RefKind, Repo, SemanticChangeKind, UndoRequest};
 use uuid::Uuid;
 
 #[derive(Debug, Parser)]
@@ -45,6 +45,10 @@ enum Command {
         #[command(subcommand)]
         command: GitCommand,
     },
+    Refs {
+        #[command(subcommand)]
+        command: RefsCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,6 +80,39 @@ enum GitCommand {
         remote: Option<String>,
         branch: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum RefsCommand {
+    List,
+    Set {
+        kind: RefKindArg,
+        name: String,
+        target: String,
+        #[arg(long)]
+        auto_rebase: bool,
+    },
+    Delete {
+        kind: RefKindArg,
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum RefKindArg {
+    Branch,
+    Tag,
+    Workspace,
+}
+
+impl From<RefKindArg> for RefKind {
+    fn from(value: RefKindArg) -> Self {
+        match value {
+            RefKindArg::Branch => RefKind::Branch,
+            RefKindArg::Tag => RefKind::Tag,
+            RefKindArg::Workspace => RefKind::Workspace,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -256,6 +293,92 @@ fn main() -> Result<()> {
                     let out = repo.git_pull_stub(remote, branch)?;
                     if !out.is_empty() {
                         println!("{}", out);
+                    }
+                }
+            }
+        }
+        Command::Refs { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                RefsCommand::List => {
+                    let refs = repo.list_refs()?;
+                    if refs.is_empty() {
+                        println!("No refs.");
+                        return Ok(());
+                    }
+
+                    for entry in refs {
+                        match entry.kind {
+                            RefKind::Workspace => {
+                                let auto_rebase = entry
+                                    .workspace
+                                    .as_ref()
+                                    .map(|workspace| workspace.auto_rebase)
+                                    .unwrap_or(false);
+                                println!(
+                                    "workspace  {}  {}  auto-rebase={}",
+                                    entry.name, entry.target_event_id, auto_rebase
+                                );
+                            }
+                            RefKind::Branch => {
+                                println!("branch     {}  {}", entry.name, entry.target_event_id);
+                            }
+                            RefKind::Tag => {
+                                println!("tag        {}  {}", entry.name, entry.target_event_id);
+                            }
+                        }
+                    }
+                }
+                RefsCommand::Set {
+                    kind,
+                    name,
+                    target,
+                    auto_rebase,
+                } => {
+                    let kind: RefKind = kind.into();
+                    let auto_rebase = match kind {
+                        RefKind::Workspace => Some(auto_rebase),
+                        RefKind::Branch | RefKind::Tag => {
+                            if auto_rebase {
+                                bail!("--auto-rebase can only be used with workspace refs");
+                            }
+                            None
+                        }
+                    };
+
+                    let reference = repo.upsert_ref(kind, name, target, auto_rebase)?;
+                    match reference.kind {
+                        RefKind::Workspace => {
+                            let auto_rebase = reference
+                                .workspace
+                                .as_ref()
+                                .map(|workspace| workspace.auto_rebase)
+                                .unwrap_or(false);
+                            println!(
+                                "set workspace {} -> {} (auto-rebase={})",
+                                reference.name, reference.target_event_id, auto_rebase
+                            );
+                        }
+                        RefKind::Branch => {
+                            println!(
+                                "set branch {} -> {}",
+                                reference.name, reference.target_event_id
+                            );
+                        }
+                        RefKind::Tag => {
+                            println!(
+                                "set tag {} -> {}",
+                                reference.name, reference.target_event_id
+                            );
+                        }
+                    }
+                }
+                RefsCommand::Delete { kind, name } => {
+                    let removed = repo.delete_ref(kind.into(), &name)?;
+                    if removed {
+                        println!("deleted ref {}", name);
+                    } else {
+                        println!("ref {} not found", name);
                     }
                 }
             }
