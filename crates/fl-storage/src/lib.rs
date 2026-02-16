@@ -1,3 +1,4 @@
+pub mod auto_storage;
 pub mod chunking;
 pub mod compaction;
 pub mod content_store;
@@ -9,6 +10,7 @@ pub mod file_index;
 pub mod layout;
 pub mod materialized_state;
 pub mod refs;
+pub mod refs_migration;
 pub mod remote_config;
 pub mod remote_protocol;
 pub mod segmented_event_log;
@@ -53,6 +55,8 @@ pub use remote_protocol::{
     SnapshotNeedRequest, SnapshotNeedResponse, SshAuthChallengeRequest, SshAuthChallengeResponse,
     SshAuthVerifyRequest, SshAuthVerifyResponse, TokenLoginRequest, TokenLoginResponse,
 };
+pub use auto_storage::{AutoEventLog, AutoRefStore};
+pub use refs_migration::{RefsMigrationReport, migrate_refs_to_segmented};
 pub use segmented_event_log::SegmentedEventLog;
 pub use segmented_refs::SegmentedRefStore;
 pub use snapshot_store::{IncrementalSnapshotReport, build_incremental_index, store_snapshot_incremental};

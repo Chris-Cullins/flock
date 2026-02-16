@@ -9,10 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::{Signer, SigningKey};
 use fl_storage::{
-    BlockRef, CONFIG_FILE, ChunkConfig, ContentStore, FLOCK_DIR, FileEntry, FileIndex,
-    HOOKS_CONFIG_FILE, HookEvent, KEY_DIR, MaterializedStateStore, RefKind, RefStore, RepoRef,
-    SECRETS_CONFIG_FILE, SIGNING_KEY_FILE, SNAPSHOT_DIR, SnapshotIndex, WorkspaceRefConfig,
-    chunk_data,
+    AutoEventLog, AutoRefStore, BlockRef, CONFIG_FILE, ChunkConfig, ContentStore, FLOCK_DIR,
+    FileEntry, FileIndex, HOOKS_CONFIG_FILE, HookEvent, KEY_DIR, MaterializedStateStore, RefKind,
+    RepoRef, SECRETS_CONFIG_FILE, SIGNING_KEY_FILE, SNAPSHOT_DIR, SnapshotIndex,
+    WorkspaceRefConfig, chunk_data,
 };
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -349,8 +349,10 @@ impl Repo {
                 .context("failed to create snapshots directory")?;
         }
 
+        // New repos start with monolithic format; auto-migration upgrades
+        // to segmented when size thresholds are crossed.
         fl_storage::EventLog::for_root(self.root()).ensure_exists()?;
-        RefStore::for_root(self.root()).ensure_exists()?;
+        fl_storage::RefStore::for_root(self.root()).ensure_exists()?;
         self.ensure_signing_key()?;
 
         let config = self.root.join(CONFIG_FILE);
@@ -450,13 +452,13 @@ impl Repo {
 
     pub fn list_events(&self) -> Result<Vec<Event>> {
         self.assert_initialized()?;
-        fl_storage::EventLog::for_root(self.root()).read_all()
+        AutoEventLog::for_root(self.root()).read_all()
     }
 
     pub fn list_refs(&self) -> Result<Vec<RepoRef>> {
         self.assert_initialized()?;
 
-        let store = RefStore::for_root(self.root());
+        let store = AutoRefStore::for_root(self.root());
         store.ensure_exists()?;
         let mut refs = store.read_all()?;
         refs.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
@@ -505,7 +507,7 @@ impl Repo {
             workspace,
         };
 
-        let store = RefStore::for_root(self.root());
+        let store = AutoRefStore::for_root(self.root());
         store.ensure_exists()?;
         store.upsert(reference.clone())?;
         self.sync_ref_to_git_if_colocated(&reference)?;
@@ -516,7 +518,7 @@ impl Repo {
         self.assert_initialized()?;
 
         let normalized_name = normalize_ref_name(name)?;
-        let store = RefStore::for_root(self.root());
+        let store = AutoRefStore::for_root(self.root());
         store.ensure_exists()?;
         let removed = store.delete(kind, &normalized_name)?;
         if removed {
@@ -574,7 +576,7 @@ impl Repo {
     pub fn fsck(&self) -> Result<FsckReport> {
         self.assert_initialized()?;
 
-        let events = fl_storage::EventLog::for_root(self.root())
+        let events = AutoEventLog::for_root(self.root())
             .read_all()
             .context("event log integrity check failed")?;
         let event_count = events.len();
@@ -771,7 +773,7 @@ impl Repo {
             snapshot_count += 1;
         }
 
-        let refs = RefStore::for_root(self.root())
+        let refs = AutoRefStore::for_root(self.root())
             .read_all()
             .context("refs integrity check failed")?;
         for reference in &refs {
@@ -2165,7 +2167,7 @@ impl Repo {
             }),
         };
 
-        let store = RefStore::for_root(self.root());
+        let store = AutoRefStore::for_root(self.root());
         store.upsert(workspace_ref.clone())?;
 
         Ok(workspace_ref)
@@ -2237,7 +2239,7 @@ impl Repo {
     ) -> Result<RepoRef> {
         self.assert_initialized()?;
 
-        let store = RefStore::for_root(self.root());
+        let store = AutoRefStore::for_root(self.root());
         let refs = store.read_all()?;
         let mut ws_ref = refs
             .iter()
@@ -2877,7 +2879,7 @@ impl Repo {
 
             // Create a branch ref pointing to the tip checkpoint
             if let Some(tip_checkpoint) = parent_checkpoint {
-                let store = RefStore::for_root(self.root());
+                let store = AutoRefStore::for_root(self.root());
                 let reference = RepoRef {
                     kind: RefKind::Branch,
                     name: branch_name.clone(),
@@ -2901,7 +2903,7 @@ impl Repo {
             let deref_sha = deref_sha.trim().to_string();
 
             if let Some(&checkpoint_id) = sha_to_checkpoint.get(&deref_sha) {
-                let store = RefStore::for_root(self.root());
+                let store = AutoRefStore::for_root(self.root());
                 let reference = RepoRef {
                     kind: RefKind::Tag,
                     name: tag_name.clone(),
@@ -3081,7 +3083,7 @@ impl Repo {
                         let bm_name = parts[0];
                         let bm_sha = parts[1].trim();
                         if let Some(checkpoint_id) = self.find_checkpoint_for_git_commit(bm_sha)? {
-                            let store = RefStore::for_root(self.root());
+                            let store = AutoRefStore::for_root(self.root());
                             let reference = RepoRef {
                                 kind: RefKind::Branch,
                                 name: format!("jj/{bm_name}"),
@@ -3225,7 +3227,7 @@ impl Repo {
         }
 
         // Export Flock Tag refs as git tags
-        let refs = RefStore::for_root(self.root()).read_all()?;
+        let refs = AutoRefStore::for_root(self.root()).read_all()?;
         let mut tags_imported: usize = 0;
         for r in &refs {
             if r.kind == RefKind::Tag {
@@ -4050,7 +4052,7 @@ impl Repo {
             kind,
         };
         self.sign_event(&mut event)?;
-        fl_storage::EventLog::for_root(self.root()).append(&event)?;
+        AutoEventLog::for_root(self.root()).append(&event)?;
         Ok(event)
     }
 
@@ -4519,7 +4521,7 @@ impl Repo {
     }
 
     fn advance_main_ref(&self, checkpoint_event_id: Uuid) -> Result<()> {
-        let store = RefStore::for_root(self.root());
+        let store = AutoRefStore::for_root(self.root());
         store.ensure_exists()?;
         let reference = RepoRef {
             kind: RefKind::Branch,
@@ -5135,7 +5137,7 @@ impl Repo {
         }))?;
 
         // Update workspace ref to point to new base
-        let store = RefStore::for_root(self.root());
+        let store = AutoRefStore::for_root(self.root());
         store.upsert(RepoRef {
             kind: RefKind::Workspace,
             name: workspace_name.to_string(),
@@ -5634,7 +5636,7 @@ impl Repo {
     }
 
     fn latest_checkpoint_event_id(&self) -> Option<Uuid> {
-        let events = fl_storage::EventLog::for_root(self.root()).read_all().ok()?;
+        let events = AutoEventLog::for_root(self.root()).read_all().ok()?;
         events
             .iter()
             .rev()
@@ -6159,10 +6161,10 @@ impl Repo {
         }
 
         // Append pulled events.
-        fl_storage::EventLog::for_root(self.root()).append_batch(&events_to_append)?;
+        AutoEventLog::for_root(self.root()).append_batch(&events_to_append)?;
 
         // Update refs from remote.
-        let ref_store = RefStore::for_root(self.root());
+        let ref_store = AutoRefStore::for_root(self.root());
         let refs_updated: Vec<String> = resp.refs.iter().map(|r| r.name.clone()).collect();
         for r in &resp.refs {
             ref_store.upsert(r.clone())?;

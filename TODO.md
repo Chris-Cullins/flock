@@ -347,7 +347,7 @@ Server-side features live in the Roost repo. Tracked here for cross-reference on
 
 Make the optimized storage paths the defaults so large repos and teams work out of the box.
 
-- [ ] Auto-migrate to segmented storage — detect when the event log or refs file crosses a size threshold and transparently upgrade to segmented event log / per-ref files without manual `fl migrate`
+- [x] Auto-migrate to segmented storage — detect when the event log or refs file crosses a size threshold and transparently upgrade to segmented event log / per-ref files without manual `fl migrate`
 - [ ] Add filesystem-level locking (`flock(2)` / lockfiles) around event log appends and ref writes to prevent corruption from concurrent writers
 - [ ] Auto-checkpoint materialized state — periodically snapshot replayed state (e.g. every 1,000 events) so event replay stays O(recent) instead of O(all)
 - [ ] Streaming semantic analysis — add size limits / chunked parsing for files >1MB to avoid loading entire large files into memory for tree-sitter parsing
