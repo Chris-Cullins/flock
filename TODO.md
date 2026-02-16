@@ -41,6 +41,14 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Implement git import and export commands
 - [x] Implement shadow mode safety checks and recovery docs
 - [x] Define jj import design and metadata mapping
+- [ ] Add `fl convert` one-command repo conversion workflow:
+  - [ ] `fl convert --from git` — detect `.git/`, init `.flock/`, import full git history (all branches/tags), set up colocated mode
+  - [ ] `fl convert --from jj` — detect `.jj/`, init `.flock/`, import jj history preserving change IDs and operation log
+  - [ ] Progress reporting for large repos (180k+ commits)
+  - [ ] Incremental/resumable conversion (don't restart from scratch if interrupted)
+  - [ ] Post-conversion validation (`fl fsck` + compare checkout against original)
+  - [ ] `--branch` filter to convert only specific branches
+  - [ ] `--shallow` option to import only recent history (last N commits) for quick onboarding
 
 ## 3. Semantic Layer (TS/JS First)
 
