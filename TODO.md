@@ -214,30 +214,50 @@ Critical for repos at scale (millions of LOC, hundreds of thousands of events). 
 - [ ] Incremental semantic indexing — update AST cache and dependency graph incrementally on new events instead of full recompute
 - [x] Large-repo benchmark suite — test against synthetic repos at 1M+ events, 10K+ files, 5M+ LOC to validate scaling targets
 
-## 10. Flock Remote (Self-Hosted Repo Server)
+## 10. Remote Sync (Client-Side)
 
-Flock's own remote hosting — no dependency on GitHub/GitLab. Replaces the traditional forge model with semantic-aware collaboration.
+Client-side commands and protocol for syncing with a Flock remote (server lives in `../roost`).
 
-### 10a. Core Transport - THIS WILL BE ROOST, AT ../roost. DONT IMPLEMENT JUST YET.
+### 10a. Remote Config and Transport Protocol
 - [ ] Define remote repository URL scheme and discovery (`fl remote add origin flock://host/repo`)
-- [ ] Implement event sync protocol — client sends events after last-known server event ID, server responds with events client is missing
-- [ ] Implement snapshot/blob transport — upload/download content blocks over HTTPS
+- [ ] Define wire protocol spec for event sync (shared between flock and roost)
+- [ ] Implement event sync protocol (client half) — send events after last-known server event ID, receive missing events
+- [ ] Implement snapshot/blob transport (client half) — upload/download content blocks over HTTPS
 - [ ] Implement `fl push` to flock remote
 - [ ] Implement `fl pull` from flock remote
-- [ ] Handle concurrent push conflicts (reject or auto-merge based on semantic analysis)
+- [ ] Handle push rejection (server rejects on conflict) — display semantic conflict info, prompt for merge
 
-### 10b. Auth and Multi-User
+### 10b. Client-Side Auth
 - [ ] SSH key and token-based authentication (leverage existing ed25519 signing)
+- [ ] `fl remote login` / `fl remote logout` — token management
+- [ ] Store credentials securely (keychain/credential-helper pattern)
+
+### 10c. Real-Time Client (Websocket)
+- [ ] Websocket connection lifecycle — connect to remote, authenticate, maintain heartbeat
+- [ ] Subscribe to event streams with filters (by file, symbol, module, agent)
+- [ ] `fl task list` / `fl ready` reflect remote state in real time (no poll/pull needed)
+- [ ] Receive "heads up" warnings when another agent/dev starts working on a symbol you're editing
+- [ ] Receive conflict forecast warnings based on active explorations' semantic change sets
+- [ ] Editor plugin protocol — define LSP-like protocol for editors to consume ghost text, presence, and heads-up warnings
+
+## 10-R. Remote Server (Roost — `../roost`)
+
+Server-side features live in the Roost repo. Tracked here for cross-reference only.
+
+### 10-R.a. Server Core
+- [ ] Receive and store events and content blocks
+- [ ] Concurrent push conflict detection (reject or auto-merge based on semantic analysis)
+- [ ] Repository storage layout on server (event log + content store + refs)
 - [ ] User/agent identity model — map actors to authenticated users
 - [ ] Repository-level access control (read/write/admin per user or team)
 - [ ] Per-branch and per-path write permissions
 
-### 10c. Server-Side Semantic Analysis
+### 10-R.b. Server-Side Semantic Analysis
 - [ ] Server-side semantic diff computation (so the web UI doesn't need tree-sitter locally)
 - [ ] Server-side merge preview (dry-run semantic merge on push)
 - [ ] Semantic change indexing — maintain searchable index of all semantic changes across history
 
-### 10d. Web UI for Semantic Review
+### 10-R.c. Web UI for Semantic Review
 - [ ] Render `fl review` output in browser — semantic change list grouped by risk
 - [ ] Expandable drill-down into individual semantic changes
 - [ ] Full line-level diff fallback view
@@ -245,33 +265,25 @@ Flock's own remote hosting — no dependency on GitHub/GitLab. Replaces the trad
 - [ ] Review approval workflow (approve/request-changes per semantic unit)
 - [ ] Exploration comparison view (side-by-side exploration outcomes)
 
-### 10e. Server Infrastructure
-- [ ] Repository storage layout on server (event log + content store + refs)
+### 10-R.d. Server Infrastructure
 - [ ] Tiered storage policies (hot/warm/cool — recent events on SSD, old history on object storage)
 - [ ] Background jobs: compaction, pruning, semantic indexing, garbage collection
 - [ ] Observability: metrics, tracing, structured logs
 - [ ] Backup and disaster recovery for hosted repos
 - [ ] Webhook system for external integrations (CI, chat, etc.)
 
-## 10.5. Real-Time Collaboration Features
-
-Layer on top of the remote server via websocket event streaming. See `docs/remote-features-brainstorm.md` for full vision.
-
-- [ ] Websocket event stream — clients subscribe to events matching filters (by file, symbol, module, agent)
-- [ ] Ghost text / semantic presence overlays — see what another dev or agent is currently changing at the symbol level, rendered as faint overlay in editor
-- [ ] Semantic feed — real-time stream of meaningful changes ("Agent A added class CurrencyConverter, 3 methods") instead of raw commit notifications
-- [ ] "Heads up" warnings — proactive notification when another agent/dev starts working on a symbol you're currently editing
-- [ ] Exploration spectating — watch an agent's semantic trail in real time (exploration starts, checkpoints, abandons, new approaches)
-- [ ] Continuous review — review semantic changes as they land instead of batch-reviewing a finished PR; approve individual semantic units incrementally
-- [ ] Conflict forecast — server predicts likely conflicts based on active explorations' semantic change sets and warns before they happen
-- [ ] Editor plugin protocol — define LSP-like protocol for editors to consume ghost text, presence, and heads-up warnings
-- [ ] Real-time task sync across connected repos:
-  - [ ] Task events (create, claim, done, fail) broadcast instantly to all connected clients via websocket
-  - [ ] `fl task list` / `fl ready` reflect remote state in real time (no poll/pull needed)
-  - [ ] Agent claims a task → all other agents see it claimed instantly, pick next available
+### 10-R.e. Real-Time Server (Websocket)
+- [ ] Websocket event stream — broadcast events matching client subscription filters
+- [ ] Ghost text / semantic presence overlays — relay symbol-level change info between clients
+- [ ] Semantic feed — stream meaningful changes ("Agent A added class CurrencyConverter, 3 methods") instead of raw commit notifications
+- [ ] Exploration spectating — relay an agent's semantic trail in real time
+- [ ] Continuous review — stream semantic changes as they land for incremental approval
+- [ ] Conflict forecast — predict likely conflicts based on active explorations and warn before they happen
+- [ ] Real-time task sync:
+  - [ ] Broadcast task events (create, claim, done, fail) instantly to all connected clients
   - [ ] Task dependency resolution propagates live (task done → blocked tasks unblock across all clients)
   - [ ] Cross-repo task visibility — tasks in repo A can reference/block tasks in repo B
-  - [ ] Dashboard view of all agent activity across all connected repos (who's working on what, task throughput, queue depth)
+  - [ ] Dashboard view of all agent activity across connected repos (who's working on what, task throughput, queue depth)
 
 ## 11. Intelligence Layer
 
@@ -327,3 +339,4 @@ Layer on top of the remote server via websocket event streaming. See `docs/remot
 ## Bugs
 
 - [ ] `fl init --colocated` writes `mode = "git-compatible"` in `.flock/config.toml` instead of `"git-colocated"` — the `--colocated` flag is ignored when writing the config
+- [ ] `fl task show/claim/done/fail` require full UUIDs — short prefixes (e.g. first 8 chars) should work like `fl diff <checkpoint>` does with prefix matching
