@@ -898,10 +898,19 @@ fn main() -> Result<()> {
                         }
                         SemanticConflictClassification::KindMismatch => "kind-mismatch",
                         SemanticConflictClassification::TextFallback => "text-fallback",
+                        SemanticConflictClassification::CrossFileBreakage => {
+                            "cross-file-breakage"
+                        }
                     };
                     println!("    [{}] {}", classification, conflict.symbol);
                     if !conflict.explanation.is_empty() {
                         println!("      {}", conflict.explanation);
+                    }
+                    if !conflict.affected_files.is_empty() {
+                        println!(
+                            "      affected files: {}",
+                            conflict.affected_files.join(", ")
+                        );
                     }
                 }
             }

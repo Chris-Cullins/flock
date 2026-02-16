@@ -3,6 +3,7 @@ pub use fl_semantic::{
     AnalyzerRegistry, FallbackTextAnalyzer, ProcessAnalyzerConfig, ProcessSemanticAnalyzer,
     SemanticAnalyzerPlugin, SemanticChange, SemanticChangeKind, SemanticCompatibility,
     SemanticCompatibilityStatus, SemanticConflictClassification, SemanticFileDiff, SemanticImpact,
-    SemanticMergeConflict, SemanticMergeResult, SemanticRisk, TreeSitterTsJsAnalyzer,
-    default_analyzer_registry, diff, merge, serve_analyzer_process, supported_source,
+    SemanticMergeConflict, SemanticMergeResult, SemanticRisk, TreeSitterAnalyzer,
+    default_analyzer_registry, diff, impact_symbols, merge, serve_analyzer_process,
+    structured, supported_source,
 };

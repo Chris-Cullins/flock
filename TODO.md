@@ -134,15 +134,21 @@ This file tracks the full build-out from current scaffold to the complete archit
 
 These should land before the storage rework — they improve merge quality independent of the backend.
 
-- [ ] Auto-resolve StyleOnly vs logic conflicts in semantic merge (one side is whitespace-only → auto-pick the logic change)
-- [ ] Cross-file semantic conflict detection (signature change in file A breaks callers in file B)
-- [ ] Wire `fl impact` dependency data into merge conflict reporting
-- [ ] Add additional language analyzers:
-  - [ ] Python (tree-sitter)
-  - [ ] Go (tree-sitter)
-  - [ ] Rust (tree-sitter)
-  - [ ] C# (tree-sitter — original arch doc target)
-- [ ] AST cache keyed by content hash (don't re-parse unchanged files)
+- [x] Auto-resolve StyleOnly vs logic conflicts in semantic merge (one side is whitespace-only → auto-pick the logic change)
+- [x] Cross-file semantic conflict detection (signature change in file A breaks callers in file B)
+- [x] Wire `fl impact` dependency data into merge conflict reporting
+- [x] Add additional language analyzers:
+  - [x] Python (tree-sitter)
+  - [x] Go (tree-sitter)
+  - [x] Rust (tree-sitter)
+  - [x] C# (tree-sitter — original arch doc target)
+- [x] Add structured analyzers for non-programming languages (nice-to-have):
+  - [x] JSON/JSONL — diff by top-level keys instead of lines
+  - [x] YAML/TOML — diff by key paths
+  - [x] XML/HTML — diff by element/attribute
+  - [x] CSS/SCSS — diff by selector/rule
+  - [x] Markdown — diff by heading/section
+- [x] AST cache keyed by content hash (don't re-parse unchanged files)
 
 ## 9. Native Storage Engine (Phase 2 Backend)
 

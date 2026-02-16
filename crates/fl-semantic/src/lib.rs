@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+pub mod structured;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -34,6 +36,10 @@ pub struct SemanticMergeConflict {
     pub classification: SemanticConflictClassification,
     #[serde(default, alias = "detail")]
     pub explanation: String,
+    #[serde(default)]
+    pub affected_files: Vec<String>,
+    #[serde(default)]
+    pub impact: Option<SemanticImpact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -46,6 +52,7 @@ pub enum SemanticConflictClassification {
     ConcurrentAddition,
     KindMismatch,
     TextFallback,
+    CrossFileBreakage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,12 +163,16 @@ struct ParameterSignature {
     is_rest: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceLanguage {
     JavaScript,
     Jsx,
     TypeScript,
     Tsx,
+    Python,
+    Go,
+    Rust,
+    CSharp,
 }
 
 impl SourceLanguage {
@@ -171,6 +182,10 @@ impl SourceLanguage {
             Some("jsx") => Some(Self::Jsx),
             Some("ts") => Some(Self::TypeScript),
             Some("tsx") => Some(Self::Tsx),
+            Some("py") => Some(Self::Python),
+            Some("go") => Some(Self::Go),
+            Some("rs") => Some(Self::Rust),
+            Some("cs") => Some(Self::CSharp),
             _ => None,
         }
     }
@@ -181,6 +196,10 @@ impl SourceLanguage {
             Self::Jsx => "jsx",
             Self::TypeScript => "typescript",
             Self::Tsx => "tsx",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Rust => "rust",
+            Self::CSharp => "csharp",
         }
     }
 }
@@ -438,7 +457,12 @@ impl AnalyzerRegistry {
 
     pub fn with_builtin() -> Self {
         let mut registry = Self::new();
-        registry.register(TreeSitterTsJsAnalyzer::default());
+        registry.register(TreeSitterAnalyzer::default());
+        registry.register(structured::JsonAnalyzer);
+        registry.register(structured::YamlTomlAnalyzer);
+        registry.register(structured::XmlHtmlAnalyzer);
+        registry.register(structured::CssAnalyzer);
+        registry.register(structured::MarkdownAnalyzer);
         registry
     }
 
@@ -507,11 +531,11 @@ impl AnalyzerRegistry {
 }
 
 #[derive(Debug, Default)]
-pub struct TreeSitterTsJsAnalyzer;
+pub struct TreeSitterAnalyzer;
 
-impl SemanticAnalyzerPlugin for TreeSitterTsJsAnalyzer {
+impl SemanticAnalyzerPlugin for TreeSitterAnalyzer {
     fn id(&self) -> &str {
-        "tree-sitter-ts-js"
+        "tree-sitter-multi"
     }
 
     fn supports_path(&self, path: &Path) -> bool {
@@ -870,6 +894,8 @@ impl SemanticAnalyzerPlugin for FallbackTextAnalyzer {
                 symbol: "(fallback text merge)".to_string(),
                 classification: SemanticConflictClassification::TextFallback,
                 explanation: "fallback text merge produced unresolved conflicts".to_string(),
+                affected_files: Vec::new(),
+                impact: None,
             }]
         } else {
             Vec::new()
@@ -1131,6 +1157,8 @@ fn tree_sitter_merge(
                 symbol: "(text-merge)".to_string(),
                 classification: SemanticConflictClassification::TextFallback,
                 explanation: "text fallback produced conflict markers".to_string(),
+                affected_files: Vec::new(),
+                impact: None,
             });
         }
 
@@ -1159,6 +1187,8 @@ fn tree_sitter_merge(
                 symbol: "(text-merge)".to_string(),
                 classification: SemanticConflictClassification::TextFallback,
                 explanation: "text merge produced unresolved conflicts".to_string(),
+                affected_files: Vec::new(),
+                impact: None,
             });
         }
     }
@@ -1295,6 +1325,8 @@ fn build_symbol_conflict(
         symbol: key.to_string(),
         classification,
         explanation,
+        affected_files: Vec::new(),
+        impact: None,
     }
 }
 
@@ -1330,7 +1362,7 @@ fn base_impact(symbol: &str) -> SemanticImpact {
     }
 }
 
-fn impact_symbols(symbol: &str) -> Vec<String> {
+pub fn impact_symbols(symbol: &str) -> Vec<String> {
     let mut symbols = BTreeSet::new();
     for part in symbol.split("->") {
         let trimmed = part.trim();
@@ -1606,7 +1638,23 @@ fn to_symbol_map(symbols: Vec<SymbolInfo>) -> BTreeMap<String, SymbolInfo> {
     map
 }
 
+fn ast_cache() -> &'static Mutex<HashMap<String, Vec<SymbolInfo>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<SymbolInfo>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolInfo>> {
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let cache_key = blake3::hash(source).to_hex().to_string();
+    if let Ok(cache) = ast_cache().lock() {
+        if let Some(cached) = cache.get(&cache_key) {
+            return Ok(cached.clone());
+        }
+    }
+
     let mut parser = Parser::new();
     match language {
         SourceLanguage::JavaScript => parser
@@ -1621,11 +1669,19 @@ fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolIn
         SourceLanguage::Tsx => parser
             .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
             .context("failed to load TSX grammar")?,
+        SourceLanguage::Python => parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .context("failed to load Python grammar")?,
+        SourceLanguage::Go => parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .context("failed to load Go grammar")?,
+        SourceLanguage::Rust => parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .context("failed to load Rust grammar")?,
+        SourceLanguage::CSharp => parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .context("failed to load C# grammar")?,
     };
-
-    if source.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let tree = parser
         .parse(source, None)
@@ -1637,7 +1693,20 @@ fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolIn
     }
 
     let mut symbols = Vec::new();
-    extract_symbols(root, source, None, &mut symbols)?;
+    match language {
+        SourceLanguage::JavaScript
+        | SourceLanguage::Jsx
+        | SourceLanguage::TypeScript
+        | SourceLanguage::Tsx => extract_symbols(root, source, None, &mut symbols)?,
+        SourceLanguage::Python => extract_symbols_python(root, source, None, &mut symbols)?,
+        SourceLanguage::Go => extract_symbols_go(root, source, None, &mut symbols)?,
+        SourceLanguage::Rust => extract_symbols_rust(root, source, None, &mut symbols)?,
+        SourceLanguage::CSharp => extract_symbols_csharp(root, source, None, &mut symbols)?,
+    }
+
+    if let Ok(mut cache) = ast_cache().lock() {
+        cache.insert(cache_key, symbols.clone());
+    }
 
     Ok(symbols)
 }
@@ -1789,6 +1858,372 @@ fn extract_symbols(
         extract_symbols(child, source, enclosing_class, symbols)?;
     }
 
+    Ok(())
+}
+
+// --- Python symbol extraction ---
+
+fn extract_symbols_python(
+    node: Node,
+    source: &[u8],
+    enclosing_class: Option<&str>,
+    symbols: &mut Vec<SymbolInfo>,
+) -> Result<()> {
+    match node.kind() {
+        "function_definition" => {
+            if let Some(fn_name) = symbol_name(node, source) {
+                let scoped_name = match enclosing_class {
+                    Some(class_name) => format!("{}.{}", class_name, fn_name),
+                    None => fn_name.clone(),
+                };
+                let kind = if enclosing_class.is_some() {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                };
+                symbols.push(SymbolInfo {
+                    kind,
+                    name: scoped_name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: extract_callable_signature(node, source),
+                });
+            }
+        }
+        "decorated_definition" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "function_definition" || child.kind() == "class_definition" {
+                    extract_symbols_python(child, source, enclosing_class, symbols)?;
+                }
+            }
+            return Ok(());
+        }
+        "class_definition" => {
+            if let Some(class_name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Class,
+                    name: class_name.clone(),
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "block" {
+                        let mut block_cursor = child.walk();
+                        for block_child in child.named_children(&mut block_cursor) {
+                            extract_symbols_python(
+                                block_child,
+                                source,
+                                Some(&class_name),
+                                symbols,
+                            )?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        extract_symbols_python(child, source, enclosing_class, symbols)?;
+    }
+    Ok(())
+}
+
+// --- Go symbol extraction ---
+
+fn extract_symbols_go(
+    node: Node,
+    source: &[u8],
+    _enclosing_class: Option<&str>,
+    symbols: &mut Vec<SymbolInfo>,
+) -> Result<()> {
+    match node.kind() {
+        "function_declaration" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Function,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: extract_callable_signature(node, source),
+                });
+            }
+        }
+        "method_declaration" => {
+            if let Some(fn_name) = symbol_name(node, source) {
+                let receiver = node
+                    .child_by_field_name("receiver")
+                    .and_then(|r| {
+                        let mut cursor = r.walk();
+                        r.named_children(&mut cursor)
+                            .next()
+                            .and_then(|param| param.child_by_field_name("type"))
+                            .map(|t| {
+                                let text = compact_text(t, source);
+                                text.trim_start_matches('*').to_string()
+                            })
+                    });
+                let scoped_name = match receiver {
+                    Some(ref recv) => format!("{}.{}", recv, fn_name),
+                    None => fn_name,
+                };
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Method,
+                    name: scoped_name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: extract_callable_signature(node, source),
+                });
+            }
+        }
+        "type_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "type_spec" {
+                    if let Some(name) = symbol_name(child, source) {
+                        let type_node = child.child_by_field_name("type");
+                        let kind = match type_node.map(|n| n.kind()) {
+                            Some("struct_type") => SymbolKind::Class,
+                            Some("interface_type") => SymbolKind::Interface,
+                            _ => SymbolKind::TypeAlias,
+                        };
+                        symbols.push(SymbolInfo {
+                            kind,
+                            name,
+                            body_hash: node_hash(child, source)?,
+                            match_hash: node_match_hash(child, source)?,
+                            signature: None,
+                        });
+                    }
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        extract_symbols_go(child, source, None, symbols)?;
+    }
+    Ok(())
+}
+
+// --- Rust symbol extraction ---
+
+fn extract_symbols_rust(
+    node: Node,
+    source: &[u8],
+    enclosing_type: Option<&str>,
+    symbols: &mut Vec<SymbolInfo>,
+) -> Result<()> {
+    match node.kind() {
+        "function_item" => {
+            if let Some(fn_name) = symbol_name(node, source) {
+                let scoped_name = match enclosing_type {
+                    Some(type_name) => format!("{}.{}", type_name, fn_name),
+                    None => fn_name,
+                };
+                let kind = if enclosing_type.is_some() {
+                    SymbolKind::Method
+                } else {
+                    SymbolKind::Function
+                };
+                symbols.push(SymbolInfo {
+                    kind,
+                    name: scoped_name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: extract_callable_signature(node, source),
+                });
+            }
+        }
+        "impl_item" => {
+            let type_name = node
+                .child_by_field_name("type")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.trim().to_string());
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "declaration_list" {
+                    let mut inner_cursor = child.walk();
+                    for inner in child.named_children(&mut inner_cursor) {
+                        extract_symbols_rust(
+                            inner,
+                            source,
+                            type_name.as_deref(),
+                            symbols,
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        "trait_item" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Interface,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+            }
+        }
+        "struct_item" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Class,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+            }
+        }
+        "enum_item" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Enum,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+            }
+        }
+        "type_item" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::TypeAlias,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        extract_symbols_rust(child, source, enclosing_type, symbols)?;
+    }
+    Ok(())
+}
+
+// --- C# symbol extraction ---
+
+fn extract_symbols_csharp(
+    node: Node,
+    source: &[u8],
+    enclosing_class: Option<&str>,
+    symbols: &mut Vec<SymbolInfo>,
+) -> Result<()> {
+    match node.kind() {
+        "method_declaration" => {
+            if let Some(method_name) = symbol_name(node, source) {
+                let scoped_name = match enclosing_class {
+                    Some(class_name) => format!("{}.{}", class_name, method_name),
+                    None => method_name,
+                };
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Method,
+                    name: scoped_name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: extract_callable_signature(node, source),
+                });
+            }
+        }
+        "class_declaration" => {
+            if let Some(class_name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Class,
+                    name: class_name.clone(),
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "declaration_list" {
+                        let mut inner_cursor = child.walk();
+                        for inner in child.named_children(&mut inner_cursor) {
+                            extract_symbols_csharp(
+                                inner,
+                                source,
+                                Some(&class_name),
+                                symbols,
+                            )?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+        "interface_declaration" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Interface,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+            }
+        }
+        "struct_declaration" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Class,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+            }
+        }
+        "enum_declaration" => {
+            if let Some(name) = symbol_name(node, source) {
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Enum,
+                    name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+            }
+        }
+        "property_declaration" => {
+            if let Some(field_name) = symbol_name(node, source) {
+                let scoped_name = match enclosing_class {
+                    Some(class_name) => format!("{}.{}", class_name, field_name),
+                    None => field_name,
+                };
+                symbols.push(SymbolInfo {
+                    kind: SymbolKind::Field,
+                    name: scoped_name,
+                    body_hash: node_hash(node, source)?,
+                    match_hash: node_match_hash(node, source)?,
+                    signature: None,
+                });
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        extract_symbols_csharp(child, source, enclosing_class, symbols)?;
+    }
     Ok(())
 }
 
@@ -2405,5 +2840,224 @@ mod tests {
             conflict.classification == SemanticConflictClassification::TextFallback
                 && conflict.explanation.contains("text fallback")
         }));
+    }
+
+    #[test]
+    fn semantic_merge_auto_resolves_style_only_vs_logic() {
+        // Base has a function
+        let base = b"function add(a, b) { return a + b; }\n";
+        // Left side only adds whitespace/comments (style-only)
+        let left = b"function add(a, b) { return a + b; }\n\n";
+        // Right side makes a logic change
+        let right = b"function add(a, b) { return a - b; }\n";
+
+        let merged = merge(
+            Path::new("resolve.ts"),
+            Some(base),
+            Some(left),
+            Some(right),
+        )
+        .expect("merge should succeed")
+        .expect("merge result should exist");
+
+        // Should auto-pick the logic change (right side) since left is style-only
+        assert_eq!(
+            merged.merged_source,
+            String::from_utf8_lossy(right).to_string()
+        );
+        // Should have no text-merge conflict since it was auto-resolved
+        assert!(
+            !merged
+                .conflicts
+                .iter()
+                .any(|c| c.classification == SemanticConflictClassification::TextFallback)
+        );
+    }
+
+    #[test]
+    fn semantic_merge_auto_resolves_logic_vs_style_only() {
+        let base = b"function add(a, b) { return a + b; }\n";
+        // Left side makes a logic change
+        let left = b"function add(a, b) { return a * b; }\n";
+        // Right side only adds whitespace (style-only)
+        let right = b"function add(a, b) { return a + b; }\n\n";
+
+        let merged = merge(
+            Path::new("resolve2.ts"),
+            Some(base),
+            Some(left),
+            Some(right),
+        )
+        .expect("merge should succeed")
+        .expect("merge result should exist");
+
+        // Should auto-pick the logic change (left side)
+        assert_eq!(
+            merged.merged_source,
+            String::from_utf8_lossy(left).to_string()
+        );
+        assert!(
+            !merged
+                .conflicts
+                .iter()
+                .any(|c| c.classification == SemanticConflictClassification::TextFallback)
+        );
+    }
+
+    // --- Python analyzer tests ---
+
+    #[test]
+    fn detects_python_function_and_class() {
+        let old = b"def greet(name):\n    return f'hello {name}'\n";
+        let new = b"def greet(name):\n    return f'hi {name}'\n\nclass User:\n    def __init__(self, name):\n        self.name = name\n";
+
+        let diff = diff(Path::new("main.py"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert_eq!(diff.language, "python");
+        assert!(!diff.parse_fallback);
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Modified && c.symbol == "function:greet"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "class:User"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "method:User.__init__"));
+    }
+
+    #[test]
+    fn detects_python_decorated_function() {
+        let old = b"";
+        let new = b"import functools\n\n@functools.lru_cache\ndef expensive(n):\n    return n * 2\n";
+
+        let diff = diff(Path::new("cached.py"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "function:expensive"));
+    }
+
+    // --- Go analyzer tests ---
+
+    #[test]
+    fn detects_go_function_and_struct() {
+        let old = b"package main\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n";
+        let new = b"package main\n\nfunc Add(a, b int) int {\n\treturn a - b\n}\n\ntype User struct {\n\tName string\n}\n\nfunc (u *User) Greet() string {\n\treturn u.Name\n}\n";
+
+        let diff = diff(Path::new("main.go"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert_eq!(diff.language, "go");
+        assert!(!diff.parse_fallback);
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Modified && c.symbol == "function:Add"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "class:User"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "method:User.Greet"));
+    }
+
+    #[test]
+    fn detects_go_interface() {
+        let old = b"package main\n";
+        let new = b"package main\n\ntype Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n";
+
+        let diff = diff(Path::new("iface.go"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "interface:Reader"));
+    }
+
+    // --- Rust analyzer tests ---
+
+    #[test]
+    fn detects_rust_function_and_struct() {
+        let old_src = b"fn add(a: i32, b: i32) -> i32 { a + b }";
+        let new_src = b"fn add(a: i32, b: i32) -> i32 { a - b }
+struct User {
+    name: String,
+}
+impl User {
+    fn greet(&self) -> String {
+        self.name.clone()
+    }
+}";
+
+        let diff = diff(Path::new("lib.rs"), Some(old_src), Some(new_src))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert_eq!(diff.language, "rust");
+        assert!(!diff.parse_fallback);
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Modified && c.symbol == "function:add"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "class:User"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "method:User.greet"));
+    }
+
+    #[test]
+    fn detects_rust_trait_and_enum() {
+        let old = b"";
+        let new = b"trait Drawable {
+    fn draw(&self);
+}
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+type Coordinate = (f64, f64);";
+
+        let diff = diff(Path::new("types.rs"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "interface:Drawable"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "enum:Color"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "type:Coordinate"));
+    }
+
+    // --- C# analyzer tests ---
+
+    #[test]
+    fn detects_csharp_class_and_method() {
+        let old = b"";
+        let new = b"class User {\n    public string Name { get; set; }\n    public string Greet() {\n        return Name;\n    }\n}\n";
+
+        let diff = diff(Path::new("User.cs"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert_eq!(diff.language, "csharp");
+        assert!(!diff.parse_fallback);
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "class:User"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "method:User.Greet"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "field:User.Name"));
+    }
+
+    #[test]
+    fn detects_csharp_interface_and_enum() {
+        let old = b"";
+        let new = b"interface IDrawable {\n    void Draw();\n}\n\nenum Color {\n    Red,\n    Green,\n    Blue\n}\n\nstruct Point {\n    public int X { get; set; }\n    public int Y { get; set; }\n}\n";
+
+        let diff = diff(Path::new("Types.cs"), Some(old), Some(new))
+            .expect("diff should succeed")
+            .expect("diff should exist");
+
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "interface:IDrawable"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "enum:Color"));
+        assert!(diff.changes.iter().any(|c| c.kind == SemanticChangeKind::Added && c.symbol == "class:Point"));
+    }
+
+    // --- AST cache tests ---
+
+    #[test]
+    fn ast_cache_returns_consistent_results() {
+        let source = b"function cached() { return 1; }";
+        let symbols1 = parse_symbols(SourceLanguage::JavaScript, source)
+            .expect("first parse should succeed");
+        let symbols2 = parse_symbols(SourceLanguage::JavaScript, source)
+            .expect("second parse should succeed");
+
+        assert_eq!(symbols1.len(), symbols2.len());
+        for (a, b) in symbols1.iter().zip(symbols2.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.body_hash, b.body_hash);
+        }
     }
 }

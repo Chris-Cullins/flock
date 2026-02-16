@@ -26,7 +26,8 @@ use crate::event::{
 use fl_collab::can_acquire_lock;
 use fl_storage::ApiCallRecord;
 use crate::semantic::{
-    SemanticFileDiff, SemanticMergeResult, diff as semantic_diff, supported_source,
+    SemanticConflictClassification, SemanticFileDiff, SemanticImpact, SemanticMergeConflict,
+    SemanticMergeResult, diff as semantic_diff, impact_symbols, supported_source,
 };
 use fl_workflow::{
     build_task_graph, previous_checkpoint_before, replay_state, resolve_target_event, to_undo_mode,
@@ -682,13 +683,88 @@ impl Repo {
             .with_context(|| format!("failed to read right file: {}", right_path.display()))?;
 
         // Use the left path as the representative for language detection
-        let result = fl_semantic::merge(left_path, Some(&base), Some(&left), Some(&right))?;
-        result.ok_or_else(|| {
-            anyhow!(
-                "unsupported file type for semantic merge: {}",
-                left_path.display()
-            )
-        })
+        let mut result = fl_semantic::merge(left_path, Some(&base), Some(&left), Some(&right))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "unsupported file type for semantic merge: {}",
+                    left_path.display()
+                )
+            })?;
+
+        // Enrich conflicts with cross-file breakage and impact data
+        self.enrich_merge_conflicts(left_path, &mut result)?;
+        Ok(result)
+    }
+
+    fn enrich_merge_conflicts(
+        &self,
+        merged_path: &Path,
+        result: &mut SemanticMergeResult,
+    ) -> Result<()> {
+        let current_files = collect_source_files(self.root(), true)?;
+        let reverse_dependencies = build_reverse_dependency_index(self.root(), &current_files)?;
+
+        let rel_path = merged_path
+            .strip_prefix(self.root())
+            .unwrap_or(merged_path);
+        let impacted_files = collect_impacted_files(&rel_path.to_path_buf(), &reverse_dependencies);
+        let impacted_file_strings: Vec<String> = impacted_files
+            .iter()
+            .filter(|p| p.as_path() != rel_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let impacted_modules: Vec<String> = impacted_files
+            .iter()
+            .filter(|p| p.as_path() != rel_path)
+            .map(|p| module_name_for_path(p))
+            .collect();
+
+        // Enrich existing conflicts with impact data
+        for conflict in &mut result.conflicts {
+            conflict.affected_files.clone_from(&impacted_file_strings);
+            conflict.impact = Some(SemanticImpact {
+                symbols: impact_symbols(&conflict.symbol),
+                files: impacted_file_strings.clone(),
+                modules: impacted_modules.clone(),
+            });
+        }
+
+        // Detect cross-file breakage: if merge changes a function signature,
+        // scan importers for potential breakage
+        let merged_symbols = self.extract_symbols_for_path(&rel_path.to_string_lossy())?;
+        if !impacted_file_strings.is_empty() {
+            for conflict in &result.conflicts {
+                if conflict.classification == SemanticConflictClassification::DivergentEdit {
+                    let symbol_name = conflict
+                        .symbol
+                        .split(':')
+                        .nth(1)
+                        .unwrap_or(&conflict.symbol);
+                    if merged_symbols.iter().any(|s| s.contains(symbol_name)) {
+                        let cross_file = SemanticMergeConflict {
+                            symbol: conflict.symbol.clone(),
+                            classification: SemanticConflictClassification::CrossFileBreakage,
+                            explanation: format!(
+                                "merge conflict on `{}` may break {} downstream file(s): {}",
+                                conflict.symbol,
+                                impacted_file_strings.len(),
+                                impacted_file_strings.join(", ")
+                            ),
+                            affected_files: impacted_file_strings.clone(),
+                            impact: Some(SemanticImpact {
+                                symbols: impact_symbols(&conflict.symbol),
+                                files: impacted_file_strings.clone(),
+                                modules: impacted_modules.clone(),
+                            }),
+                        };
+                        result.conflicts.push(cross_file);
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Reviews an exploration by diffing its base checkpoint against current working directory.

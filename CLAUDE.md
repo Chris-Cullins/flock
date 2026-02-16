@@ -45,7 +45,7 @@ fl-collab       Collaboration contracts (stub for future phases)
 ### Core Design Patterns
 
 - **Event sourcing**: All state changes are append-only events. State is reconstructed by replaying events. Undo is pointer movement, not file rewriting.
-- **Semantic-first merging**: AST-level understanding via tree-sitter (TS/JS), falling back to text diff for unsupported languages.
+- **Semantic-first merging**: AST-level understanding via tree-sitter (TS/JS/Python/Go/Rust/C#), falling back to text diff for unsupported languages.
 - **Plugin analyzers**: `SemanticAnalyzerPlugin` trait with an `AnalyzerRegistry`. Process analyzers run out-of-process via JSON-over-stdio protocol with auto-restart.
 - **Layered degradation**: Semantic layer is optional. Process analyzers auto-restart on failure. Unsupported languages use `FallbackTextAnalyzer`.
 - **Two modes**: `GitCompatible` (`.flock` only) and `GitColocated` (`.git` + `.flock` sidecar with mirror refs under `refs/flock/*`).
@@ -75,7 +75,7 @@ Known bugs are tracked in the `## Bugs` section at the bottom of `TODO.md`. Add 
 
 - Rust edition 2024, synchronous (no async/tokio)
 - No external database — all state in JSONL/JSON files under `.flock/`
-- Tree-sitter bindings for JS, JSX, TS, TSX only; other languages use text fallback
+- Tree-sitter bindings for JS, JSX, TS, TSX, Python, Go, Rust, C#; other languages use text fallback
 - Unit tests are inline (`#[cfg(test)]` modules); integration tests in `crates/*/tests/`
 - `fl-semantic/src/lib.rs` contains ~2,400 lines including ~2,100 lines of tests covering symbol extraction, conflict classification, and signature compatibility
 - Events are signed with ed25519 (optional), include Merkle snapshot roots for integrity
