@@ -66,6 +66,13 @@ pub struct StatusReport {
 }
 
 #[derive(Debug, Clone)]
+pub struct FileSummary {
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub deleted: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct MigrateReport {
     pub snapshots_migrated: u32,
     pub blocks_stored: u64,
@@ -151,6 +158,31 @@ pub struct ConflictDetail {
     pub symbol: Option<String>,
     pub classification: String,
     pub explanation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvertReport {
+    pub branches_imported: usize,
+    pub tags_imported: usize,
+    pub commits_imported: usize,
+    pub commits_skipped: usize,
+    pub validation_ok: bool,
+    pub validation_detail: String,
+}
+
+impl std::fmt::Display for ConvertReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "conversion complete: {} commits imported ({} skipped), {} branches, {} tags",
+            self.commits_imported, self.commits_skipped, self.branches_imported, self.tags_imported,
+        )?;
+        if self.validation_ok {
+            write!(f, "validation: OK — {}", self.validation_detail)
+        } else {
+            write!(f, "validation: FAILED — {}", self.validation_detail)
+        }
+    }
 }
 
 fn check_workspace_limits(
@@ -817,6 +849,201 @@ impl Repo {
     ) -> Result<Vec<(String, Vec<SemanticFileDiff>)>> {
         let diffs = self.semantic_diff_from_latest_checkpoint()?;
         Ok(classify_diffs_by_intent(diffs))
+    }
+
+    /// Finds a checkpoint event by exact UUID or UUID prefix.
+    pub fn find_checkpoint_by_prefix(&self, prefix: &str) -> Result<(Event, CheckpointEvent)> {
+        let checkpoints = self.list_checkpoints_with_payload()?;
+        let matches: Vec<_> = checkpoints
+            .into_iter()
+            .filter(|(event, _)| event.id.to_string().starts_with(prefix))
+            .collect();
+        match matches.len() {
+            0 => bail!("no checkpoint matching prefix '{}'", prefix),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            n => bail!(
+                "ambiguous prefix '{}' matches {} checkpoints; use a longer prefix",
+                prefix,
+                n
+            ),
+        }
+    }
+
+    /// Semantic diff between two checkpoints identified by ID/prefix.
+    pub fn semantic_diff_between_checkpoints(
+        &self,
+        from_prefix: &str,
+        to_prefix: &str,
+    ) -> Result<Vec<SemanticFileDiff>> {
+        self.assert_initialized()?;
+
+        let (_, from_payload) = self.find_checkpoint_by_prefix(from_prefix)?;
+        let (_, to_payload) = self.find_checkpoint_by_prefix(to_prefix)?;
+
+        let from_root = self.snapshot_path(from_payload.snapshot_id);
+        let to_root = self.snapshot_path(to_payload.snapshot_id);
+
+        let from_files = collect_source_files(&from_root, false)?;
+        let to_files = collect_source_files(&to_root, false)?;
+
+        let mut all_paths: BTreeSet<PathBuf> = from_files;
+        all_paths.extend(to_files.iter().cloned());
+
+        let mut diffs = Vec::new();
+        for rel_path in &all_paths {
+            let before_path = from_root.join(rel_path);
+            let after_path = to_root.join(rel_path);
+
+            let before = fs::read(&before_path).ok();
+            let after = fs::read(&after_path).ok();
+
+            let diff = semantic_diff(rel_path, before.as_deref(), after.as_deref())?;
+            if let Some(diff) = diff {
+                diffs.push(diff);
+            }
+        }
+
+        let current_files = collect_source_files(&to_root, false)?;
+        enrich_semantic_impacts(&to_root, &current_files, &mut diffs)?;
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(diffs)
+    }
+
+    /// Semantic diff between a specific checkpoint and the working directory.
+    pub fn semantic_diff_checkpoint_vs_working(
+        &self,
+        checkpoint_prefix: &str,
+    ) -> Result<Vec<SemanticFileDiff>> {
+        self.assert_initialized()?;
+
+        let (_, payload) = self.find_checkpoint_by_prefix(checkpoint_prefix)?;
+        let snapshot_root = self.snapshot_path(payload.snapshot_id);
+        let snapshot_files = collect_source_files(&snapshot_root, false)?;
+        let current_files = collect_source_files(self.root(), true)?;
+
+        let mut all_paths: BTreeSet<PathBuf> = snapshot_files;
+        all_paths.extend(current_files.iter().cloned());
+
+        let mut diffs = Vec::new();
+        for rel_path in &all_paths {
+            let before_path = snapshot_root.join(rel_path);
+            let after_path = self.root.join(rel_path);
+
+            let before = fs::read(&before_path).ok();
+            let after = fs::read(&after_path).ok();
+
+            let diff = semantic_diff(rel_path, before.as_deref(), after.as_deref())?;
+            if let Some(diff) = diff {
+                diffs.push(diff);
+            }
+        }
+
+        enrich_semantic_impacts(self.root(), &current_files, &mut diffs)?;
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(diffs)
+    }
+
+    /// Groups semantic changes between two checkpoints by inferred intent.
+    pub fn semantic_diff_between_checkpoints_with_intents(
+        &self,
+        from_prefix: &str,
+        to_prefix: &str,
+    ) -> Result<Vec<(String, Vec<SemanticFileDiff>)>> {
+        let diffs = self.semantic_diff_between_checkpoints(from_prefix, to_prefix)?;
+        Ok(classify_diffs_by_intent(diffs))
+    }
+
+    /// Groups semantic changes from a checkpoint vs working directory by intent.
+    pub fn semantic_diff_checkpoint_vs_working_with_intents(
+        &self,
+        checkpoint_prefix: &str,
+    ) -> Result<Vec<(String, Vec<SemanticFileDiff>)>> {
+        let diffs = self.semantic_diff_checkpoint_vs_working(checkpoint_prefix)?;
+        Ok(classify_diffs_by_intent(diffs))
+    }
+
+    /// Returns a file-level summary of changes between two snapshots.
+    pub fn file_summary_between_checkpoints(
+        &self,
+        from_prefix: &str,
+        to_prefix: &str,
+    ) -> Result<FileSummary> {
+        self.assert_initialized()?;
+        let (_, from_payload) = self.find_checkpoint_by_prefix(from_prefix)?;
+        let (_, to_payload) = self.find_checkpoint_by_prefix(to_prefix)?;
+
+        let from_root = self.snapshot_path(from_payload.snapshot_id);
+        let to_root = self.snapshot_path(to_payload.snapshot_id);
+
+        let from_files = collect_source_files(&from_root, false)?;
+        let to_files = collect_source_files(&to_root, false)?;
+
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut deleted = Vec::new();
+
+        for path in &to_files {
+            if !from_files.contains(path) {
+                added.push(path.display().to_string());
+            } else {
+                let old = fs::read(from_root.join(path)).unwrap_or_default();
+                let new = fs::read(to_root.join(path)).unwrap_or_default();
+                if old != new {
+                    modified.push(path.display().to_string());
+                }
+            }
+        }
+        for path in &from_files {
+            if !to_files.contains(path) {
+                deleted.push(path.display().to_string());
+            }
+        }
+
+        Ok(FileSummary {
+            added,
+            modified,
+            deleted,
+        })
+    }
+
+    /// Returns a file-level summary of changes between a checkpoint and working dir.
+    pub fn file_summary_checkpoint_vs_working(
+        &self,
+        checkpoint_prefix: &str,
+    ) -> Result<FileSummary> {
+        self.assert_initialized()?;
+        let (_, payload) = self.find_checkpoint_by_prefix(checkpoint_prefix)?;
+        let snapshot_root = self.snapshot_path(payload.snapshot_id);
+
+        let snapshot_files = collect_source_files(&snapshot_root, false)?;
+        let current_files = collect_source_files(self.root(), true)?;
+
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut deleted = Vec::new();
+
+        for path in &current_files {
+            if !snapshot_files.contains(path) {
+                added.push(path.display().to_string());
+            } else {
+                let old = fs::read(snapshot_root.join(path)).unwrap_or_default();
+                let new = fs::read(self.root.join(path)).unwrap_or_default();
+                if old != new {
+                    modified.push(path.display().to_string());
+                }
+            }
+        }
+        for path in &snapshot_files {
+            if !current_files.contains(path) {
+                deleted.push(path.display().to_string());
+            }
+        }
+
+        Ok(FileSummary {
+            added,
+            modified,
+            deleted,
+        })
     }
 
     /// Computes transitive impact of a file path within the repository.
@@ -2371,6 +2598,561 @@ impl Repo {
         })
     }
 
+    /// Convert a git repository into Flock format.
+    ///
+    /// Detects `.git/`, initializes `.flock/` in colocated mode, and imports
+    /// commit history for all branches (or filtered by `branch_filter`).
+    /// Tags are imported as Flock Tag refs. The operation is resumable —
+    /// already-imported commits are skipped via `known_git_commit_mappings()`.
+    pub fn convert_from_git(
+        &self,
+        branch_filter: Option<String>,
+        shallow: Option<usize>,
+    ) -> Result<ConvertReport> {
+        // 1. Detect .git/
+        let git_dir = self.root.join(".git");
+        if !git_dir.exists() {
+            bail!(
+                "no .git directory found at {}; nothing to convert",
+                self.root.display()
+            );
+        }
+
+        // 2. Init .flock/ in colocated mode
+        let flock_dir = self.root.join(FLOCK_DIR);
+        if !flock_dir.exists() {
+            self.init_colocated()?;
+            eprintln!("initialized .flock/ in git-colocated mode");
+        }
+
+        // 3. Enumerate branches
+        let branch_output = self
+            .run_git(&[
+                "for-each-ref",
+                "--format=%(refname:short) %(objectname)",
+                "refs/heads/",
+            ])
+            .context("failed to enumerate git branches")?;
+        let mut branches: Vec<(String, String)> = branch_output
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // 4. Enumerate tags
+        let tag_output = self
+            .run_git(&[
+                "for-each-ref",
+                "--format=%(refname:short) %(objectname)",
+                "refs/tags/",
+            ])
+            .context("failed to enumerate git tags")?;
+        let tags: Vec<(String, String)> = tag_output
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // 5. Filter branches if requested
+        if let Some(ref filter) = branch_filter {
+            let allowed: Vec<&str> = filter.split(',').map(str::trim).collect();
+            branches.retain(|(name, _)| allowed.iter().any(|a| a == name));
+        }
+
+        if branches.is_empty() {
+            bail!("no branches found to convert");
+        }
+
+        // Prefer "main" or "master" as first branch
+        let main_idx = branches
+            .iter()
+            .position(|(name, _)| name == "main" || name == "master")
+            .unwrap_or(0);
+        if main_idx != 0 {
+            branches.swap(0, main_idx);
+        }
+
+        let mut known_commits = self.known_git_commit_mappings()?;
+        let mut commits_imported: usize = 0;
+        let mut commits_skipped: usize = 0;
+        let mut branches_imported: usize = 0;
+        // Map git SHA → checkpoint event ID for tag resolution
+        let mut sha_to_checkpoint: HashMap<String, Uuid> = HashMap::new();
+
+        // 6. Import each branch
+        for (branch_name, _tip_sha) in &branches {
+            let mut rev_list_args = vec!["rev-list", "--reverse"];
+            let shallow_arg;
+            if let Some(n) = shallow {
+                shallow_arg = format!("-{n}");
+                rev_list_args.push(&shallow_arg);
+            }
+            rev_list_args.push(branch_name);
+
+            let output = self
+                .run_git(&rev_list_args)
+                .with_context(|| format!("failed to enumerate commits for branch `{branch_name}`"))?;
+            let commits: Vec<String> = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+
+            let total = commits.len();
+            let mut parent_checkpoint = self.latest_checkpoint().map(|event| event.id);
+            let mut branch_had_new_commits = false;
+
+            for (i, commit) in commits.iter().enumerate() {
+                if known_commits.contains(commit) {
+                    // Record the mapping if we already imported this commit
+                    if let Some(existing_id) = self.find_checkpoint_for_git_commit(commit)? {
+                        sha_to_checkpoint.insert(commit.clone(), existing_id);
+                        parent_checkpoint = Some(existing_id);
+                    }
+                    commits_skipped += 1;
+                    continue;
+                }
+
+                eprintln!(
+                    "[{}/{}] Importing commit {} (branch: {branch_name})",
+                    i + 1,
+                    total,
+                    &commit[..commit.len().min(12)]
+                );
+
+                let subject = self.run_git(&["show", "-s", "--format=%s", commit])?;
+                let message = self.run_git(&["show", "-s", "--format=%B", commit])?;
+                let label = normalize_label(subject.trim());
+                let label = if label.is_empty() {
+                    format!("git-import-{}", short_sha(commit))
+                } else {
+                    label
+                };
+                let message = if message.trim().is_empty() {
+                    Some(format!("git import {commit}"))
+                } else {
+                    Some(message.trim().to_string())
+                };
+
+                let event = self.create_checkpoint_from_git_commit(
+                    commit,
+                    label,
+                    message,
+                    parent_checkpoint,
+                )?;
+                sha_to_checkpoint.insert(commit.clone(), event.id);
+                parent_checkpoint = Some(event.id);
+                known_commits.insert(commit.clone());
+                commits_imported += 1;
+                branch_had_new_commits = true;
+            }
+
+            // Create a branch ref pointing to the tip checkpoint
+            if let Some(tip_checkpoint) = parent_checkpoint {
+                let store = RefStore::for_root(self.root());
+                let reference = RepoRef {
+                    kind: RefKind::Branch,
+                    name: branch_name.clone(),
+                    target_event_id: tip_checkpoint,
+                    workspace: None,
+                };
+                store.upsert(reference)?;
+                if branch_had_new_commits || branches_imported == 0 {
+                    branches_imported += 1;
+                }
+            }
+        }
+
+        // 7. Import tags
+        let mut tags_imported: usize = 0;
+        for (tag_name, tag_sha) in &tags {
+            // Dereference annotated tags to the underlying commit
+            let deref_sha = self
+                .run_git(&["rev-parse", &format!("{tag_sha}^{{}}")])
+                .unwrap_or_else(|_| tag_sha.clone());
+            let deref_sha = deref_sha.trim().to_string();
+
+            if let Some(&checkpoint_id) = sha_to_checkpoint.get(&deref_sha) {
+                let store = RefStore::for_root(self.root());
+                let reference = RepoRef {
+                    kind: RefKind::Tag,
+                    name: tag_name.clone(),
+                    target_event_id: checkpoint_id,
+                    workspace: None,
+                };
+                store.upsert(reference)?;
+                tags_imported += 1;
+            }
+        }
+
+        // 8. Validate
+        let (validation_ok, validation_detail) = match self.fsck() {
+            Ok(report) => (
+                true,
+                format!(
+                    "{} events, {} checkpoints, {} snapshots, {} refs",
+                    report.event_count,
+                    report.checkpoint_count,
+                    report.snapshot_count,
+                    report.ref_count,
+                ),
+            ),
+            Err(e) => (false, format!("{e:#}")),
+        };
+
+        Ok(ConvertReport {
+            branches_imported,
+            tags_imported,
+            commits_imported,
+            commits_skipped,
+            validation_ok,
+            validation_detail,
+        })
+    }
+
+    /// Convert a jj repository into Flock format.
+    ///
+    /// Detects `.jj/`, initializes `.flock/`, and imports jj history using
+    /// the git backend that jj maintains under `.jj/repo/store/git/`.
+    pub fn convert_from_jj(&self, shallow: Option<usize>) -> Result<ConvertReport> {
+        let jj_dir = self.root.join(".jj");
+        if !jj_dir.exists() {
+            bail!(
+                "no .jj directory found at {}; nothing to convert",
+                self.root.display()
+            );
+        }
+
+        // jj uses a git backend — check for it
+        let jj_git_dir = jj_dir.join("repo").join("store").join("git");
+        if !jj_git_dir.exists() {
+            bail!(
+                "jj git backend not found at {}; only git-backed jj repos are supported",
+                jj_git_dir.display()
+            );
+        }
+
+        // Init .flock/
+        let flock_dir = self.root.join(FLOCK_DIR);
+        if !flock_dir.exists() {
+            self.init_colocated()?;
+            eprintln!("initialized .flock/ in git-colocated mode");
+        }
+
+        // Use jj log to enumerate commits in topological order
+        let jj_available = Command::new("jj")
+            .arg("--version")
+            .current_dir(&self.root)
+            .output()
+            .is_ok();
+
+        if !jj_available {
+            bail!("jj CLI not found; install jj to convert jj repositories");
+        }
+
+        let output = Command::new("jj")
+            .args([
+                "log",
+                "--no-graph",
+                "-r",
+                "all()",
+                "-T",
+                r#"commit_id ++ " " ++ description.first_line() ++ "\n""#,
+                "--reversed",
+            ])
+            .current_dir(&self.root)
+            .output()
+            .context("failed to run jj log")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            bail!("jj log failed: {stderr}");
+        }
+
+        let log_output = String::from_utf8_lossy(&output.stdout);
+        let mut commits: Vec<(String, String)> = log_output
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
+                if parts.len() == 2 && !parts[0].is_empty() {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else if parts.len() == 1 && !parts[0].is_empty() {
+                    Some((parts[0].to_string(), String::new()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Filter out the root commit (all zeros)
+        commits.retain(|(sha, _)| !sha.chars().all(|c| c == '0'));
+
+        if let Some(n) = shallow {
+            let len = commits.len();
+            if n < len {
+                commits = commits.split_off(len - n);
+            }
+        }
+
+        let total = commits.len();
+        let mut known_commits = self.known_git_commit_mappings()?;
+        let mut parent_checkpoint = self.latest_checkpoint().map(|event| event.id);
+        let mut commits_imported: usize = 0;
+        let mut commits_skipped: usize = 0;
+
+        for (i, (commit_id, description)) in commits.iter().enumerate() {
+            if known_commits.contains(commit_id) {
+                commits_skipped += 1;
+                if let Some(existing_id) = self.find_checkpoint_for_git_commit(commit_id)? {
+                    parent_checkpoint = Some(existing_id);
+                }
+                continue;
+            }
+
+            eprintln!(
+                "[{}/{}] Importing jj commit {}",
+                i + 1,
+                total,
+                &commit_id[..commit_id.len().min(12)]
+            );
+
+            let label = normalize_label(description.trim());
+            let label = if label.is_empty() {
+                format!("jj-import-{}", short_sha(commit_id))
+            } else {
+                label
+            };
+            let message = if description.trim().is_empty() {
+                Some(format!("jj import {commit_id}"))
+            } else {
+                Some(description.trim().to_string())
+            };
+
+            let event = self.create_checkpoint_from_git_commit(
+                commit_id,
+                label,
+                message,
+                parent_checkpoint,
+            )?;
+            parent_checkpoint = Some(event.id);
+            known_commits.insert(commit_id.clone());
+            commits_imported += 1;
+        }
+
+        // Import jj bookmarks as branch refs
+        let mut branches_imported: usize = 0;
+        let bookmark_output = Command::new("jj")
+            .args(["bookmark", "list", "--all", "-T", r#"name ++ " " ++ commit_id ++ "\n""#])
+            .current_dir(&self.root)
+            .output();
+        if let Ok(bm_output) = bookmark_output {
+            if bm_output.status.success() {
+                let bm_text = String::from_utf8_lossy(&bm_output.stdout);
+                for line in bm_text.lines() {
+                    let parts: Vec<&str> = line.trim().splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        let bm_name = parts[0];
+                        let bm_sha = parts[1].trim();
+                        if let Some(checkpoint_id) = self.find_checkpoint_for_git_commit(bm_sha)? {
+                            let store = RefStore::for_root(self.root());
+                            let reference = RepoRef {
+                                kind: RefKind::Branch,
+                                name: format!("jj/{bm_name}"),
+                                target_event_id: checkpoint_id,
+                                workspace: None,
+                            };
+                            store.upsert(reference)?;
+                            branches_imported += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Validate
+        let (validation_ok, validation_detail) = match self.fsck() {
+            Ok(report) => (
+                true,
+                format!(
+                    "{} events, {} checkpoints, {} snapshots, {} refs",
+                    report.event_count,
+                    report.checkpoint_count,
+                    report.snapshot_count,
+                    report.ref_count,
+                ),
+            ),
+            Err(e) => (false, format!("{e:#}")),
+        };
+
+        Ok(ConvertReport {
+            branches_imported,
+            tags_imported: 0,
+            commits_imported,
+            commits_skipped,
+            validation_ok,
+            validation_detail,
+        })
+    }
+
+    /// Export Flock history to a clean git repository.
+    ///
+    /// Creates git commits from checkpoints, maps explorations to branches,
+    /// maps Flock Tag refs to git tags. Optionally removes `.flock/` afterward.
+    pub fn convert_to_git(&self, remove_flock: bool) -> Result<ConvertReport> {
+        self.assert_initialized()?;
+
+        // Check if .git/ exists — if not, init one
+        let git_dir = self.root.join(".git");
+        if !git_dir.exists() {
+            fl_bridge_git::run_git(&self.root, &["init"])
+                .context("failed to initialize git repository for export")?;
+            eprintln!("initialized .git/ for export");
+        }
+
+        // Export checkpoints using existing git_export logic but to the repo itself
+        let checkpoints = self.list_checkpoints_with_payload()?;
+        if checkpoints.is_empty() {
+            bail!("no checkpoints available to export");
+        }
+
+        let temp_repo =
+            tempfile::tempdir().context("failed to create temporary git export directory")?;
+        fl_bridge_git::run_git(temp_repo.path(), &["init"])
+            .context("failed to initialize temporary git repository for export")?;
+
+        let mut mapping: Vec<(Uuid, String)> = Vec::new();
+        for (event, checkpoint) in &checkpoints {
+            clear_directory_except(temp_repo.path(), &[".git"])?;
+            let snapshot_root = self.snapshot_path(checkpoint.snapshot_id);
+            if snapshot_root.exists() {
+                copy_tree(snapshot_root.as_path(), temp_repo.path(), false)?;
+            }
+
+            fl_bridge_git::run_git(temp_repo.path(), &["add", "-A"])
+                .context("failed to stage exported checkpoint contents")?;
+            let message = checkpoint
+                .message
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&checkpoint.label);
+            fl_bridge_git::run_git(
+                temp_repo.path(),
+                &[
+                    "-c",
+                    "user.name=Flock",
+                    "-c",
+                    "user.email=flock@local",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "failed to commit exported checkpoint {} in temporary git repository",
+                    event.id
+                )
+            })?;
+
+            let sha = fl_bridge_git::run_git(temp_repo.path(), &["rev-parse", "HEAD"])
+                .context("failed to resolve exported commit sha")?;
+            mapping.push((event.id, sha.trim().to_string()));
+        }
+
+        // Fetch the exported history into the real repo using a temporary ref,
+        // then update main. Direct fetch into a checked-out branch is forbidden.
+        let source = temp_repo.path().to_string_lossy().to_string();
+        let tmp_ref = "refs/flock/convert-export";
+        let refspec = format!("+HEAD:{tmp_ref}");
+        self.run_git(&["fetch", &source, &refspec])
+            .context("failed to import exported history")?;
+        self.run_git(&["update-ref", "refs/heads/main", tmp_ref])
+            .context("failed to update main branch from exported history")?;
+        let _ = self.run_git(&["update-ref", "-d", tmp_ref]);
+
+        let commits_imported = mapping.len();
+
+        // Map exploration branches
+        let explorations = self.list_explorations()?;
+        let mut branches_imported: usize = 1; // main
+        for exploration in &explorations {
+            if exploration.status == ExplorationStatus::Active
+                || exploration.status == ExplorationStatus::Promoted
+            {
+                if let Some((_, last_sha)) = mapping.last() {
+                    // Create a branch pointing to the exploration's last checkpoint
+                    let branch_name = normalize_label(&exploration.title);
+                    if !branch_name.is_empty() {
+                        let _ = self.run_git(&[
+                            "branch",
+                            "-f",
+                            &branch_name,
+                            last_sha,
+                        ]);
+                        branches_imported += 1;
+                    }
+                }
+            }
+        }
+
+        // Export Flock Tag refs as git tags
+        let refs = RefStore::for_root(self.root()).read_all()?;
+        let mut tags_imported: usize = 0;
+        for r in &refs {
+            if r.kind == RefKind::Tag {
+                // Find the git commit for this tag's target event
+                if let Some((_, sha)) = mapping.iter().find(|(eid, _)| *eid == r.target_event_id) {
+                    let _ = self.run_git(&["tag", "-f", &r.name, sha]);
+                    tags_imported += 1;
+                }
+            }
+        }
+
+        // Validate
+        let (validation_ok, validation_detail) = match self.fsck() {
+            Ok(report) => (
+                true,
+                format!(
+                    "{} events, {} checkpoints exported to git",
+                    report.event_count, report.checkpoint_count,
+                ),
+            ),
+            Err(e) => (false, format!("{e:#}")),
+        };
+
+        // Cleanup
+        if remove_flock {
+            let flock_dir = self.root.join(FLOCK_DIR);
+            if flock_dir.exists() {
+                fs::remove_dir_all(&flock_dir).context("failed to remove .flock/ directory")?;
+                eprintln!("removed .flock/ directory");
+            }
+        }
+
+        Ok(ConvertReport {
+            branches_imported,
+            tags_imported,
+            commits_imported,
+            commits_skipped: 0,
+            validation_ok,
+            validation_detail,
+        })
+    }
+
     /// Scan the working directory for secrets and return an error if any are
     /// found and the config is set to block.
     fn scan_working_directory_for_secrets(&self) -> Result<()> {
@@ -3189,6 +3971,34 @@ impl Repo {
             }
         }
         Ok(commits)
+    }
+
+    /// Find the checkpoint event ID that corresponds to a given git commit SHA.
+    fn find_checkpoint_for_git_commit(&self, git_commit: &str) -> Result<Option<Uuid>> {
+        for event in self.list_events()? {
+            let EventKind::GitBridge(ref bridge) = event.kind else {
+                continue;
+            };
+            if bridge.action != GitBridgeAction::Commit || !bridge.success {
+                continue;
+            }
+            // detail format: "checkpoint=<uuid> git_commit=<sha>"
+            let mut checkpoint_id = None;
+            let mut commit_sha = None;
+            for token in bridge.detail.split_whitespace() {
+                if let Some((key, value)) = token.split_once('=') {
+                    match key {
+                        "checkpoint" => checkpoint_id = Uuid::parse_str(value).ok(),
+                        "git_commit" => commit_sha = Some(value),
+                        _ => {}
+                    }
+                }
+            }
+            if commit_sha == Some(git_commit) {
+                return Ok(checkpoint_id);
+            }
+        }
+        Ok(None)
     }
 
     fn snapshot_path(&self, snapshot_id: Uuid) -> PathBuf {
@@ -7394,5 +8204,230 @@ mod tests {
         // The .log file should not appear in any change lists.
         assert!(!report.modified_files.contains(&"debug.log".to_string()));
         assert!(!report.new_files.contains(&"debug.log".to_string()));
+    }
+
+    /// Helper: create a git repo with N commits and return the temp directory.
+    fn create_git_repo_with_commits(n: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        fl_bridge_git::run_git(p, &["init"]).expect("git init");
+        fl_bridge_git::run_git(p, &["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "--allow-empty", "-m", "initial"]).expect("initial commit");
+        for i in 1..n {
+            let file = p.join(format!("file{i}.txt"));
+            fs::write(&file, format!("content {i}")).unwrap();
+            fl_bridge_git::run_git(p, &["add", "-A"]).unwrap();
+            fl_bridge_git::run_git(p, &["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "-m", &format!("commit {i}")]).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn convert_from_git_basic() {
+        let dir = create_git_repo_with_commits(4);
+        let repo = Repo::at(dir.path());
+        let report = repo.convert_from_git(None, None).expect("convert_from_git");
+        assert!(report.commits_imported >= 4, "expected at least 4 commits, got {}", report.commits_imported);
+        assert!(report.branches_imported >= 1);
+        assert!(report.validation_ok, "validation failed: {}", report.validation_detail);
+    }
+
+    #[test]
+    fn convert_from_git_branches() {
+        let dir = create_git_repo_with_commits(3);
+        let p = dir.path();
+        // Create a second branch with an extra commit
+        fl_bridge_git::run_git(p, &["checkout", "-b", "feature"]).unwrap();
+        let file = p.join("feature.txt");
+        fs::write(&file, "feature content").unwrap();
+        fl_bridge_git::run_git(p, &["add", "-A"]).unwrap();
+        fl_bridge_git::run_git(p, &["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "-m", "feature commit"]).unwrap();
+        fl_bridge_git::run_git(p, &["checkout", "master"]).unwrap_or_else(|_| {
+            fl_bridge_git::run_git(p, &["checkout", "main"]).unwrap()
+        });
+
+        let repo = Repo::at(p);
+        let report = repo.convert_from_git(None, None).expect("convert_from_git");
+        assert!(report.branches_imported >= 2, "expected at least 2 branches, got {}", report.branches_imported);
+        assert!(report.validation_ok);
+    }
+
+    #[test]
+    fn convert_from_git_tags() {
+        let dir = create_git_repo_with_commits(3);
+        let p = dir.path();
+        fl_bridge_git::run_git(p, &["tag", "v1.0"]).unwrap();
+
+        let repo = Repo::at(p);
+        let report = repo.convert_from_git(None, None).expect("convert_from_git");
+        assert_eq!(report.tags_imported, 1, "expected 1 tag imported");
+        assert!(report.validation_ok);
+    }
+
+    #[test]
+    fn convert_from_git_shallow() {
+        let dir = create_git_repo_with_commits(6);
+        let repo = Repo::at(dir.path());
+        let report = repo.convert_from_git(None, Some(3)).expect("convert_from_git shallow");
+        assert_eq!(report.commits_imported, 3, "shallow should import exactly 3 commits");
+        assert!(report.validation_ok);
+    }
+
+    #[test]
+    fn convert_from_git_branch_filter() {
+        let dir = create_git_repo_with_commits(3);
+        let p = dir.path();
+        fl_bridge_git::run_git(p, &["checkout", "-b", "feature"]).unwrap();
+        let file = p.join("feature.txt");
+        fs::write(&file, "feature").unwrap();
+        fl_bridge_git::run_git(p, &["add", "-A"]).unwrap();
+        fl_bridge_git::run_git(p, &["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "-m", "feature"]).unwrap();
+        fl_bridge_git::run_git(p, &["checkout", "master"]).unwrap_or_else(|_| {
+            fl_bridge_git::run_git(p, &["checkout", "main"]).unwrap()
+        });
+
+        let repo = Repo::at(p);
+        let report = repo.convert_from_git(Some("feature".to_string()), None).expect("convert_from_git filtered");
+        assert_eq!(report.branches_imported, 1, "should only import feature branch");
+        assert!(report.validation_ok);
+    }
+
+    #[test]
+    fn convert_from_git_resumable() {
+        let dir = create_git_repo_with_commits(3);
+        let p = dir.path();
+        let repo = Repo::at(p);
+
+        // First import
+        let report1 = repo.convert_from_git(None, None).expect("first convert");
+        let first_count = report1.commits_imported;
+        assert!(first_count >= 3);
+
+        // Add more commits
+        let file = p.join("new.txt");
+        fs::write(&file, "new").unwrap();
+        fl_bridge_git::run_git(p, &["add", "-A"]).unwrap();
+        fl_bridge_git::run_git(p, &["-c", "user.name=Test", "-c", "user.email=test@test", "commit", "-m", "new commit"]).unwrap();
+
+        // Second import — should only import the new commit
+        let report2 = repo.convert_from_git(None, None).expect("second convert");
+        assert_eq!(report2.commits_imported, 1, "resumable should only import 1 new commit");
+        assert!(report2.commits_skipped >= first_count);
+        assert!(report2.validation_ok);
+    }
+
+    #[test]
+    fn convert_to_git_roundtrip() {
+        // Create a flock repo with some checkpoints
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        repo.create_checkpoint(Some("first".to_string())).expect("checkpoint 1");
+
+        fs::write(dir.path().join("world.txt"), "world").unwrap();
+        repo.create_checkpoint(Some("second".to_string())).expect("checkpoint 2");
+
+        // Export to git
+        let report = repo.convert_to_git(false).expect("convert_to_git");
+        assert_eq!(report.commits_imported, 2, "should export 2 checkpoints as commits");
+        assert!(report.validation_ok, "validation failed: {}", report.validation_detail);
+
+        // Verify git history exists
+        let log_output = fl_bridge_git::run_git(dir.path(), &["log", "--oneline"]).expect("git log");
+        assert!(log_output.lines().count() >= 2, "git should have at least 2 commits");
+    }
+
+    #[test]
+    fn checkpoint_to_checkpoint_diff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        let file = dir.path().join("sample.ts");
+        fs::write(&file, "function add(a: number, b: number) { return a + b; }")
+            .expect("write v1");
+        let ev1 = repo.create_checkpoint(Some("v1".to_string())).expect("cp1");
+        let id1 = ev1.id.to_string();
+
+        fs::write(
+            &file,
+            "function add(a: number, b: number) { return a + b; }\nfunction sub(a: number, b: number) { return a - b; }",
+        )
+        .expect("write v2");
+        let ev2 = repo.create_checkpoint(Some("v2".to_string())).expect("cp2");
+        let id2 = ev2.id.to_string();
+
+        // Checkpoint-to-checkpoint diff
+        let diffs = repo
+            .semantic_diff_between_checkpoints(&id1, &id2)
+            .expect("diff between checkpoints");
+        assert_eq!(diffs.len(), 1, "should have 1 file diff");
+        assert!(
+            diffs[0]
+                .changes
+                .iter()
+                .any(|c| c.kind == crate::semantic::SemanticChangeKind::Added
+                    && c.symbol.contains("sub")),
+            "should detect added sub function"
+        );
+
+        // Prefix lookup
+        let prefix = &id1[..8];
+        let diffs2 = repo
+            .semantic_diff_between_checkpoints(prefix, &id2)
+            .expect("diff with prefix");
+        assert_eq!(diffs2.len(), diffs.len());
+
+        // Checkpoint vs working dir
+        fs::write(
+            &file,
+            "function add(a: number, b: number) { return a + b; }\nfunction sub(a: number, b: number) { return a - b; }\nfunction mul(a: number, b: number) { return a * b; }",
+        )
+        .expect("write v3");
+        let diffs3 = repo
+            .semantic_diff_checkpoint_vs_working(&id2)
+            .expect("diff checkpoint vs working");
+        assert!(
+            diffs3[0]
+                .changes
+                .iter()
+                .any(|c| c.kind == crate::semantic::SemanticChangeKind::Added
+                    && c.symbol.contains("mul")),
+            "should detect added mul function"
+        );
+
+        // File summary between checkpoints
+        let summary = repo
+            .file_summary_between_checkpoints(&id1, &id2)
+            .expect("file summary");
+        assert!(
+            summary.modified.iter().any(|f| f.contains("sample.ts")),
+            "sample.ts should appear as modified"
+        );
+
+        // File summary checkpoint vs working
+        let summary2 = repo
+            .file_summary_checkpoint_vs_working(&id2)
+            .expect("file summary vs working");
+        assert!(
+            summary2.modified.iter().any(|f| f.contains("sample.ts")),
+            "sample.ts should appear as modified vs working"
+        );
+    }
+
+    #[test]
+    fn checkpoint_prefix_ambiguous_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Non-existent prefix should error
+        let err = repo.find_checkpoint_by_prefix("nonexistent");
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err().to_string().contains("no checkpoint matching"),
+            "should report no matching checkpoint"
+        );
     }
 }

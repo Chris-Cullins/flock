@@ -14,7 +14,7 @@ pub use event::{
 pub use fl_storage::ApiCallRecord;
 pub use fl_storage::{RefKind, RepoRef, WorkspaceRefConfig};
 pub use repo::{
-    ConflictDetail, ConflictStatus, ConflictSummary, DecisionSummary, ExplorationStatus,
+    ConflictDetail, ConflictStatus, ConflictSummary, ConvertReport, DecisionSummary, ExplorationStatus, FileSummary,
     ExplorationSummary, FsckReport, GateConditionKind, GatePolicyKind, GateStatus, GateSummary,
     ImpactReport, LockStatus, LockSummary, PresenceSummary, ProvenanceInfo, RebaseResult, StatusReport,
     RebaseSummary, ReplayedState, Repo, ResourceUsageTotals, ReviewStats, ReviewSummary,

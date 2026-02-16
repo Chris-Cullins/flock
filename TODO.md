@@ -64,15 +64,15 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Implement git import and export commands
 - [x] Implement shadow mode safety checks and recovery docs
 - [x] Define jj import design and metadata mapping
-- [ ] Add `fl convert` one-command repo conversion workflow:
-  - [ ] `fl convert --from git` — detect `.git/`, init `.flock/`, import full git history (all branches/tags), set up colocated mode
-  - [ ] `fl convert --from jj` — detect `.jj/`, init `.flock/`, import jj history preserving change IDs and operation log
-  - [ ] Progress reporting for large repos (180k+ commits)
-  - [ ] Incremental/resumable conversion (don't restart from scratch if interrupted)
-  - [ ] Post-conversion validation (`fl fsck` + compare checkout against original)
-  - [ ] `--branch` filter to convert only specific branches
-  - [ ] `--shallow` option to import only recent history (last N commits) for quick onboarding
-  - [ ] `fl convert --to git` — export full flock history back to a clean `.git/` repo (checkpoints → commits, explorations → branches, tags preserved), then optionally remove `.flock/`
+- [x] Add `fl convert` one-command repo conversion workflow:
+  - [x] `fl convert --from git` — detect `.git/`, init `.flock/`, import full git history (all branches/tags), set up colocated mode
+  - [x] `fl convert --from jj` — detect `.jj/`, init `.flock/`, import jj history preserving change IDs and operation log
+  - [x] Progress reporting for large repos (180k+ commits)
+  - [x] Incremental/resumable conversion (don't restart from scratch if interrupted)
+  - [x] Post-conversion validation (`fl fsck` + compare checkout against original)
+  - [x] `--branch` filter to convert only specific branches
+  - [x] `--shallow` option to import only recent history (last N commits) for quick onboarding
+  - [x] `fl convert --to git` — export full flock history back to a clean `.git/` repo (checkpoints → commits, explorations → branches, tags preserved), then optionally remove `.flock/`
 
 ## 3. Semantic Layer (TS/JS First)
 
@@ -105,6 +105,11 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [x] `fl review --full` line diff fallback
 - [x] Add TUI views for exploration trees and task graph
 - [x] Add shell completion and command help polish
+- [x] Add checkpoint-to-checkpoint diff:
+  - [x] `fl diff <checkpoint-a> <checkpoint-b>` — compare two checkpoints by ID/prefix
+  - [x] `fl diff <checkpoint>` — compare a specific checkpoint against the working directory
+  - [x] Support `--semantic`, `--intent`, and `--json` flags for checkpoint-to-checkpoint diff
+  - [x] Show file-level summary (added/modified/deleted) and semantic-level changes
 
 ## 5. Explorations and Workspaces
 
@@ -213,7 +218,7 @@ Critical for repos at scale (millions of LOC, hundreds of thousands of events). 
 
 Flock's own remote hosting — no dependency on GitHub/GitLab. Replaces the traditional forge model with semantic-aware collaboration.
 
-### 10a. Core Transport
+### 10a. Core Transport - THIS WILL BE ROOST, AT ../roost. DONT IMPLEMENT JUST YET.
 - [ ] Define remote repository URL scheme and discovery (`fl remote add origin flock://host/repo`)
 - [ ] Implement event sync protocol — client sends events after last-known server event ID, server responds with events client is missing
 - [ ] Implement snapshot/blob transport — upload/download content blocks over HTTPS

@@ -54,7 +54,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show semantic diff since last checkpoint
+    /// Show semantic diff between checkpoints or against working directory
     Diff {
         /// Enable semantic diff output
         #[arg(long)]
@@ -65,6 +65,12 @@ enum Command {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// First checkpoint ID/prefix (compare against working dir if only one given)
+        #[arg(name = "FROM")]
+        from: Option<String>,
+        /// Second checkpoint ID/prefix (compare FROM..TO)
+        #[arg(name = "TO")]
+        to: Option<String>,
     },
     /// Analyze impact of changes to a path or symbol
     Impact {
@@ -220,10 +226,40 @@ enum Command {
         #[arg(long, default_value = "180d")]
         older_than: String,
     },
+    /// Convert a repository to/from Flock format
+    Convert {
+        #[command(subcommand)]
+        command: ConvertCommand,
+    },
     /// Generate shell completions for bash, zsh, fish, or powershell
     Completions {
         /// Shell to generate completions for
         shell: Shell,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConvertCommand {
+    /// Convert from git repository to Flock
+    FromGit {
+        /// Only convert specific branches (comma-separated)
+        #[arg(long)]
+        branch: Option<String>,
+        /// Only import last N commits per branch (shallow)
+        #[arg(long)]
+        shallow: Option<usize>,
+    },
+    /// Convert from jj repository to Flock
+    FromJj {
+        /// Only import last N commits (shallow)
+        #[arg(long)]
+        shallow: Option<usize>,
+    },
+    /// Export Flock history to a clean git repository
+    ToGit {
+        /// Remove .flock/ directory after successful export
+        #[arg(long)]
+        remove_flock: bool,
     },
 }
 
@@ -809,77 +845,67 @@ fn main() -> Result<()> {
             semantic,
             intent,
             json,
+            from,
+            to,
         } => {
-            if intent {
-                // --intent implies --semantic
-                let repo = Repo::discover(cwd)?;
-                let groups = repo.semantic_diff_with_intents()?;
-                if groups.is_empty() {
-                    if json {
-                        println!("[]");
+            let repo = Repo::discover(cwd)?;
+
+            // Determine diff mode based on positional args
+            match (from.as_deref(), to.as_deref()) {
+                // fl diff <from> <to> — checkpoint-to-checkpoint diff
+                (Some(from_prefix), Some(to_prefix)) => {
+                    if intent {
+                        let groups = repo.semantic_diff_between_checkpoints_with_intents(
+                            from_prefix,
+                            to_prefix,
+                        )?;
+                        print_intent_diff(&groups, json)?;
+                    } else if semantic {
+                        let diffs =
+                            repo.semantic_diff_between_checkpoints(from_prefix, to_prefix)?;
+                        print_semantic_diffs(&diffs, json)?;
                     } else {
-                        println!("No semantic changes since last checkpoint.");
+                        // File-level summary + semantic changes
+                        let summary =
+                            repo.file_summary_between_checkpoints(from_prefix, to_prefix)?;
+                        let diffs =
+                            repo.semantic_diff_between_checkpoints(from_prefix, to_prefix)?;
+                        print_full_diff_summary(&summary, &diffs, json)?;
                     }
-                    return Ok(());
                 }
-
-                if json {
-                    let json_groups: Vec<serde_json::Value> = groups
-                        .iter()
-                        .map(|(intent, files)| {
-                            serde_json::json!({
-                                "intent": intent,
-                                "files": serde_json::to_value(files).unwrap_or_default(),
-                            })
-                        })
-                        .collect();
-                    println!("{}", serde_json::to_string_pretty(&json_groups)?);
-                    return Ok(());
+                // fl diff <checkpoint> — checkpoint vs working directory
+                (Some(checkpoint_prefix), None) => {
+                    if intent {
+                        let groups = repo
+                            .semantic_diff_checkpoint_vs_working_with_intents(checkpoint_prefix)?;
+                        print_intent_diff(&groups, json)?;
+                    } else if semantic {
+                        let diffs =
+                            repo.semantic_diff_checkpoint_vs_working(checkpoint_prefix)?;
+                        print_semantic_diffs(&diffs, json)?;
+                    } else {
+                        let summary =
+                            repo.file_summary_checkpoint_vs_working(checkpoint_prefix)?;
+                        let diffs =
+                            repo.semantic_diff_checkpoint_vs_working(checkpoint_prefix)?;
+                        print_full_diff_summary(&summary, &diffs, json)?;
+                    }
                 }
-
-                for (intent_label, files) in &groups {
-                    let total_changes: usize = files.iter().map(|f| f.changes.len()).sum();
-                    println!(
-                        "## {} ({} file{}, {} change{})",
-                        intent_label,
-                        files.len(),
-                        if files.len() == 1 { "" } else { "s" },
-                        total_changes,
-                        if total_changes == 1 { "" } else { "s" }
-                    );
-                    for diff in files {
-                        println!("  {} [{}]", diff.path, diff.language);
-                        for change in &diff.changes {
-                            let marker = change_marker(change.kind);
-                            let risk = risk_label(change.risk);
-                            println!("    {} [{}] {}", marker, risk, change.symbol);
+                // fl diff — latest checkpoint vs working directory (existing behavior)
+                (None, None) => {
+                    if intent {
+                        let groups = repo.semantic_diff_with_intents()?;
+                        print_intent_diff(&groups, json)?;
+                    } else {
+                        if !semantic {
+                            bail!("only `fl diff --semantic` or `fl diff --intent` is implemented;\nor use `fl diff <checkpoint-id>` to diff a specific checkpoint");
                         }
+                        let diffs = repo.semantic_diff_from_latest_checkpoint()?;
+                        print_semantic_diffs(&diffs, json)?;
                     }
-                    println!();
                 }
-            } else {
-                if !semantic {
-                    bail!("only `fl diff --semantic` or `fl diff --intent` is implemented");
-                }
-
-                let repo = Repo::discover(cwd)?;
-                let diffs = repo.semantic_diff_from_latest_checkpoint()?;
-                if diffs.is_empty() {
-                    if json {
-                        println!("[]");
-                    } else {
-                        println!("No semantic changes since last checkpoint.");
-                    }
-                    return Ok(());
-                }
-
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&diffs)?);
-                    return Ok(());
-                }
-
-                for diff in diffs {
-                    print_semantic_file_diff(&diff);
+                (None, Some(_)) => {
+                    bail!("cannot specify TO without FROM; use `fl diff <from> <to>`");
                 }
             }
         }
@@ -2412,6 +2438,23 @@ fn main() -> Result<()> {
                 report.total_events, report.retained_events, report.archived_events
             );
         }
+        Command::Convert { command } => match command {
+            ConvertCommand::FromGit { branch, shallow } => {
+                let repo = Repo::at(&cwd);
+                let report = repo.convert_from_git(branch, shallow)?;
+                println!("{report}");
+            }
+            ConvertCommand::FromJj { shallow } => {
+                let repo = Repo::at(&cwd);
+                let report = repo.convert_from_jj(shallow)?;
+                println!("{report}");
+            }
+            ConvertCommand::ToGit { remove_flock } => {
+                let repo = Repo::discover(&cwd)?;
+                let report = repo.convert_to_git(remove_flock)?;
+                println!("{report}");
+            }
+        },
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "fl", &mut io::stdout());
@@ -2484,6 +2527,129 @@ fn print_semantic_file_diff(diff: &fl_core::SemanticFileDiff) {
     if diff.parse_fallback {
         println!("  ! parser fallback used");
     }
+}
+
+fn print_semantic_diffs(
+    diffs: &[fl_core::SemanticFileDiff],
+    json: bool,
+) -> Result<()> {
+    if diffs.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No semantic changes.");
+        }
+        return Ok(());
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diffs)?);
+        return Ok(());
+    }
+    for diff in diffs {
+        print_semantic_file_diff(diff);
+    }
+    Ok(())
+}
+
+fn print_intent_diff(
+    groups: &[(String, Vec<fl_core::SemanticFileDiff>)],
+    json: bool,
+) -> Result<()> {
+    if groups.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No semantic changes.");
+        }
+        return Ok(());
+    }
+    if json {
+        let json_groups: Vec<serde_json::Value> = groups
+            .iter()
+            .map(|(intent, files)| {
+                serde_json::json!({
+                    "intent": intent,
+                    "files": serde_json::to_value(files).unwrap_or_default(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_groups)?);
+        return Ok(());
+    }
+    for (intent_label, files) in groups {
+        let total_changes: usize = files.iter().map(|f| f.changes.len()).sum();
+        println!(
+            "## {} ({} file{}, {} change{})",
+            intent_label,
+            files.len(),
+            if files.len() == 1 { "" } else { "s" },
+            total_changes,
+            if total_changes == 1 { "" } else { "s" }
+        );
+        for diff in files {
+            println!("  {} [{}]", diff.path, diff.language);
+            for change in &diff.changes {
+                let marker = change_marker(change.kind);
+                let risk = risk_label(change.risk);
+                println!("    {} [{}] {}", marker, risk, change.symbol);
+            }
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn print_full_diff_summary(
+    summary: &fl_core::repo::FileSummary,
+    diffs: &[fl_core::SemanticFileDiff],
+    json: bool,
+) -> Result<()> {
+    if json {
+        let output = serde_json::json!({
+            "files": {
+                "added": summary.added,
+                "modified": summary.modified,
+                "deleted": summary.deleted,
+            },
+            "semantic_changes": diffs,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    // File-level summary
+    let total = summary.added.len() + summary.modified.len() + summary.deleted.len();
+    if total == 0 && diffs.is_empty() {
+        println!("No changes.");
+        return Ok(());
+    }
+
+    println!("=== File Summary ===");
+    for f in &summary.added {
+        println!("  + {}", f);
+    }
+    for f in &summary.modified {
+        println!("  ~ {}", f);
+    }
+    for f in &summary.deleted {
+        println!("  - {}", f);
+    }
+    println!(
+        "{} added, {} modified, {} deleted\n",
+        summary.added.len(),
+        summary.modified.len(),
+        summary.deleted.len()
+    );
+
+    // Semantic changes
+    if !diffs.is_empty() {
+        println!("=== Semantic Changes ===");
+        for diff in diffs {
+            print_semantic_file_diff(diff);
+        }
+    }
+
+    Ok(())
 }
 
 fn build_undo_request(
