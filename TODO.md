@@ -237,6 +237,13 @@ Layer on top of the remote server via websocket event streaming. See `docs/remot
 - [ ] Continuous review — review semantic changes as they land instead of batch-reviewing a finished PR; approve individual semantic units incrementally
 - [ ] Conflict forecast — server predicts likely conflicts based on active explorations' semantic change sets and warns before they happen
 - [ ] Editor plugin protocol — define LSP-like protocol for editors to consume ghost text, presence, and heads-up warnings
+- [ ] Real-time task sync across connected repos:
+  - [ ] Task events (create, claim, done, fail) broadcast instantly to all connected clients via websocket
+  - [ ] `fl task list` / `fl ready` reflect remote state in real time (no poll/pull needed)
+  - [ ] Agent claims a task → all other agents see it claimed instantly, pick next available
+  - [ ] Task dependency resolution propagates live (task done → blocked tasks unblock across all clients)
+  - [ ] Cross-repo task visibility — tasks in repo A can reference/block tasks in repo B
+  - [ ] Dashboard view of all agent activity across all connected repos (who's working on what, task throughput, queue depth)
 
 ## 11. Intelligence Layer
 
