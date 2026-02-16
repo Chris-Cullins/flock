@@ -4053,7 +4053,50 @@ impl Repo {
         };
         self.sign_event(&mut event)?;
         AutoEventLog::for_root(self.root()).append(&event)?;
+
+        // Auto-materialize state at regular intervals for faster future replay
+        self.maybe_auto_materialize();
+
         Ok(event)
+    }
+
+    /// Number of events between automatic materialized state snapshots.
+    const AUTO_MATERIALIZE_INTERVAL: usize = 1_000;
+
+    /// Check if the event count just crossed an interval boundary and
+    /// snapshot the replayed state if so. Errors are silently ignored
+    /// since materialization is an optimization, not a correctness requirement.
+    fn maybe_auto_materialize(&self) {
+        let events = match self.list_events() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let count = events.len();
+        if count == 0 || count % Self::AUTO_MATERIALIZE_INTERVAL != 0 {
+            return;
+        }
+
+        // Check if we already have a snapshot at this count
+        let store = MaterializedStateStore::for_root(self.root());
+        if let Ok(Some((latest, _))) = store.load_latest() {
+            if latest >= count {
+                return;
+            }
+        }
+
+        // Replay state (using incremental replay if a prior snapshot exists)
+        let state = match self.replay_state() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let json = match serde_json::to_string(&state) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+
+        let _ = store.save(count, &json);
     }
 
     fn latest_event_id(&self) -> Result<Option<Uuid>> {
@@ -9936,5 +9979,183 @@ mod tests {
 
         let p = super::normalize_path(std::path::Path::new("a/./b/c"));
         assert_eq!(p, std::path::PathBuf::from("a/b/c"));
+    }
+
+    #[test]
+    fn auto_materialize_triggers_at_interval() {
+        use fl_storage::MaterializedStateStore;
+
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        // Write legacy (unsigned, no schema wrapper) events directly to the
+        // event log file so we can cheaply reach the 1,000-event threshold.
+        let log_path = dir
+            .path()
+            .join(fl_storage::FLOCK_DIR)
+            .join("event-log/events.jsonl");
+
+        let mut lines = String::new();
+        let mut parent: Option<Uuid> = None;
+        for i in 0..Repo::AUTO_MATERIALIZE_INTERVAL {
+            let id = Uuid::from_u128(i as u128 + 1);
+            let event = Event {
+                id,
+                timestamp: format!("170000000000000{}", i),
+                actor: "tester".to_string(),
+                parent_id: parent,
+                signer_public_key: None,
+                signature: None,
+                prev_event_hash: None,
+                kind: EventKind::Session(crate::event::SessionEvent {
+                    session_id: id,
+                    action: crate::event::SessionAction::Start,
+                    agent: "bot".to_string(),
+                    initiator: None,
+                    task_description: Some("t".to_string()),
+                    exploration_id: None,
+                    result: None,
+                }),
+            };
+            lines.push_str(&serde_json::to_string(&event).unwrap());
+            lines.push('\n');
+            parent = Some(id);
+        }
+        fs::write(&log_path, &lines).expect("write legacy events");
+
+        // Verify no materialized state exists yet
+        let store = MaterializedStateStore::for_root(dir.path());
+        assert!(
+            store.load_latest().unwrap().is_none(),
+            "no materialized state should exist before auto-materialize"
+        );
+
+        // Call maybe_auto_materialize — event count is exactly at the interval
+        repo.maybe_auto_materialize();
+
+        // Verify materialized state was created at the interval boundary
+        let (count, json) = store
+            .load_latest()
+            .unwrap()
+            .expect("materialized state should exist after auto-materialize");
+        assert_eq!(count, Repo::AUTO_MATERIALIZE_INTERVAL);
+        assert!(!json.is_empty());
+
+        // Verify the materialized state deserializes correctly
+        let state: fl_workflow::ReplayedState =
+            serde_json::from_str(&json).expect("materialized state should be valid JSON");
+        assert_eq!(
+            state.applied_event_ids.len(),
+            Repo::AUTO_MATERIALIZE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn auto_materialize_skips_non_boundary() {
+        use fl_storage::MaterializedStateStore;
+
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        // Write fewer events than the interval
+        let log_path = dir
+            .path()
+            .join(fl_storage::FLOCK_DIR)
+            .join("event-log/events.jsonl");
+
+        let mut lines = String::new();
+        let mut parent: Option<Uuid> = None;
+        for i in 0..50u128 {
+            let id = Uuid::from_u128(i + 1);
+            let event = Event {
+                id,
+                timestamp: format!("170000000000000{}", i),
+                actor: "tester".to_string(),
+                parent_id: parent,
+                signer_public_key: None,
+                signature: None,
+                prev_event_hash: None,
+                kind: EventKind::Session(crate::event::SessionEvent {
+                    session_id: id,
+                    action: crate::event::SessionAction::Start,
+                    agent: "bot".to_string(),
+                    initiator: None,
+                    task_description: Some("t".to_string()),
+                    exploration_id: None,
+                    result: None,
+                }),
+            };
+            lines.push_str(&serde_json::to_string(&event).unwrap());
+            lines.push('\n');
+            parent = Some(id);
+        }
+        fs::write(&log_path, &lines).expect("write legacy events");
+
+        // Call maybe_auto_materialize — count (50) is not at an interval
+        repo.maybe_auto_materialize();
+
+        // Verify no materialized state was created
+        let store = MaterializedStateStore::for_root(dir.path());
+        assert!(
+            store.load_latest().unwrap().is_none(),
+            "no materialized state should exist at non-boundary count"
+        );
+    }
+
+    #[test]
+    fn auto_materialize_skips_if_already_exists() {
+        use fl_storage::MaterializedStateStore;
+
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        // Write exactly 1,000 events
+        let log_path = dir
+            .path()
+            .join(fl_storage::FLOCK_DIR)
+            .join("event-log/events.jsonl");
+
+        let mut lines = String::new();
+        let mut parent: Option<Uuid> = None;
+        for i in 0..Repo::AUTO_MATERIALIZE_INTERVAL {
+            let id = Uuid::from_u128(i as u128 + 1);
+            let event = Event {
+                id,
+                timestamp: format!("170000000000000{}", i),
+                actor: "tester".to_string(),
+                parent_id: parent,
+                signer_public_key: None,
+                signature: None,
+                prev_event_hash: None,
+                kind: EventKind::Session(crate::event::SessionEvent {
+                    session_id: id,
+                    action: crate::event::SessionAction::Start,
+                    agent: "bot".to_string(),
+                    initiator: None,
+                    task_description: Some("t".to_string()),
+                    exploration_id: None,
+                    result: None,
+                }),
+            };
+            lines.push_str(&serde_json::to_string(&event).unwrap());
+            lines.push('\n');
+            parent = Some(id);
+        }
+        fs::write(&log_path, &lines).expect("write legacy events");
+
+        // Pre-populate materialized state at this count
+        let store = MaterializedStateStore::for_root(dir.path());
+        store.save(Repo::AUTO_MATERIALIZE_INTERVAL, r#"{"pre-existing": true}"#).unwrap();
+
+        // Call maybe_auto_materialize — should skip since snapshot exists
+        repo.maybe_auto_materialize();
+
+        // Verify the pre-existing state wasn't overwritten
+        let (count, json) = store.load_latest().unwrap().unwrap();
+        assert_eq!(count, Repo::AUTO_MATERIALIZE_INTERVAL);
+        assert!(json.contains("pre-existing"), "existing snapshot should not be overwritten");
     }
 }

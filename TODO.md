@@ -349,7 +349,7 @@ Make the optimized storage paths the defaults so large repos and teams work out 
 
 - [x] Auto-migrate to segmented storage — detect when the event log or refs file crosses a size threshold and transparently upgrade to segmented event log / per-ref files without manual `fl migrate`
 - [x] Add filesystem-level locking (`flock(2)` / lockfiles) around event log appends and ref writes to prevent corruption from concurrent writers
-- [ ] Auto-checkpoint materialized state — periodically snapshot replayed state (e.g. every 1,000 events) so event replay stays O(recent) instead of O(all)
+- [x] Auto-checkpoint materialized state — periodically snapshot replayed state (e.g. every 1,000 events) so event replay stays O(recent) instead of O(all)
 - [ ] Streaming semantic analysis — add size limits / chunked parsing for files >1MB to avoid loading entire large files into memory for tree-sitter parsing
 - [ ] Evaluate a server coordination component for team-scale use — file-based advisory locks have a ceiling; consider CRDTs or a lightweight Roost-mediated lock/presence protocol for 10+ concurrent writers
 
