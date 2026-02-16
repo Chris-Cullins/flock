@@ -149,6 +149,12 @@ pub struct EventPullRequest {
     pub last_known_event: Option<Uuid>,
     /// Optional branch filter.
     pub branch: Option<String>,
+    /// Shallow clone: max number of checkpoint events to fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    /// Sparse clone: only fetch blocks for files matching these glob patterns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +275,21 @@ pub struct SshAuthVerifyResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Block fault (on-demand lazy fetch)
+// ---------------------------------------------------------------------------
+
+/// Request blocks that weren't fetched during initial clone (lazy mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockFaultRequest {
+    pub block_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockFaultResponse {
+    pub blocks: Vec<BlockPayload>,
+}
+
+// ---------------------------------------------------------------------------
 // Push / Pull report types (returned by Repo methods)
 // ---------------------------------------------------------------------------
 
@@ -287,6 +308,15 @@ pub struct PullReport {
     pub events_pulled: usize,
     pub blocks_downloaded: usize,
     pub refs_updated: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloneReport {
+    pub pull: PullReport,
+    pub clone_dir: String,
+    pub depth: Option<usize>,
+    pub sparse_patterns: Vec<String>,
+    pub lazy: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +382,50 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: EventPushRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.last_known_remote_event, req.last_known_remote_event);
+    }
+
+    #[test]
+    fn serde_pull_request_with_depth_and_sparse() {
+        let req = EventPullRequest {
+            last_known_event: None,
+            branch: Some("main".to_string()),
+            depth: Some(10),
+            sparse_paths: Some(vec!["src/**".to_string()]),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: EventPullRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.depth, Some(10));
+        assert_eq!(decoded.sparse_paths, Some(vec!["src/**".to_string()]));
+    }
+
+    #[test]
+    fn serde_pull_request_backward_compat() {
+        // Old format without depth/sparse should still deserialize
+        let json = r#"{"last_known_event":null,"branch":null}"#;
+        let decoded: EventPullRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.depth, None);
+        assert_eq!(decoded.sparse_paths, None);
+    }
+
+    #[test]
+    fn serde_block_fault_round_trip() {
+        let req = BlockFaultRequest {
+            block_hashes: vec!["abc123".to_string(), "def456".to_string()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: BlockFaultRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.block_hashes, req.block_hashes);
+
+        let resp = BlockFaultResponse {
+            blocks: vec![BlockPayload {
+                hash: "abc123".to_string(),
+                data_base64: "aGVsbG8=".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: BlockFaultResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.blocks.len(), 1);
+        assert_eq!(decoded.blocks[0].hash, "abc123");
     }
 
     #[test]

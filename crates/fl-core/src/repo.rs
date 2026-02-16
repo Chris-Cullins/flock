@@ -5996,6 +5996,87 @@ impl Repo {
     /// Pull events and content from a roost.
     pub fn pull(&self, roost_name: &str, branch: Option<&str>) -> Result<fl_storage::PullReport> {
         self.assert_initialized()?;
+        let config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost(&config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        // Delegate to pull_with_options with defaults from roost config.
+        let sparse = entry.sparse_patterns.clone();
+        let depth = entry.clone_depth;
+        let lazy = entry.lazy;
+
+        self.pull_with_options(roost_name, branch, depth, &sparse, lazy)
+    }
+
+    /// Clone a remote repository to a local directory.
+    ///
+    /// This is a static method — it creates the target directory, initializes
+    /// a Flock repo, adds the roost, and pulls with the given options.
+    pub fn clone_from(
+        url: &str,
+        dir: &Path,
+        depth: Option<usize>,
+        sparse_patterns: Vec<String>,
+        lazy: bool,
+        focus_target: Option<&str>,
+    ) -> Result<fl_storage::CloneReport> {
+        // Parse URL to validate.
+        fl_storage::RemoteUrl::parse(url)?;
+
+        // Create the target directory and initialize.
+        fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create clone directory {}", dir.display()))?;
+
+        let repo = Repo::at(dir);
+        repo.init()?;
+        repo.roost_add("origin", url)?;
+
+        // Compute sparse patterns from focus target if specified.
+        let final_sparse = if let Some(target) = focus_target {
+            let mut patterns = repo.focus_clone_patterns(url, target)?;
+            // Merge with any explicit sparse patterns.
+            for p in &sparse_patterns {
+                if !patterns.contains(p) {
+                    patterns.push(p.clone());
+                }
+            }
+            patterns
+        } else {
+            sparse_patterns.clone()
+        };
+
+        // Store clone config in roost entry.
+        {
+            let mut config = fl_storage::load_roosts(repo.root())?;
+            let entry = fl_storage::find_roost_mut(&mut config, "origin").unwrap();
+            entry.clone_depth = depth;
+            entry.sparse_patterns = final_sparse.clone();
+            entry.lazy = lazy;
+            fl_storage::save_roosts(repo.root(), &config)?;
+        }
+
+        // Pull with options.
+        let pull_report = repo.pull_with_options("origin", None, depth, &final_sparse, lazy)?;
+
+        Ok(fl_storage::CloneReport {
+            pull: pull_report,
+            clone_dir: dir.to_string_lossy().to_string(),
+            depth,
+            sparse_patterns: final_sparse,
+            lazy,
+        })
+    }
+
+    /// Pull events and content with partial clone options.
+    pub fn pull_with_options(
+        &self,
+        roost_name: &str,
+        branch: Option<&str>,
+        depth: Option<usize>,
+        sparse_patterns: &[String],
+        lazy: bool,
+    ) -> Result<fl_storage::PullReport> {
+        self.assert_initialized()?;
         let mut config = fl_storage::load_roosts(self.root())?;
         let entry = fl_storage::find_roost_mut(&mut config, roost_name)
             .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
@@ -6004,9 +6085,17 @@ impl Repo {
         let resolved_token = fl_storage::resolve_token(entry.token.as_deref(), url.host.as_deref())?;
         let transport = crate::remote::transport_for_url(&url, resolved_token.as_deref())?;
 
+        let sparse = if sparse_patterns.is_empty() {
+            None
+        } else {
+            Some(sparse_patterns.to_vec())
+        };
+
         let resp = transport.pull_events(&fl_storage::EventPullRequest {
             last_known_event: entry.last_synced_event,
             branch: branch.map(String::from),
+            depth,
+            sparse_paths: sparse,
         })?;
 
         if resp.events.is_empty() {
@@ -6020,7 +6109,7 @@ impl Repo {
 
         let events_pulled = resp.events.len();
 
-        // Download missing snapshots.
+        // Download missing snapshots (unless lazy).
         let mut blocks_downloaded = 0;
         let snapshot_ids: Vec<Uuid> = resp
             .events
@@ -6034,26 +6123,43 @@ impl Repo {
             })
             .collect();
 
-        for snap_id in &snapshot_ids {
-            let snap_dir = self.root.join(SNAPSHOT_DIR).join(snap_id.to_string());
-            if !snap_dir.exists() {
-                match transport.download_snapshot(*snap_id) {
-                    Ok(data) => {
-                        fs::create_dir_all(&snap_dir)?;
-                        let cursor = std::io::Cursor::new(data);
-                        let mut archive = tar::Archive::new(cursor);
-                        archive.unpack(&snap_dir)?;
-                        blocks_downloaded += 1;
-                    }
-                    Err(_) => {
-                        // Snapshot may not exist on remote (e.g., native mode).
+        if !lazy {
+            for snap_id in &snapshot_ids {
+                let snap_dir = self.root.join(SNAPSHOT_DIR).join(snap_id.to_string());
+                if !snap_dir.exists() {
+                    match transport.download_snapshot(*snap_id) {
+                        Ok(data) => {
+                            fs::create_dir_all(&snap_dir)?;
+                            let cursor = Cursor::new(data);
+                            let mut archive = tar::Archive::new(cursor);
+                            archive.unpack(&snap_dir)?;
+                            blocks_downloaded += 1;
+
+                            // If sparse, remove files not matching patterns.
+                            if !sparse_patterns.is_empty() {
+                                self.apply_sparse_filter(&snap_dir, sparse_patterns)?;
+                            }
+                        }
+                        Err(_) => {
+                            // Snapshot may not exist on remote (native mode).
+                        }
                     }
                 }
             }
         }
 
-        // Append pulled events to our log.
-        fl_storage::EventLog::for_root(self.root()).append_batch(&resp.events)?;
+        // Re-sign any graft events (those with cleared signatures from
+        // shallow clone depth truncation) using our local signing key.
+        let mut events_to_append = resp.events.clone();
+        for event in &mut events_to_append {
+            if event.signature.is_none() && event.signer_public_key.is_none() {
+                // Graft event — re-sign with our key.
+                self.sign_event(event)?;
+            }
+        }
+
+        // Append pulled events.
+        fl_storage::EventLog::for_root(self.root()).append_batch(&events_to_append)?;
 
         // Update refs from remote.
         let ref_store = RefStore::for_root(self.root());
@@ -6084,6 +6190,336 @@ impl Repo {
             blocks_downloaded,
             refs_updated,
         })
+    }
+
+    /// Apply sparse filter — remove files from a snapshot directory that don't
+    /// match any of the given glob patterns.
+    fn apply_sparse_filter(&self, snap_dir: &Path, patterns: &[String]) -> Result<()> {
+        let compiled: Vec<glob::Pattern> = patterns
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+
+        if compiled.is_empty() {
+            return Ok(());
+        }
+
+        // Walk the snapshot directory and remove non-matching files.
+        let mut to_remove = Vec::new();
+        for entry in WalkDir::new(snap_dir).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Ok(rel) = entry.path().strip_prefix(snap_dir) {
+                let rel_str = rel.to_string_lossy();
+                let matches = compiled.iter().any(|pat| pat.matches(&rel_str));
+                if !matches {
+                    to_remove.push(entry.path().to_path_buf());
+                }
+            }
+        }
+
+        for path in to_remove {
+            let _ = fs::remove_file(&path);
+        }
+
+        Ok(())
+    }
+
+    /// Add a sparse pattern for a roost.
+    pub fn sparse_add(&self, roost_name: &str, pattern: &str) -> Result<()> {
+        self.assert_initialized()?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost_mut(&mut config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        if !entry.sparse_patterns.contains(&pattern.to_string()) {
+            entry.sparse_patterns.push(pattern.to_string());
+        }
+        fl_storage::save_roosts(self.root(), &config)?;
+        Ok(())
+    }
+
+    /// Remove a sparse pattern from a roost.
+    pub fn sparse_remove(&self, roost_name: &str, pattern: &str) -> Result<()> {
+        self.assert_initialized()?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost_mut(&mut config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        let before = entry.sparse_patterns.len();
+        entry.sparse_patterns.retain(|p| p != pattern);
+        if entry.sparse_patterns.len() == before {
+            bail!("sparse pattern '{}' not found on roost '{}'", pattern, roost_name);
+        }
+        fl_storage::save_roosts(self.root(), &config)?;
+        Ok(())
+    }
+
+    /// List sparse patterns for a roost.
+    pub fn sparse_list(&self, roost_name: &str) -> Result<Vec<String>> {
+        self.assert_initialized()?;
+        let config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost(&config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+        Ok(entry.sparse_patterns.clone())
+    }
+
+    /// Fetch additional history for a shallow clone.
+    pub fn fetch_deepen(&self, roost_name: &str, additional_depth: usize) -> Result<fl_storage::PullReport> {
+        self.assert_initialized()?;
+        let config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost(&config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        let current_depth = entry.clone_depth.unwrap_or(0);
+        let new_depth = current_depth + additional_depth;
+
+        // Pull with the new expanded depth.
+        let sparse = entry.sparse_patterns.clone();
+        let lazy = entry.lazy;
+        let report = self.pull_with_options(roost_name, None, Some(new_depth), &sparse, lazy)?;
+
+        // Update the stored depth.
+        let mut config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost_mut(&mut config, roost_name).unwrap();
+        entry.clone_depth = Some(new_depth);
+        fl_storage::save_roosts(self.root(), &config)?;
+
+        Ok(report)
+    }
+
+    /// Scan for missing blocks and fetch them from the roost.
+    pub fn fetch_resolve_missing(&self, roost_name: &str) -> Result<usize> {
+        self.assert_initialized()?;
+        let config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost(&config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        let url = fl_storage::RemoteUrl::parse(&entry.url)?;
+        let resolved_token = fl_storage::resolve_token(entry.token.as_deref(), url.host.as_deref())?;
+        let transport = crate::remote::transport_for_url(&url, resolved_token.as_deref())?;
+
+        let content_store = ContentStore::for_root(self.root());
+        let file_index = FileIndex::for_root(self.root());
+
+        // Find all snapshot indices and check for missing blocks.
+        let mut missing_hashes: BTreeSet<String> = BTreeSet::new();
+        for snap_id in file_index.list().unwrap_or_default() {
+            if let Ok(index) = file_index.read(snap_id) {
+                for entry in index.files.values() {
+                    for block in &entry.blocks {
+                        if !content_store.has(&block.hash) {
+                            missing_hashes.insert(block.hash.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if missing_hashes.is_empty() {
+            return Ok(0);
+        }
+
+        let hashes: Vec<String> = missing_hashes.into_iter().collect();
+        let fetched = transport.download_blocks_batch(&hashes)?;
+        let mut count = 0;
+        for (hash, data) in fetched {
+            let stored_hash = content_store.put(&data)?;
+            if stored_hash == hash {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Pin files matching a pattern for offline access.
+    pub fn pin(&self, roost_name: &str, pattern: &str) -> Result<usize> {
+        self.assert_initialized()?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost_mut(&mut config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        // Store the pin pattern.
+        if !entry.pin_patterns.contains(&pattern.to_string()) {
+            entry.pin_patterns.push(pattern.to_string());
+        }
+
+        let url_str = entry.url.clone();
+        let token = entry.token.clone();
+        fl_storage::save_roosts(self.root(), &config)?;
+
+        // Fetch blocks for matching files.
+        let url = fl_storage::RemoteUrl::parse(&url_str)?;
+        let resolved_token = fl_storage::resolve_token(token.as_deref(), url.host.as_deref())?;
+        let transport = crate::remote::transport_for_url(&url, resolved_token.as_deref())?;
+
+        let compiled = glob::Pattern::new(pattern)
+            .map_err(|e| anyhow!("invalid glob pattern '{}': {}", pattern, e))?;
+
+        let content_store = ContentStore::for_root(self.root());
+        let file_index = FileIndex::for_root(self.root());
+
+        let mut missing_hashes: BTreeSet<String> = BTreeSet::new();
+        for snap_id in file_index.list().unwrap_or_default() {
+            if let Ok(index) = file_index.read(snap_id) {
+                for (path, entry) in &index.files {
+                    if compiled.matches(path) {
+                        for block in &entry.blocks {
+                            if !content_store.has(&block.hash) {
+                                missing_hashes.insert(block.hash.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if missing_hashes.is_empty() {
+            return Ok(0);
+        }
+
+        let hashes: Vec<String> = missing_hashes.into_iter().collect();
+        let fetched = transport.download_blocks_batch(&hashes)?;
+        let mut count = 0;
+        for (_hash, data) in fetched {
+            content_store.put(&data)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// List pinned patterns for a roost.
+    pub fn pin_list(&self, roost_name: &str) -> Result<Vec<String>> {
+        self.assert_initialized()?;
+        let config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost(&config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+        Ok(entry.pin_patterns.clone())
+    }
+
+    /// Remove a pin pattern from a roost.
+    pub fn pin_remove(&self, roost_name: &str, pattern: &str) -> Result<()> {
+        self.assert_initialized()?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost_mut(&mut config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        let before = entry.pin_patterns.len();
+        entry.pin_patterns.retain(|p| p != pattern);
+        if entry.pin_patterns.len() == before {
+            bail!("pin pattern '{}' not found on roost '{}'", pattern, roost_name);
+        }
+        fl_storage::save_roosts(self.root(), &config)?;
+        Ok(())
+    }
+
+    /// Parse Cargo.toml workspace to compute sparse patterns for a build target.
+    ///
+    /// Reads the remote's Cargo.toml (via a temporary pull of events to find it),
+    /// finds workspace members, and computes the transitive closure of local
+    /// path dependencies for the given target crate.
+    pub fn focus_clone_patterns(&self, _url: &str, target: &str) -> Result<Vec<String>> {
+        // Look for Cargo.toml in the working directory (it was fetched during init+pull).
+        let cargo_toml = self.root.join("Cargo.toml");
+        if !cargo_toml.exists() {
+            // Try the snapshot directory for the latest checkpoint.
+            let events = self.list_events().unwrap_or_default();
+            for event in events.iter().rev() {
+                if let EventKind::Checkpoint(cp) = &event.kind {
+                    let snap_cargo = self.root.join(SNAPSHOT_DIR)
+                        .join(cp.snapshot_id.to_string())
+                        .join("Cargo.toml");
+                    if snap_cargo.exists() {
+                        return self.parse_cargo_focus(&snap_cargo, target);
+                    }
+                }
+            }
+            bail!("Cargo.toml not found; --focus requires a Cargo workspace");
+        }
+        self.parse_cargo_focus(&cargo_toml, target)
+    }
+
+    fn parse_cargo_focus(&self, cargo_toml: &Path, target: &str) -> Result<Vec<String>> {
+        let content = fs::read_to_string(cargo_toml)
+            .with_context(|| format!("failed to read {}", cargo_toml.display()))?;
+        let parsed: toml::Value = toml::from_str(&content)
+            .with_context(|| "failed to parse Cargo.toml")?;
+
+        // Find workspace members.
+        let mut members: Vec<String> = Vec::new();
+        if let Some(workspace) = parsed.get("workspace") {
+            if let Some(member_list) = workspace.get("members").and_then(|v| v.as_array()) {
+                for m in member_list {
+                    if let Some(s) = m.as_str() {
+                        members.push(s.to_string());
+                    }
+                }
+            }
+        }
+
+        // Find which member matches the target.
+        let mut target_path = None;
+        for member in &members {
+            // Check if member ends with the target name or matches exactly.
+            let member_name = member.rsplit('/').next().unwrap_or(member);
+            if member_name == target || member == target {
+                target_path = Some(member.clone());
+                break;
+            }
+        }
+
+        let target_path = target_path
+            .ok_or_else(|| anyhow!("target '{}' not found in workspace members: {:?}", target, members))?;
+
+        // Start with the target path and collect transitive path dependencies.
+        let mut needed_paths: BTreeSet<String> = BTreeSet::new();
+        let mut queue = vec![target_path.clone()];
+        let mut visited = BTreeSet::new();
+
+        while let Some(current) = queue.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            needed_paths.insert(current.clone());
+
+            // Read that member's Cargo.toml for path dependencies.
+            let member_cargo = cargo_toml.parent().unwrap().join(&current).join("Cargo.toml");
+            if let Ok(member_content) = fs::read_to_string(&member_cargo) {
+                if let Ok(member_parsed) = toml::from_str::<toml::Value>(&member_content) {
+                    // Check [dependencies], [dev-dependencies], [build-dependencies]
+                    for section in &["dependencies", "dev-dependencies", "build-dependencies"] {
+                        if let Some(deps) = member_parsed.get(section).and_then(|v| v.as_table()) {
+                            for (_name, dep) in deps {
+                                if let Some(path) = dep.get("path").and_then(|v| v.as_str()) {
+                                    // Resolve relative path
+                                    let resolved = PathBuf::from(&current).join(path);
+                                    let normalized = normalize_path(&resolved);
+                                    // Check if it's a workspace member.
+                                    let norm_str = normalized.to_string_lossy().to_string();
+                                    if members.iter().any(|m| m == &norm_str || m.ends_with(&format!("/{}", norm_str)) || norm_str.ends_with(m)) {
+                                        queue.push(norm_str);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Convert to glob patterns.
+        let mut patterns: Vec<String> = needed_paths
+            .iter()
+            .map(|p| format!("{}/**", p))
+            .collect();
+
+        // Always include root Cargo.toml and workspace config files.
+        patterns.push("Cargo.toml".to_string());
+        patterns.push("Cargo.lock".to_string());
+        patterns.push(".cargo/**".to_string());
+
+        Ok(patterns)
     }
 
     /// Connect to a roost via WebSocket for real-time event streaming.
@@ -7214,6 +7650,19 @@ fn update_config_mode(raw: &str, new_mode: &str) -> String {
         result.push('\n');
     }
     result
+}
+
+/// Normalize a path by resolving `..` and `.` components without touching the filesystem.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => { components.pop(); }
+            Component::CurDir => {}
+            other => { components.push(other); }
+        }
+    }
+    components.iter().collect()
 }
 
 #[cfg(test)]
@@ -9324,5 +9773,166 @@ mod tests {
         let err = repo.find_task_by_prefix("00000000");
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("no task matching"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Clone / partial clone tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clone_via_local_fs_transport() {
+        // Create a source repo with a checkpoint.
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repo::at(source_dir.path());
+        source.init().unwrap();
+        std::fs::write(source_dir.path().join("hello.txt"), "hello world").unwrap();
+        source.create_checkpoint(Some("initial commit".to_string())).unwrap();
+
+        // Clone to a new directory.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let target = clone_dir.path().join("cloned");
+        let source_url = format!("file://{}", source_dir.path().display());
+
+        let report = Repo::clone_from(
+            &source_url,
+            &target,
+            None,   // depth
+            vec![], // sparse
+            false,  // lazy
+            None,   // focus
+        ).unwrap();
+
+        assert!(report.pull.events_pulled > 0);
+        assert_eq!(report.pull.roost_name, "origin");
+
+        // Verify the cloned repo has events.
+        let cloned = Repo::discover(&target).unwrap();
+        let events = cloned.list_events().unwrap();
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn shallow_clone_limits_checkpoints() {
+        // Create a source repo with multiple checkpoints.
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repo::at(source_dir.path());
+        source.init().unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                source_dir.path().join(format!("file{}.txt", i)),
+                format!("content {}", i),
+            ).unwrap();
+            source.create_checkpoint(Some(format!("commit {}", i))).unwrap();
+        }
+
+        // Clone with depth 2.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let target = clone_dir.path().join("shallow");
+        let source_url = format!("file://{}", source_dir.path().display());
+
+        let report = Repo::clone_from(
+            &source_url,
+            &target,
+            Some(2), // depth
+            vec![],  // sparse
+            false,   // lazy
+            None,    // focus
+        ).unwrap();
+
+        assert!(report.pull.events_pulled > 0);
+        assert_eq!(report.depth, Some(2));
+
+        // Verify fewer events than the full repo.
+        let cloned = Repo::discover(&target).unwrap();
+        let cloned_events = cloned.list_events().unwrap();
+        let source_events = source.list_events().unwrap();
+        assert!(cloned_events.len() < source_events.len());
+    }
+
+    #[test]
+    fn sparse_patterns_persisted_in_roost_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::at(dir.path());
+        repo.init().unwrap();
+        repo.roost_add("origin", "file:///tmp/fake").unwrap();
+
+        // Add sparse patterns.
+        repo.sparse_add("origin", "src/**").unwrap();
+        repo.sparse_add("origin", "*.toml").unwrap();
+
+        let patterns = repo.sparse_list("origin").unwrap();
+        assert_eq!(patterns, vec!["src/**", "*.toml"]);
+
+        // Duplicate add is idempotent.
+        repo.sparse_add("origin", "src/**").unwrap();
+        assert_eq!(repo.sparse_list("origin").unwrap().len(), 2);
+
+        // Remove.
+        repo.sparse_remove("origin", "*.toml").unwrap();
+        assert_eq!(repo.sparse_list("origin").unwrap(), vec!["src/**"]);
+    }
+
+    #[test]
+    fn pin_patterns_persisted_in_roost_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::at(dir.path());
+        repo.init().unwrap();
+        repo.roost_add("origin", "file:///tmp/fake").unwrap();
+
+        // Pin list starts empty.
+        assert!(repo.pin_list("origin").unwrap().is_empty());
+
+        // Pin remove of non-existent fails.
+        assert!(repo.pin_remove("origin", "nope").is_err());
+    }
+
+    #[test]
+    fn lazy_clone_skips_snapshot_download() {
+        // Create a source repo with a checkpoint.
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repo::at(source_dir.path());
+        source.init().unwrap();
+        std::fs::write(source_dir.path().join("test.txt"), "content").unwrap();
+        source.create_checkpoint(Some("init".to_string())).unwrap();
+
+        // Clone lazily.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let target = clone_dir.path().join("lazy");
+        let source_url = format!("file://{}", source_dir.path().display());
+
+        let report = Repo::clone_from(
+            &source_url,
+            &target,
+            None,
+            vec![],
+            true, // lazy
+            None,
+        ).unwrap();
+
+        assert!(report.lazy);
+        assert!(report.pull.events_pulled > 0);
+        // Lazy clone should download 0 blocks (snapshots skipped).
+        assert_eq!(report.pull.blocks_downloaded, 0);
+    }
+
+    #[test]
+    fn clone_derives_dir_from_url() {
+        // Test that RemoteUrl parsing extracts the right name.
+        let url = fl_storage::RemoteUrl::parse("flock://example.com/acme/myrepo").unwrap();
+        let name = url.path.rsplit('/').next().unwrap_or("repo");
+        assert_eq!(name, "myrepo");
+
+        let url = fl_storage::RemoteUrl::parse("file:///tmp/test-repo").unwrap();
+        let name = url.path.rsplit('/').next().unwrap_or("repo");
+        assert_eq!(name, "test-repo");
+    }
+
+    #[test]
+    fn normalize_path_resolves_parent_refs() {
+        let p = super::normalize_path(std::path::Path::new("a/b/../c"));
+        assert_eq!(p, std::path::PathBuf::from("a/c"));
+
+        let p = super::normalize_path(std::path::Path::new("a/./b/c"));
+        assert_eq!(p, std::path::PathBuf::from("a/b/c"));
     }
 }

@@ -128,6 +128,46 @@ impl EventLog {
 
         Ok(())
     }
+
+    /// Append a batch of events from a remote pull. Signatures are not
+    /// required — graft events from shallow clones may have their signature
+    /// stripped when the parent_id is cleared.
+    pub fn append_batch_from_pull(&self, events: &[Event]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.ensure_exists()?;
+
+        let existing = self.read_all()?;
+        let mut expected_parent = existing.last().map(|e| e.id);
+
+        // Pre-validate with relaxed signature checking.
+        for event in events {
+            validate_next_parent(event, expected_parent)?;
+            verify_event_signature(event, false)?; // signatures optional
+            verify_checkpoint_merkle_root(event, true)?;
+            expected_parent = Some(event.id);
+        }
+
+        // Append with hash chain links.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {} for batch append", self.path.display()))?;
+
+        let mut prev_hash: Option<String> = existing.last().map(|e| compute_event_hash(e));
+        for event in events {
+            let mut event = event.clone();
+            event.prev_event_hash = prev_hash;
+            prev_hash = Some(compute_event_hash(&event));
+            let record = EventRecord::from_event(&event);
+            let line = serde_json::to_string(&record).context("failed to serialize event")?;
+            writeln!(file, "{}", line).context("failed to append event to log")?;
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]

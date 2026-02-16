@@ -710,6 +710,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tempfile",
+ "toml",
  "tungstenite",
  "ureq",
  "uuid",

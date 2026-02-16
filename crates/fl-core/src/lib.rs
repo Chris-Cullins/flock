@@ -23,7 +23,7 @@ pub use event::{
     UndoMode,
 };
 pub use fl_storage::ApiCallRecord;
-pub use fl_storage::{PullReport, PushReport, RefKind, RemoteUrl, RepoRef, RoostEntry, WorkspaceRefConfig};
+pub use fl_storage::{CloneReport, PullReport, PushReport, RefKind, RemoteUrl, RepoRef, RoostEntry, WorkspaceRefConfig};
 pub use fl_storage::{WsClientMessage, WsServerMessage, WsSubscribeRequest};
 pub use repo::{
     ConflictDetail, ConflictStatus, ConflictSummary, ConvertReport, DecisionSummary, ExplorationStatus, FileSummary,

@@ -30,6 +30,18 @@ pub struct RoostEntry {
     pub last_synced_event: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Shallow clone depth (number of checkpoint events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_depth: Option<usize>,
+    /// Sparse checkout glob patterns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sparse_patterns: Vec<String>,
+    /// Whether this clone uses lazy block fetching.
+    #[serde(default)]
+    pub lazy: bool,
+    /// Pinned glob patterns for offline access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pin_patterns: Vec<String>,
 }
 
 /// Load roosts config from `.flock/roosts.toml`. Returns default if file
@@ -75,6 +87,10 @@ pub fn add_roost(config: &mut RoostsConfig, name: &str, url: &str) -> Result<()>
         url: url.to_string(),
         last_synced_event: None,
         token: None,
+        clone_depth: None,
+        sparse_patterns: Vec::new(),
+        lazy: false,
+        pin_patterns: Vec::new(),
     });
     Ok(())
 }

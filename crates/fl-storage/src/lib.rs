@@ -47,11 +47,11 @@ pub use remote_config::{
     save_roosts,
 };
 pub use remote_protocol::{
-    BlockNeedRequest, BlockNeedResponse, BlockPayload, BlockUploadRequest, BlockUploadResponse,
-    EventPullRequest, EventPullResponse, EventPushRequest, EventPushResponse, PullReport,
-    PushReport, RemoteScheme, RemoteUrl, SnapshotNeedRequest, SnapshotNeedResponse,
-    SshAuthChallengeRequest, SshAuthChallengeResponse, SshAuthVerifyRequest, SshAuthVerifyResponse,
-    TokenLoginRequest, TokenLoginResponse,
+    BlockFaultRequest, BlockFaultResponse, BlockNeedRequest, BlockNeedResponse, BlockPayload,
+    BlockUploadRequest, BlockUploadResponse, CloneReport, EventPullRequest, EventPullResponse,
+    EventPushRequest, EventPushResponse, PullReport, PushReport, RemoteScheme, RemoteUrl,
+    SnapshotNeedRequest, SnapshotNeedResponse, SshAuthChallengeRequest, SshAuthChallengeResponse,
+    SshAuthVerifyRequest, SshAuthVerifyResponse, TokenLoginRequest, TokenLoginResponse,
 };
 pub use segmented_event_log::SegmentedEventLog;
 pub use segmented_refs::SegmentedRefStore;

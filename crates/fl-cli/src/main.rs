@@ -265,6 +265,59 @@ enum Command {
         /// Branch to pull
         branch: Option<String>,
     },
+    /// Clone a remote repository
+    Clone {
+        /// Remote URL (flock:// or file://)
+        url: String,
+        /// Target directory (defaults to repo name from URL)
+        dir: Option<String>,
+        /// Shallow clone: only fetch last N checkpoints
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Sparse clone: only fetch blocks matching these globs
+        #[arg(long)]
+        sparse: Vec<String>,
+        /// Focus clone: auto-compute sparse set from build target
+        #[arg(long)]
+        focus: Option<String>,
+        /// Lazy clone: download events/indices only, fetch blocks on demand
+        #[arg(long)]
+        lazy: bool,
+    },
+    /// Manage sparse checkout patterns
+    Sparse {
+        #[command(subcommand)]
+        command: SparseCommand,
+    },
+    /// Fetch additional history or resolve missing blocks
+    Fetch {
+        /// Extend shallow history by N additional checkpoints
+        #[arg(long)]
+        deepen: Option<usize>,
+        /// Scan for and download missing blocks
+        #[arg(long)]
+        resolve_missing: bool,
+        /// Roost name (defaults to "origin")
+        #[arg(long)]
+        roost: Option<String>,
+    },
+    /// Pin files for offline access (eagerly fetch blocks)
+    Pin {
+        /// Glob pattern to pin (e.g. "src/**")
+        pattern: Option<String>,
+        /// Pin all files (convert to full clone)
+        #[arg(long)]
+        all: bool,
+        /// List pinned patterns
+        #[arg(long)]
+        list: bool,
+        /// Remove a pin pattern
+        #[arg(long)]
+        unpin: Option<String>,
+        /// Roost name (defaults to "origin")
+        #[arg(long)]
+        roost: Option<String>,
+    },
     /// Stream live events from a remote via WebSocket
     Watch {
         /// Roost name (defaults to "origin")
@@ -423,6 +476,32 @@ enum RoostCommand {
     SetUrl {
         name: String,
         url: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SparseCommand {
+    /// Add a sparse checkout pattern
+    Add {
+        /// Glob pattern (e.g. "src/**")
+        pattern: String,
+        /// Roost name (defaults to "origin")
+        #[arg(long)]
+        roost: Option<String>,
+    },
+    /// Remove a sparse checkout pattern
+    Remove {
+        /// Glob pattern to remove
+        pattern: String,
+        /// Roost name (defaults to "origin")
+        #[arg(long)]
+        roost: Option<String>,
+    },
+    /// List sparse checkout patterns
+    List {
+        /// Roost name (defaults to "origin")
+        #[arg(long)]
+        roost: Option<String>,
     },
 }
 
@@ -2845,6 +2924,129 @@ fn main() -> Result<()> {
                 if !report.refs_updated.is_empty() {
                     println!("refs updated: {}", report.refs_updated.join(", "));
                 }
+            }
+        }
+        Command::Clone {
+            url,
+            dir,
+            depth,
+            sparse,
+            focus,
+            lazy,
+        } => {
+            // Derive directory name from URL if not specified.
+            let target_dir = if let Some(d) = dir {
+                PathBuf::from(d)
+            } else {
+                let parsed = fl_core::RemoteUrl::parse(&url)?;
+                let name = parsed.path.rsplit('/').next().unwrap_or("repo");
+                PathBuf::from(name)
+            };
+
+            let report = Repo::clone_from(
+                &url,
+                &target_dir,
+                depth,
+                sparse,
+                lazy,
+                focus.as_deref(),
+            )?;
+
+            println!(
+                "cloned to '{}': {} event(s), {} block(s)",
+                report.clone_dir,
+                report.pull.events_pulled,
+                report.pull.blocks_downloaded,
+            );
+            if !report.sparse_patterns.is_empty() {
+                println!("sparse patterns: {}", report.sparse_patterns.join(", "));
+            }
+            if report.lazy {
+                println!("lazy mode: blocks fetched on demand");
+            }
+            if let Some(d) = report.depth {
+                println!("shallow depth: {} checkpoints", d);
+            }
+        }
+        Command::Sparse { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                SparseCommand::Add { pattern, roost } => {
+                    let roost_name = roost.as_deref().unwrap_or("origin");
+                    repo.sparse_add(roost_name, &pattern)?;
+                    println!("sparse pattern '{}' added to '{}'", pattern, roost_name);
+                }
+                SparseCommand::Remove { pattern, roost } => {
+                    let roost_name = roost.as_deref().unwrap_or("origin");
+                    repo.sparse_remove(roost_name, &pattern)?;
+                    println!("sparse pattern '{}' removed from '{}'", pattern, roost_name);
+                }
+                SparseCommand::List { roost } => {
+                    let roost_name = roost.as_deref().unwrap_or("origin");
+                    let patterns = repo.sparse_list(roost_name)?;
+                    if patterns.is_empty() {
+                        println!("no sparse patterns configured for '{}'", roost_name);
+                    } else {
+                        for p in &patterns {
+                            println!("  {}", p);
+                        }
+                    }
+                }
+            }
+        }
+        Command::Fetch {
+            deepen,
+            resolve_missing,
+            roost,
+        } => {
+            let repo = Repo::discover(cwd)?;
+            let roost_name = roost.as_deref().unwrap_or("origin");
+            if let Some(n) = deepen {
+                let report = repo.fetch_deepen(roost_name, n)?;
+                println!(
+                    "deepened by {}: pulled {} event(s), {} block(s)",
+                    n, report.events_pulled, report.blocks_downloaded
+                );
+            } else if resolve_missing {
+                let count = repo.fetch_resolve_missing(roost_name)?;
+                if count == 0 {
+                    println!("no missing blocks");
+                } else {
+                    println!("fetched {} missing block(s)", count);
+                }
+            } else {
+                println!("specify --deepen N or --resolve-missing");
+            }
+        }
+        Command::Pin {
+            pattern,
+            all,
+            list,
+            unpin,
+            roost,
+        } => {
+            let repo = Repo::discover(cwd)?;
+            let roost_name = roost.as_deref().unwrap_or("origin");
+            if list {
+                let patterns = repo.pin_list(roost_name)?;
+                if patterns.is_empty() {
+                    println!("no pinned patterns for '{}'", roost_name);
+                } else {
+                    for p in &patterns {
+                        println!("  {}", p);
+                    }
+                }
+            } else if let Some(ref pat) = unpin {
+                repo.pin_remove(roost_name, pat)?;
+                println!("unpinned '{}'", pat);
+            } else if all {
+                let count = repo.pin(roost_name, "**")?;
+                println!("pinned all files: fetched {} block(s)", count);
+            } else if let Some(ref pat) = pattern {
+                let count = repo.pin(roost_name, pat)?;
+                println!("pinned '{}': fetched {} block(s)", pat, count);
+            } else {
+                println!("specify a pattern, --all, --list, or --unpin");
             }
         }
         Command::Watch {

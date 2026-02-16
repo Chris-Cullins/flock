@@ -3,7 +3,7 @@ use std::fs;
 use anyhow::{Context, Result, bail};
 use fl_storage::{
     BlockNeedRequest, BlockNeedResponse, BlockUploadRequest, BlockUploadResponse,
-    EventLog, EventPullRequest, EventPullResponse, EventPushRequest, EventPushResponse,
+    EventKind, EventLog, EventPullRequest, EventPullResponse, EventPushRequest, EventPushResponse,
     RemoteScheme, RemoteUrl, SnapshotNeedRequest, SnapshotNeedResponse,
     SshAuthChallengeRequest, SshAuthChallengeResponse, SshAuthVerifyRequest, SshAuthVerifyResponse,
     TokenLoginRequest, TokenLoginResponse,
@@ -26,6 +26,15 @@ pub trait RoostTransport {
     fn check_blocks_needed(&self, req: &BlockNeedRequest) -> Result<BlockNeedResponse>;
     fn upload_blocks(&self, req: &BlockUploadRequest) -> Result<BlockUploadResponse>;
     fn download_block(&self, hash: &str) -> Result<Vec<u8>>;
+    fn download_blocks_batch(&self, hashes: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+        // Default implementation: download one at a time
+        let mut results = Vec::new();
+        for hash in hashes {
+            let data = self.download_block(hash)?;
+            results.push((hash.clone(), data));
+        }
+        Ok(results)
+    }
     fn check_snapshots_needed(&self, req: &SnapshotNeedRequest) -> Result<SnapshotNeedResponse>;
     fn upload_snapshot(&self, snapshot_id: Uuid, data: &[u8]) -> Result<()>;
     fn download_snapshot(&self, snapshot_id: Uuid) -> Result<Vec<u8>>;
@@ -247,7 +256,7 @@ impl RoostTransport for LocalFsTransport {
         let all_events = event_log.read_all()?;
 
         // Find events after last_known_event.
-        let events = if let Some(last_known) = req.last_known_event {
+        let mut events = if let Some(last_known) = req.last_known_event {
             let pos = all_events.iter().position(|e| e.id == last_known);
             match pos {
                 Some(idx) => all_events[idx + 1..].to_vec(),
@@ -256,6 +265,41 @@ impl RoostTransport for LocalFsTransport {
         } else {
             all_events
         };
+
+        // Apply depth filter: keep only the last N checkpoint events
+        // (plus non-checkpoint events between them).
+        if let Some(depth) = req.depth {
+            if depth > 0 {
+                // Walk backward to find the Nth checkpoint from the end
+                let mut checkpoint_count = 0;
+                let mut cutoff_idx = 0;
+                for (i, event) in events.iter().enumerate().rev() {
+                    if matches!(&event.kind, EventKind::Checkpoint(_)) {
+                        checkpoint_count += 1;
+                        if checkpoint_count >= depth {
+                            cutoff_idx = i;
+                            break;
+                        }
+                    }
+                }
+                if checkpoint_count >= depth {
+                    events = events[cutoff_idx..].to_vec();
+                    // Null out the parent_id and signature on the graft point
+                    // so the client can append these events without a broken
+                    // causal chain. The signature is invalidated by the
+                    // parent_id change, so it must be cleared too.
+                    // The first event becomes a graft point — its parent
+                    // reference is severed. Mark it for re-signing by
+                    // clearing parent_id (the caller must re-sign it).
+                    if let Some(first) = events.first_mut() {
+                        first.parent_id = None;
+                        // Signature is now invalid — must be re-signed.
+                        first.signature = None;
+                        first.signer_public_key = None;
+                    }
+                }
+            }
+        }
 
         let ref_store = self.ref_store();
         ref_store.ensure_exists()?;
