@@ -696,6 +696,7 @@ dependencies = [
  "ed25519-dalek",
  "fl-bridge-git",
  "fl-collab",
+ "fl-policy",
  "fl-semantic",
  "fl-storage",
  "fl-workflow",
@@ -715,6 +716,16 @@ dependencies = [
  "ureq",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "fl-policy"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "glob",
+ "serde",
+ "uuid",
 ]
 
 [[package]]

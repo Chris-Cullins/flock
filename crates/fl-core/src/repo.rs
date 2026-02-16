@@ -415,6 +415,12 @@ impl Repo {
             self.scan_working_directory_for_secrets()?;
         }
 
+        // Enforce policy checks (budget + rate limits).
+        let task_id = self.active_task_id();
+        let exploration_id = self.active_exploration_id();
+        self.enforce_budget_policy(task_id, exploration_id)?;
+        self.enforce_rate_limit_policy(task_id, exploration_id)?;
+
         let label = message
             .as_deref()
             .map(normalize_label)
@@ -729,6 +735,7 @@ impl Repo {
                 EventKind::Hook(_) => {}
                 EventKind::RemoteSync(_) => {}
                 EventKind::Intelligence(_) => {}
+                EventKind::Policy(_) => {}
             }
         }
 
@@ -1366,6 +1373,10 @@ impl Repo {
     pub fn start_exploration(&self, title: String) -> Result<ExplorationSummary> {
         self.assert_initialized()?;
 
+        // Enforce rate limit policy (explorations per task).
+        let task_id = self.active_task_id();
+        self.enforce_rate_limit_policy(task_id, None)?;
+
         let id = Uuid::new_v4();
         let base_checkpoint_event = self.latest_checkpoint().map(|event| event.id);
         let event = self.append_event(EventKind::Exploration(ExplorationEvent {
@@ -1402,6 +1413,10 @@ impl Repo {
 
     pub fn promote_exploration(&self, id: Uuid) -> Result<ExplorationSummary> {
         self.assert_initialized()?;
+
+        // Enforce budget policy before promoting.
+        let task_id = self.active_task_id();
+        self.enforce_budget_policy(task_id, Some(id))?;
 
         let existing = self
             .list_explorations()?
@@ -2277,6 +2292,11 @@ impl Repo {
 
     pub fn undo(&self, request: UndoRequest) -> Result<UndoResult> {
         self.assert_initialized()?;
+
+        // Enforce rate limit policy (undos per exploration).
+        let task_id = self.active_task_id();
+        let exploration_id = self.active_exploration_id();
+        self.enforce_rate_limit_policy(task_id, exploration_id)?;
 
         let events = self.list_events()?;
         if events.is_empty() {
@@ -3268,6 +3288,199 @@ impl Repo {
             validation_ok,
             validation_detail,
         })
+    }
+
+    // --- Policy enforcement helpers ---
+
+    fn policies_config(&self) -> crate::policies::PoliciesConfig {
+        crate::policies::load_policies_config(self.root())
+    }
+
+    /// Record a policy decision in the event log for audit trail.
+    fn record_policy_decision(
+        &self,
+        decision: &fl_policy::PolicyDecision,
+    ) -> Result<()> {
+        let verdict_kind = match &decision.verdict {
+            fl_policy::PolicyVerdict::Allow => fl_storage::PolicyVerdictKind::Allow,
+            fl_policy::PolicyVerdict::Gate { .. } => fl_storage::PolicyVerdictKind::Gate,
+            fl_policy::PolicyVerdict::Block { .. } => fl_storage::PolicyVerdictKind::Block,
+        };
+        let reason = match &decision.verdict {
+            fl_policy::PolicyVerdict::Allow => None,
+            fl_policy::PolicyVerdict::Gate { reason, .. } => Some(reason.clone()),
+            fl_policy::PolicyVerdict::Block { reason, .. } => Some(reason.clone()),
+        };
+        let category = match decision.category {
+            fl_policy::PolicyCategory::Scope => "Scope",
+            fl_policy::PolicyCategory::Budget => "Budget",
+            fl_policy::PolicyCategory::RateLimit => "RateLimit",
+        };
+        let operation = match decision.operation {
+            fl_policy::PolicyOperation::Checkpoint => "Checkpoint",
+            fl_policy::PolicyOperation::ExplorationStart => "ExplorationStart",
+            fl_policy::PolicyOperation::ExplorationPromote => "ExplorationPromote",
+            fl_policy::PolicyOperation::Undo => "Undo",
+            fl_policy::PolicyOperation::TaskClaim => "TaskClaim",
+        };
+        self.append_event(EventKind::Policy(fl_storage::PolicyEvent {
+            policy_name: decision.policy_name.clone(),
+            policy_category: category.to_string(),
+            verdict: verdict_kind,
+            operation: operation.to_string(),
+            reason,
+            task_id: decision.task_id,
+            exploration_id: decision.exploration_id,
+            affected_files: decision.affected_files.clone(),
+        }))?;
+        Ok(())
+    }
+
+    /// Enforce budget policy for the current task. Called before checkpoints.
+    fn enforce_budget_policy(
+        &self,
+        task_id: Option<Uuid>,
+        exploration_id: Option<Uuid>,
+    ) -> Result<()> {
+        let config = self.policies_config();
+        if !config.budget.enabled {
+            return Ok(());
+        }
+        let Some(tid) = task_id else {
+            return Ok(());
+        };
+
+        let state = self.replay_state()?;
+        let tracker = state.policy_budgets.get(&tid);
+
+        let usage = fl_policy::BudgetUsage {
+            task_id: tid,
+            files_modified: tracker.map(|t| t.files_modified.len() as u32).unwrap_or(0),
+            lines_changed: tracker.map(|t| t.lines_changed).unwrap_or(0),
+            exploration_id,
+            exploration_files_modified: tracker
+                .and_then(|t| {
+                    exploration_id.and_then(|eid| t.exploration_files.get(&eid).map(|s| s.len() as u32))
+                })
+                .unwrap_or(0),
+        };
+
+        let decision = fl_policy::check_budget_limits(&config.budget, &usage);
+        if decision.is_blocked() || decision.is_gated() {
+            self.record_policy_decision(&decision)?;
+        }
+        if decision.is_blocked() {
+            if let fl_policy::PolicyVerdict::Block { reason, fix_suggestion } = &decision.verdict {
+                let msg = if let Some(fix) = fix_suggestion {
+                    format!("Policy blocked: {}\nSuggestion: {}", reason, fix)
+                } else {
+                    format!("Policy blocked: {}", reason)
+                };
+                bail!("{}", msg);
+            }
+        }
+        if decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
+                eprintln!("warning: policy gate triggered — {}", reason);
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce rate limit policy for the current task.
+    fn enforce_rate_limit_policy(
+        &self,
+        task_id: Option<Uuid>,
+        exploration_id: Option<Uuid>,
+    ) -> Result<()> {
+        let config = self.policies_config();
+        if !config.rate_limits.enabled {
+            return Ok(());
+        }
+        let Some(tid) = task_id else {
+            return Ok(());
+        };
+
+        let state = self.replay_state()?;
+        let tracker = state.policy_rate_limits.get(&tid);
+
+        let undos_in_exploration = tracker
+            .and_then(|t| {
+                exploration_id.and_then(|eid| t.undo_counts.get(&eid).copied())
+            })
+            .unwrap_or(0);
+
+        // Count checkpoints in the current window.
+        let window_secs = config.rate_limits.window_secs;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let window_start = now.saturating_sub(window_secs);
+        let window_start_nanos = window_start * 1_000_000_000;
+        let checkpoints_in_window = tracker
+            .map(|t| {
+                t.checkpoint_timestamps
+                    .iter()
+                    .filter(|ts| {
+                        ts.parse::<u128>().unwrap_or(0) >= window_start_nanos as u128
+                    })
+                    .count() as u32
+            })
+            .unwrap_or(0);
+
+        let usage = fl_policy::RateLimitUsage {
+            task_id: tid,
+            explorations_started: tracker.map(|t| t.explorations_started).unwrap_or(0),
+            exploration_id,
+            undos_in_exploration,
+            checkpoints_in_window,
+        };
+
+        let decision = fl_policy::check_rate_limits(&config.rate_limits, &usage);
+        if decision.is_blocked() || decision.is_gated() {
+            self.record_policy_decision(&decision)?;
+        }
+        if decision.is_blocked() {
+            if let fl_policy::PolicyVerdict::Block { reason, fix_suggestion } = &decision.verdict {
+                let msg = if let Some(fix) = fix_suggestion {
+                    format!("Policy blocked: {}\nSuggestion: {}", reason, fix)
+                } else {
+                    format!("Policy blocked: {}", reason)
+                };
+                bail!("{}", msg);
+            }
+        }
+        if decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
+                eprintln!("warning: policy rate limit gate triggered — {}", reason);
+            }
+        }
+        Ok(())
+    }
+
+    /// Find the active task ID from replayed state (if any task is claimed by current actor).
+    fn active_task_id(&self) -> Option<Uuid> {
+        let state = self.replay_state().ok()?;
+        let actor = current_actor();
+        state
+            .tasks
+            .values()
+            .find(|t| {
+                t.status == fl_workflow::TaskStatus::Claimed
+                    && t.assignee.as_deref() == Some(&actor)
+            })
+            .map(|t| t.id)
+    }
+
+    /// Find the active exploration ID from replayed state.
+    fn active_exploration_id(&self) -> Option<Uuid> {
+        let state = self.replay_state().ok()?;
+        state
+            .explorations
+            .values()
+            .find(|e| e.status == fl_workflow::ExplorationStatus::Active)
+            .map(|e| e.id)
     }
 
     /// Scan the working directory for secrets and return an error if any are

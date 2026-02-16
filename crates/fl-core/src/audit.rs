@@ -157,6 +157,7 @@ fn event_kind_label(kind: &EventKind) -> &'static str {
         EventKind::Hook(_) => "Hook",
         EventKind::RemoteSync(_) => "RemoteSync",
         EventKind::Intelligence(_) => "Intelligence",
+        EventKind::Policy(_) => "Policy",
     }
 }
 

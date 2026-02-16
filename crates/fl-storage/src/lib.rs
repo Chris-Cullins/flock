@@ -30,7 +30,8 @@ pub use event::{
     LockAction, LockEvent, NotifyConfig, PresenceAction,
     PresenceEvent, RebaseEvent, RemoteSyncAction, RemoteSyncEvent, ResourceUsageEvent,
     SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent, SubscriptionFilter,
-    TaskAction, TaskEvent, UndoEvent, UndoMode, compute_event_hash, event_signing_payload,
+    TaskAction, TaskEvent, UndoEvent, UndoMode, PolicyEvent, PolicyVerdictKind,
+    compute_event_hash, event_signing_payload,
 };
 pub use event_log::EventLog;
 pub use file_lock::{FileLock, LockPaths};
@@ -39,8 +40,8 @@ pub use file_index::{BlockRef, FileEntry, FileIndex, SnapshotIndex};
 pub use layout::{
     CONFIG_FILE, EVENT_LOG_DIR, EVENT_LOG_FILE, EVENT_LOG_INDEX_FILE, EVENT_LOG_SEGMENTS_DIR,
     FLOCK_DIR, KEY_DIR, MATERIALIZED_STATES_DIR, REFS_DIR, REFS_FILE, SECRETS_CONFIG_FILE,
-    HOOKS_CONFIG_FILE, SEGMENTED_REFS_DIR, SIGNING_KEY_FILE, SNAPSHOT_DIR, STORE_BLOCKS_DIR,
-    STORE_DIR, STORE_INDEX_DIR,
+    HOOKS_CONFIG_FILE, POLICIES_CONFIG_FILE, SEGMENTED_REFS_DIR, SIGNING_KEY_FILE, SNAPSHOT_DIR,
+    STORE_BLOCKS_DIR, STORE_DIR, STORE_INDEX_DIR,
 };
 pub use materialized_state::MaterializedStateStore;
 pub use refs::{

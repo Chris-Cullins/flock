@@ -22,3 +22,4 @@ pub const EVENT_LOG_INDEX_FILE: &str = ".flock/event-log/index.json";
 // Segmented refs paths
 pub const SEGMENTED_REFS_DIR: &str = ".flock/refs-v2";
 pub const HOOKS_CONFIG_FILE: &str = ".flock/hooks.toml";
+pub const POLICIES_CONFIG_FILE: &str = ".flock/policies.toml";

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -41,6 +41,7 @@ pub enum EventKind {
     Hook(HookEvent),
     RemoteSync(RemoteSyncEvent),
     Intelligence(IntelligenceEvent),
+    Policy(PolicyEvent),
 }
 
 impl Event {
@@ -400,6 +401,29 @@ pub enum IntelligenceAction {
     IntentExtraction,
     ConflictSuggestion,
     ConfidenceCalculation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyEvent {
+    pub policy_name: String,
+    pub policy_category: String,
+    pub verdict: PolicyVerdictKind,
+    pub operation: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+    #[serde(default)]
+    pub exploration_id: Option<Uuid>,
+    #[serde(default)]
+    pub affected_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PolicyVerdictKind {
+    Allow,
+    Gate,
+    Block,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

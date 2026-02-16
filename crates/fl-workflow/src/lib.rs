@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -178,6 +178,41 @@ pub enum TaskRelation {
     DiscoveredFrom,
 }
 
+/// Tracks budget usage per task for policy enforcement.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PolicyBudgetTracker {
+    pub task_id: Uuid,
+    pub files_modified: BTreeSet<String>,
+    pub lines_changed: u32,
+    /// Per-exploration file tracking.
+    pub exploration_files: BTreeMap<Uuid, BTreeSet<String>>,
+}
+
+/// Tracks rate limit usage per task for policy enforcement.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PolicyRateLimitTracker {
+    pub task_id: Uuid,
+    pub explorations_started: u32,
+    /// Undo count per exploration.
+    pub undo_counts: BTreeMap<Uuid, u32>,
+    /// Checkpoint timestamps (nanosecond strings) for windowed rate limiting.
+    pub checkpoint_timestamps: Vec<String>,
+}
+
+/// A recorded policy decision for audit purposes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDecisionRecord {
+    pub policy_name: String,
+    pub policy_category: String,
+    pub verdict: String,
+    pub operation: String,
+    pub reason: Option<String>,
+    pub task_id: Option<Uuid>,
+    pub exploration_id: Option<Uuid>,
+    pub affected_files: Vec<String>,
+    pub timestamp: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayedState {
     pub latest_checkpoint_event_id: Option<Uuid>,
@@ -192,6 +227,12 @@ pub struct ReplayedState {
     pub rebases: Vec<RebaseSummary>,
     pub conflicts: BTreeMap<Uuid, ConflictSummary>,
     pub applied_event_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub policy_budgets: BTreeMap<Uuid, PolicyBudgetTracker>,
+    #[serde(default)]
+    pub policy_rate_limits: BTreeMap<Uuid, PolicyRateLimitTracker>,
+    #[serde(default)]
+    pub policy_decisions: Vec<PolicyDecisionRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -208,6 +249,9 @@ struct ReplayAccumulator {
     rebases: Vec<RebaseSummary>,
     conflicts: BTreeMap<Uuid, ConflictSummary>,
     applied_event_ids: Vec<Uuid>,
+    policy_budgets: BTreeMap<Uuid, PolicyBudgetTracker>,
+    policy_rate_limits: BTreeMap<Uuid, PolicyRateLimitTracker>,
+    policy_decisions: Vec<PolicyDecisionRecord>,
 }
 
 impl From<ReplayedState> for ReplayAccumulator {
@@ -225,6 +269,9 @@ impl From<ReplayedState> for ReplayAccumulator {
             rebases: state.rebases,
             conflicts: state.conflicts,
             applied_event_ids: state.applied_event_ids,
+            policy_budgets: state.policy_budgets,
+            policy_rate_limits: state.policy_rate_limits,
+            policy_decisions: state.policy_decisions,
         }
     }
 }
@@ -258,7 +305,21 @@ impl ReplayAccumulator {
             rebases: self.rebases,
             conflicts: self.conflicts,
             applied_event_ids: self.applied_event_ids,
+            policy_budgets: self.policy_budgets,
+            policy_rate_limits: self.policy_rate_limits,
+            policy_decisions: self.policy_decisions,
         }
+    }
+
+    /// Find the task ID claimed by the given actor, if any.
+    fn find_claimed_task_for_actor(&self, actor: &str) -> Option<Uuid> {
+        self.tasks
+            .values()
+            .find(|t| {
+                t.status == TaskStatus::Claimed
+                    && t.assignee.as_deref() == Some(actor)
+            })
+            .map(|t| t.id)
     }
 
     fn apply_event(
@@ -271,6 +332,16 @@ impl ReplayAccumulator {
             EventKind::Checkpoint(checkpoint) => {
                 self.latest_checkpoint_event_id = Some(event.id);
                 self.latest_checkpoint_snapshot_id = Some(checkpoint.snapshot_id);
+                // Track checkpoint timestamps for rate limiting — attribute to the
+                // task whose actor matches the event actor (if any).
+                let actor_task = self.find_claimed_task_for_actor(&event.actor);
+                if let Some(tid) = actor_task {
+                    if let Some(tracker) = self.policy_rate_limits.get_mut(&tid) {
+                        tracker.checkpoint_timestamps.push(event.timestamp.clone());
+                    }
+                    // Budget file/line tracking requires file change metadata
+                    // in checkpoint events (not yet available). Tracked in TODO 12.5c.
+                }
             }
             EventKind::Exploration(exploration) => match exploration.action {
                 ExplorationAction::Start => {
@@ -285,6 +356,14 @@ impl ReplayAccumulator {
                             updated_at: event.timestamp.clone(),
                         },
                     );
+                    // Track exploration starts for rate limiting — attribute to
+                    // the task whose actor matches the event actor.
+                    let actor_task = self.find_claimed_task_for_actor(&event.actor);
+                    if let Some(tid) = actor_task {
+                        if let Some(tracker) = self.policy_rate_limits.get_mut(&tid) {
+                            tracker.explorations_started += 1;
+                        }
+                    }
                 }
                 ExplorationAction::Promote => {
                     if let Some(entry) = self.explorations.get_mut(&exploration.exploration_id) {
@@ -335,11 +414,42 @@ impl ReplayAccumulator {
                         self.applied_event_ids.push(restored_checkpoint_event);
                     }
                 }
+                // Track undo counts for rate limiting — attribute to the
+                // task whose actor matches the event actor.
+                let active_exploration = self.explorations.values()
+                    .find(|e| e.status == ExplorationStatus::Active)
+                    .map(|e| e.id);
+                if let Some(exp_id) = active_exploration {
+                    let actor_task = self.find_claimed_task_for_actor(&event.actor);
+                    if let Some(tid) = actor_task {
+                        if let Some(tracker) = self.policy_rate_limits.get_mut(&tid) {
+                            *tracker.undo_counts.entry(exp_id).or_insert(0) += 1;
+                        }
+                    }
+                }
             }
             EventKind::GitBridge(_) => {}
             EventKind::Hook(_) => {}
             EventKind::RemoteSync(_) => {}
             EventKind::Intelligence(_) => {}
+            EventKind::Policy(policy) => {
+                let verdict_str = match policy.verdict {
+                    fl_storage::PolicyVerdictKind::Allow => "Allow",
+                    fl_storage::PolicyVerdictKind::Gate => "Gate",
+                    fl_storage::PolicyVerdictKind::Block => "Block",
+                };
+                self.policy_decisions.push(PolicyDecisionRecord {
+                    policy_name: policy.policy_name.clone(),
+                    policy_category: policy.policy_category.clone(),
+                    verdict: verdict_str.to_string(),
+                    operation: policy.operation.clone(),
+                    reason: policy.reason.clone(),
+                    task_id: policy.task_id,
+                    exploration_id: policy.exploration_id,
+                    affected_files: policy.affected_files.clone(),
+                    timestamp: event.timestamp.clone(),
+                });
+            }
             EventKind::Session(session) => match session.action {
                 SessionAction::Start => {
                     self.sessions.insert(
@@ -630,6 +740,19 @@ impl ReplayAccumulator {
                             .or_else(|| Some(event.actor.clone()));
                         entry.claimed_at = Some(event.timestamp.clone());
                     }
+                    // Initialize policy trackers for the claimed task.
+                    self.policy_budgets.entry(task.task_id).or_insert_with(|| {
+                        PolicyBudgetTracker {
+                            task_id: task.task_id,
+                            ..Default::default()
+                        }
+                    });
+                    self.policy_rate_limits.entry(task.task_id).or_insert_with(|| {
+                        PolicyRateLimitTracker {
+                            task_id: task.task_id,
+                            ..Default::default()
+                        }
+                    });
                 }
                 TaskAction::Unclaim => {
                     if let Some(entry) = self.tasks.get_mut(&task.task_id) {

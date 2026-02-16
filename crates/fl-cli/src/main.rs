@@ -390,6 +390,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Agent governance policy management
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
     /// Generate shell completions for bash, zsh, fish, or powershell
     Completions {
         /// Shell to generate completions for
@@ -873,6 +878,23 @@ enum ConflictCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Display current policy configuration
+    Show,
+    /// Write default policies.toml to .flock/
+    Init,
+    /// Show policy decisions from the event log
+    Audit {
+        /// Filter by task ID
+        #[arg(long)]
+        task: Option<String>,
+        /// Filter by exploration ID
+        #[arg(long)]
+        exploration: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum ConflictStatusArg {
     Detected,
@@ -1080,6 +1102,14 @@ fn main() -> Result<()> {
                         intel.action,
                         intel.model.as_deref().unwrap_or("-"),
                         intel.confidence.map(|c| format!("{:.0}", c)).unwrap_or_else(|| "-".to_string()),
+                    ),
+                    EventKind::Policy(policy) => println!(
+                        "{}  policy  {}  {:?}  op={}  reason={}",
+                        event.timestamp,
+                        policy.policy_name,
+                        policy.verdict,
+                        policy.operation,
+                        policy.reason.as_deref().unwrap_or("-"),
                     ),
                 }
             }
@@ -3263,6 +3293,115 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Policy { command } => match command {
+            PolicyCommand::Show => {
+                let repo = Repo::discover(cwd)?;
+                let config = fl_core::load_policies_config(repo.root());
+                println!("Agent Governance Policies");
+                println!("========================");
+                println!();
+                println!("[scope]");
+                println!("  enabled = {}", config.scope.enabled);
+                println!("  enforce_mode = {:?}", config.scope.enforce_mode);
+                println!("  scope_mode = {:?}", config.scope.scope_mode);
+                println!();
+                println!("[budget]");
+                println!("  enabled = {}", config.budget.enabled);
+                if let Some(v) = config.budget.max_files_per_task {
+                    println!("  max_files_per_task = {}", v);
+                }
+                if let Some(v) = config.budget.max_files_per_exploration {
+                    println!("  max_files_per_exploration = {}", v);
+                }
+                if let Some(v) = config.budget.max_lines_per_task {
+                    println!("  max_lines_per_task = {}", v);
+                }
+                println!("  on_exceed = {:?}", config.budget.on_exceed);
+                println!();
+                println!("[rate_limits]");
+                println!("  enabled = {}", config.rate_limits.enabled);
+                if let Some(v) = config.rate_limits.max_explorations_per_task {
+                    println!("  max_explorations_per_task = {}", v);
+                }
+                if let Some(v) = config.rate_limits.max_undos_per_exploration {
+                    println!("  max_undos_per_exploration = {}", v);
+                }
+                if let Some(v) = config.rate_limits.max_checkpoints_per_window {
+                    println!("  max_checkpoints_per_window = {}", v);
+                }
+                println!("  window_secs = {}", config.rate_limits.window_secs);
+                println!("  on_exceed = {:?}", config.rate_limits.on_exceed);
+            }
+            PolicyCommand::Init => {
+                let repo = Repo::discover(cwd)?;
+                let path = repo.root().join(".flock/policies.toml");
+                if path.exists() {
+                    bail!("policies.toml already exists at {}", path.display());
+                }
+                std::fs::write(&path, fl_core::DEFAULT_POLICIES_TOML)?;
+                println!("Created {}", path.display());
+            }
+            PolicyCommand::Audit { task, exploration } => {
+                let repo = Repo::discover(cwd)?;
+                let state = repo.replay_state()?;
+
+                let task_filter = task.map(|s| {
+                    Uuid::parse_str(&s).unwrap_or_else(|_| {
+                        eprintln!("warning: invalid task UUID '{}', showing all", s);
+                        Uuid::nil()
+                    })
+                });
+                let exploration_filter = exploration.map(|s| {
+                    Uuid::parse_str(&s).unwrap_or_else(|_| {
+                        eprintln!("warning: invalid exploration UUID '{}', showing all", s);
+                        Uuid::nil()
+                    })
+                });
+
+                let decisions: Vec<_> = state
+                    .policy_decisions
+                    .iter()
+                    .filter(|d| {
+                        if let Some(tid) = task_filter {
+                            if !tid.is_nil() && d.task_id != Some(tid) {
+                                return false;
+                            }
+                        }
+                        if let Some(eid) = exploration_filter {
+                            if !eid.is_nil() && d.exploration_id != Some(eid) {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
+
+                if decisions.is_empty() {
+                    println!("No policy decisions recorded.");
+                } else {
+                    println!("Policy Decisions ({} total)", decisions.len());
+                    println!();
+                    for d in &decisions {
+                        println!(
+                            "  {} {} [{}] verdict={} op={}",
+                            d.timestamp, d.policy_name, d.policy_category, d.verdict, d.operation
+                        );
+                        if let Some(reason) = &d.reason {
+                            println!("    reason: {}", reason);
+                        }
+                        if let Some(tid) = d.task_id {
+                            println!("    task: {}", tid);
+                        }
+                        if let Some(eid) = d.exploration_id {
+                            println!("    exploration: {}", eid);
+                        }
+                        if !d.affected_files.is_empty() {
+                            println!("    files: {}", d.affected_files.join(", "));
+                        }
+                    }
+                }
+            }
+        },
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "fl", &mut io::stdout());

@@ -326,22 +326,24 @@ Server-side features live in the Roost repo. Tracked here for cross-reference on
 Enforce quality, consistency, and safety at the point of creation. Policies are configured in `.flock/policies.toml` (versioned with code) and enforced locally before events reach the server. See `../roost-git/docs/flock-agent-governance.md` for full design.
 
 ### 12.5a. Policy Engine Core
-- [ ] Parse and validate `.flock/policies.toml` configuration
-- [ ] Policy evaluation pipeline — intercept file writes, checkpoints, promotions, merges, and task lifecycle events
-- [ ] Three-verdict model: Allow / Gate (pause for human review) / Block (reject with structured error)
-- [ ] Policy decision audit trail — log which policies were evaluated and their verdicts in the event log
+- [x] Parse and validate `.flock/policies.toml` configuration
+- [x] Policy evaluation pipeline — intercept file writes, checkpoints, promotions, merges, and task lifecycle events
+- [x] Three-verdict model: Allow / Gate (pause for human review) / Block (reject with structured error)
+- [x] Policy decision audit trail — log which policies were evaluated and their verdicts in the event log
 
 ### 12.5b. Scope Enforcement
-- [ ] Check file writes against task-defined scope (path patterns or semantic scope)
-- [ ] Three enforcement modes: Block (reject out-of-scope), Gate (allow with justification), Split (auto-extract to discovery task)
+- [x] Scope policy types and evaluation logic (fl-policy crate)
+- [x] Three enforcement modes: Block (reject out-of-scope), Gate (allow with justification), Split (auto-extract to discovery task)
+- [ ] Wire scope enforcement into repo operations (requires task-level scope metadata)
 - [ ] Auto-create discovery tasks for out-of-scope observations in split mode
-- [ ] Configuration: `[scope] enforce = "split"`, `default_scope_mode = "path" | "semantic" | "module"`
+- [x] Configuration: `[scope] enforce = "split"`, `default_scope_mode = "path" | "semantic" | "module"`
 
 ### 12.5c. Change Budget Limits
-- [ ] Track files modified and lines changed per exploration and per task
+- [ ] Track files modified and lines changed per exploration and per task (requires file change metadata in checkpoint events)
 - [ ] Track semantic changes per exploration
-- [ ] Enforce configurable budgets with pause_and_flag / block / warn actions
-- [ ] Configuration: `[budget] max_files_per_task`, `max_lines_per_task`, `max_semantic_changes_per_exploration`
+- [x] Budget policy types and evaluation logic (fl-policy crate)
+- [x] Enforce configurable budgets with pause_and_flag / block / warn actions
+- [x] Configuration: `[budget] max_files_per_task`, `max_lines_per_task`, `max_semantic_changes_per_exploration`
 
 ### 12.5d. Commit Hygiene & Structured Intent Metadata
 - [ ] Extend checkpoint/commit events with structured intent fields: category (bugfix/feature/refactor/test/docs/style/chore), scope, confidence (high/medium/low), structured description
@@ -382,10 +384,10 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 - [ ] Configuration: `[tests] require_passing`, `require_new_coverage`, `min_coverage_percent`
 
 ### 12.5j. Rate Limits & Runaway Prevention
-- [ ] Track explorations per task, wall-clock time per exploration, undo operations per exploration, token budget per task
-- [ ] Enforce configurable limits with pause_and_escalate / warn / block actions
+- [x] Track explorations per task, wall-clock time per exploration, undo operations per exploration, token budget per task
+- [x] Enforce configurable limits with pause_and_escalate / warn / block actions
 - [ ] Escalation notifications with context (what the agent tried, links to exploration tree)
-- [ ] Configuration: `[rate_limits] max_explorations_per_task`, `max_time_per_exploration`, `max_undos_per_exploration`, `max_tokens_per_task`
+- [x] Configuration: `[rate_limits] max_explorations_per_task`, `max_time_per_exploration`, `max_undos_per_exploration`, `max_tokens_per_task`
 
 ### 12.5k. Regression Detection & Automatic Rollback
 - [ ] Post-merge monitoring — watch for test failures and benchmark regressions traceable to recently merged changes

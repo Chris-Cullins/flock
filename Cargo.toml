@@ -4,6 +4,7 @@ members = [
   "crates/fl-semantic",
   "crates/fl-workflow",
   "crates/fl-collab",
+  "crates/fl-policy",
   "crates/fl-bridge-git",
   "crates/fl-core",
   "crates/fl-cli",

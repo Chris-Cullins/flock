@@ -6,6 +6,7 @@ pub mod editor_protocol;
 pub mod event;
 pub mod hooks;
 pub mod intelligence;
+pub mod policies;
 pub mod reconcile;
 pub mod remote;
 pub mod repo;
@@ -20,7 +21,7 @@ pub use event::{
     IntelligenceAction, IntelligenceEvent,
     RemoteSyncAction, RemoteSyncEvent, ResourceUsageEvent, SessionAction, SessionEvent,
     SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
-    UndoMode,
+    UndoMode, PolicyEvent, PolicyVerdictKind,
 };
 pub use fl_storage::ApiCallRecord;
 pub use fl_storage::{CloneReport, PullReport, PushReport, RefKind, RemoteUrl, RepoRef, RoostEntry, WorkspaceRefConfig};
@@ -40,6 +41,7 @@ pub use intelligence::{
     IntelligenceConfig, IntelligenceIndexReport, IntentExtractionResult, IntentSource, QueryResult,
     SearchIndex,
 };
+pub use policies::{PoliciesConfig, DEFAULT_POLICIES_TOML, load_policies_config, parse_policies_config};
 pub use semantic::{
     SemanticChange, SemanticChangeKind, SemanticCompatibility, SemanticCompatibilityStatus,
     SemanticConflictClassification, SemanticFileDiff, SemanticImpact, SemanticMergeConflict,
