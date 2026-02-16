@@ -10,9 +10,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::{Signer, SigningKey};
 use fl_storage::{
     BlockRef, CONFIG_FILE, ChunkConfig, ContentStore, FLOCK_DIR, FileEntry, FileIndex, KEY_DIR,
-    RefKind, RefStore, RepoRef, SIGNING_KEY_FILE, SNAPSHOT_DIR, SnapshotIndex,
-    WorkspaceRefConfig, chunk_data,
+    MaterializedStateStore, RefKind, RefStore, RepoRef, SECRETS_CONFIG_FILE, SIGNING_KEY_FILE,
+    SNAPSHOT_DIR, SnapshotIndex, WorkspaceRefConfig, chunk_data,
 };
+use ignore::WalkBuilder;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -30,7 +31,8 @@ use crate::semantic::{
     SemanticMergeResult, diff as semantic_diff, impact_symbols, supported_source,
 };
 use fl_workflow::{
-    build_task_graph, previous_checkpoint_before, replay_state, resolve_target_event, to_undo_mode,
+    build_task_graph, previous_checkpoint_before, replay_state, replay_state_incremental,
+    resolve_target_event, to_undo_mode,
 };
 
 pub use fl_collab::{
@@ -51,6 +53,15 @@ pub struct FsckReport {
     pub checkpoint_count: usize,
     pub snapshot_count: usize,
     pub ref_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusReport {
+    pub branch: String,
+    pub checkpoint_id: Option<String>,
+    pub new_files: Vec<String>,
+    pub modified_files: Vec<String>,
+    pub deleted_files: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +267,14 @@ impl Repo {
                 .with_context(|| format!("failed to write {}", config.display()))?;
         }
 
+        let secrets_config = self.root.join(SECRETS_CONFIG_FILE);
+        if !secrets_config.exists() {
+            fs::write(&secrets_config, crate::secrets::DEFAULT_SECRETS_TOML)
+                .with_context(|| {
+                    format!("failed to write {}", secrets_config.display())
+                })?;
+        }
+
         if mode == RepoMode::GitColocated {
             self.ensure_git_repository()?;
             self.ensure_git_exclude_entry(".flock/")?;
@@ -265,14 +284,43 @@ impl Repo {
     }
 
     pub fn create_checkpoint(&self, message: Option<String>) -> Result<Event> {
+        self.create_checkpoint_with_options(message, false)
+    }
+
+    pub fn create_checkpoint_with_options(
+        &self,
+        message: Option<String>,
+        allow_secrets: bool,
+    ) -> Result<Event> {
         self.assert_initialized()?;
+
+        // Run secret detection before creating the checkpoint.
+        if !allow_secrets {
+            self.scan_working_directory_for_secrets()?;
+        }
+
         let label = message
             .as_deref()
             .map(normalize_label)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("checkpoint-{}", Uuid::new_v4().simple()));
 
-        self.create_checkpoint_with_lineage(label, message, None)
+        let event = self.create_checkpoint_with_lineage(label, message, None)?;
+
+        // If secrets were explicitly allowed, record it in the event log as an
+        // audit trail.
+        if allow_secrets {
+            self.append_event(EventKind::GitBridge(GitBridgeEvent {
+                action: GitBridgeAction::Commit,
+                success: true,
+                detail: format!(
+                    "checkpoint={} allow_secrets=true (secret scan bypassed by user)",
+                    event.id
+                ),
+            }))?;
+        }
+
+        Ok(event)
     }
 
     pub fn list_events(&self) -> Result<Vec<Event>> {
@@ -355,7 +403,47 @@ impl Repo {
     pub fn replay_state(&self) -> Result<ReplayedState> {
         self.assert_initialized()?;
         let events = self.list_events()?;
+
+        // Try to use materialized state for incremental replay
+        let store = MaterializedStateStore::for_root(self.root());
+        if let Ok(Some((event_count, json))) = store.load_latest() {
+            if event_count <= events.len() {
+                if let Ok(base_state) = serde_json::from_str::<ReplayedState>(&json) {
+                    return replay_state_incremental(&events, event_count, base_state);
+                }
+            }
+        }
+
+        // Fallback to full replay
         replay_state(&events)
+    }
+
+    /// Materialize the current replay state for faster future replay.
+    pub fn materialize(&self) -> Result<usize> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let json = serde_json::to_string(&state)
+            .context("failed to serialize replayed state")?;
+        let store = MaterializedStateStore::for_root(self.root());
+        store.save(events.len(), &json)?;
+        Ok(events.len())
+    }
+
+    /// Migrate event log from single JSONL to segmented format.
+    pub fn migrate_event_log(&self) -> Result<fl_storage::EventLogMigrationReport> {
+        self.assert_initialized()?;
+        fl_storage::migrate_to_segmented(self.root())
+    }
+
+    /// Compact the event log, archiving old non-structural events.
+    pub fn compact(&self, older_than: std::time::Duration) -> Result<fl_storage::CompactionReport> {
+        self.assert_initialized()?;
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        fl_storage::compact_event_log(self.root(), older_than, now_nanos)
     }
 
     pub fn fsck(&self) -> Result<FsckReport> {
@@ -582,6 +670,82 @@ impl Repo {
             checkpoint_count: seen_checkpoints.len(),
             snapshot_count,
             ref_count: refs.len(),
+        })
+    }
+
+    pub fn status(&self) -> Result<StatusReport> {
+        self.assert_initialized()?;
+
+        // Determine current branch from refs.
+        let refs = self.list_refs()?;
+        let branch = refs
+            .iter()
+            .find(|r| r.kind == RefKind::Branch)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "main".to_string());
+
+        let colocated = self.repo_mode()? == RepoMode::GitColocated;
+
+        // Collect all files in the working directory (using ignore filtering).
+        let current_files = collect_all_files_with_mode(self.root(), true, colocated)?;
+
+        let checkpoint = self.latest_checkpoint();
+        if checkpoint.is_none() {
+            // No checkpoint yet — everything is new.
+            return Ok(StatusReport {
+                branch,
+                checkpoint_id: None,
+                new_files: current_files.into_iter().collect(),
+                modified_files: Vec::new(),
+                deleted_files: Vec::new(),
+            });
+        }
+        let checkpoint = checkpoint.unwrap();
+        let checkpoint_id = checkpoint.id.to_string();
+        let EventKind::Checkpoint(payload) = checkpoint.kind else {
+            bail!("latest checkpoint event had unexpected kind");
+        };
+
+        let snapshot_root = self.snapshot_path(payload.snapshot_id);
+        let snapshot_files = collect_all_files_with_mode(&snapshot_root, false, false)?;
+
+        let mut new_files = Vec::new();
+        let mut modified_files = Vec::new();
+        let mut deleted_files = Vec::new();
+
+        // Files in current but not in snapshot = new.
+        for file in &current_files {
+            if !snapshot_files.contains(file) {
+                new_files.push(file.clone());
+            }
+        }
+
+        // Files in both = check for modifications.
+        for file in &current_files {
+            if snapshot_files.contains(file) {
+                let current_path = self.root().join(file);
+                let snapshot_path = snapshot_root.join(file);
+                let current_content = fs::read(&current_path).ok();
+                let snapshot_content = fs::read(&snapshot_path).ok();
+                if current_content != snapshot_content {
+                    modified_files.push(file.clone());
+                }
+            }
+        }
+
+        // Files in snapshot but not in current = deleted.
+        for file in &snapshot_files {
+            if !current_files.contains(file) {
+                deleted_files.push(file.clone());
+            }
+        }
+
+        Ok(StatusReport {
+            branch,
+            checkpoint_id: Some(checkpoint_id),
+            new_files,
+            modified_files,
+            deleted_files,
         })
     }
 
@@ -2182,6 +2346,36 @@ impl Repo {
         })
     }
 
+    /// Scan the working directory for secrets and return an error if any are
+    /// found and the config is set to block.
+    fn scan_working_directory_for_secrets(&self) -> Result<()> {
+        use crate::secrets::{format_findings, load_secrets_config, scan_files_for_secrets};
+
+        let config = load_secrets_config(self.root());
+        let colocated = self.repo_mode()? == RepoMode::GitColocated;
+
+        // Collect tracked files using the same walker as checkpoint.
+        let files: Vec<PathBuf> = build_repo_walker(&self.root, colocated)
+            .build()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+            .map(|e| e.into_path())
+            .collect();
+
+        let report = scan_files_for_secrets(&self.root, &files, &config)?;
+
+        if report.has_secrets() {
+            let msg = format_findings(&report.findings);
+            if config.block {
+                bail!("{}", msg);
+            } else {
+                eprintln!("warning: {}", msg);
+            }
+        }
+
+        Ok(())
+    }
+
     fn create_checkpoint_with_lineage(
         &self,
         label: String,
@@ -2260,7 +2454,8 @@ impl Repo {
                 )
             })?;
 
-            copy_tree(source_root, &snapshot_path, apply_skip)?;
+            let colocated = self.repo_mode()? == RepoMode::GitColocated;
+            copy_tree_with_mode(source_root, &snapshot_path, apply_skip, colocated)?;
 
             self.create_checkpoint_from_existing_snapshot_with_lineage(
                 snapshot_id,
@@ -2518,30 +2713,31 @@ impl Repo {
         let chunk_config = ChunkConfig::default();
         let mut index = SnapshotIndex::new(snapshot_id);
 
-        let walker = WalkDir::new(source_root)
-            .into_iter()
-            .filter_entry(|entry| !apply_skip || !should_skip_path(source_root, entry.path()));
+        // Collect file paths using either the ignore-aware walker or plain walkdir.
+        let file_paths: Vec<PathBuf> = if apply_skip {
+            let colocated = self.repo_mode()? == RepoMode::GitColocated;
+            build_repo_walker(source_root, colocated)
+                .build()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+                .map(|e| e.into_path())
+                .collect()
+        } else {
+            WalkDir::new(source_root)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.into_path())
+                .collect()
+        };
 
-        for entry in walker {
-            let entry = entry.context("failed while walking source for native snapshot")?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let rel_path = entry
-                .path()
+        for path in &file_paths {
+            let rel_path = path
                 .strip_prefix(source_root)
                 .context("failed to compute relative path for native snapshot")?;
 
-            if apply_skip && should_skip_relative(rel_path) {
-                continue;
-            }
-
-            let contents = fs::read(entry.path()).with_context(|| {
-                format!(
-                    "failed to read {} for native snapshot",
-                    entry.path().display()
-                )
+            let contents = fs::read(path).with_context(|| {
+                format!("failed to read {} for native snapshot", path.display())
             })?;
 
             let file_hash = blake3::hash(&contents).to_hex().to_string();
@@ -4275,6 +4471,13 @@ fn collect_snapshot_files(snapshot_dir: &Path) -> Result<HashMap<String, Vec<u8>
     Ok(files)
 }
 
+/// Directories that are always skipped during individual path checks (snapshot
+/// restore, workspace clear, scoped undo validation).
+const ALWAYS_SKIP_DIRS: &[&str] = &[".git", ".flock", "target", "node_modules", "__pycache__"];
+
+/// Check whether a relative path should be skipped based on built-in directory
+/// names. Used for path-level checks outside of tree walking (where
+/// `build_repo_walker` handles filtering instead).
 fn should_skip_path(root: &Path, path: &Path) -> bool {
     match path.strip_prefix(root) {
         Ok(rel) => should_skip_relative(rel),
@@ -4283,55 +4486,141 @@ fn should_skip_path(root: &Path, path: &Path) -> bool {
 }
 
 fn should_skip_relative(path: &Path) -> bool {
-    let skip = [".git", ".flock", "target", "node_modules"];
-
     for component in path.components() {
         let Component::Normal(name) = component else {
             continue;
         };
-        if skip.iter().any(|item| name == *item) {
+        if ALWAYS_SKIP_DIRS.iter().any(|item| name == *item) {
             return true;
         }
     }
-
     false
 }
 
+/// Built-in patterns that are always ignored (directories and files that should
+/// never be tracked by flock).
+const BUILTIN_IGNORE_PATTERNS: &[&str] = &[
+    ".flock/",
+    ".git/",
+    "node_modules/",
+    "target/",
+    "__pycache__/",
+    ".env",
+];
+
+/// Build a `WalkBuilder` for the given root directory with `.flockignore`
+/// support and built-in default patterns.
+///
+/// When `colocated` is true and no `.flockignore` exists, the builder will
+/// also respect `.gitignore` files.
+fn build_repo_walker(root: &Path, colocated: bool) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+
+    // Disable default gitignore/hidden handling — we control everything.
+    builder.standard_filters(false);
+    builder.hidden(false);
+
+    let flockignore_path = root.join(".flockignore");
+    let has_flockignore = flockignore_path.is_file();
+
+    // Disable all git-specific ignore handling; we use custom ignore filenames
+    // instead so it works regardless of git repo detection.
+    builder.git_ignore(false);
+    builder.git_global(false);
+    builder.git_exclude(false);
+
+    // Add the appropriate custom ignore filename.
+    if has_flockignore {
+        builder.add_custom_ignore_filename(".flockignore");
+    } else if colocated {
+        // Fall back to .gitignore in colocated mode when no .flockignore exists.
+        builder.add_custom_ignore_filename(".gitignore");
+    }
+
+    // Add built-in patterns via an override set so they always apply.
+    let mut overrides = ignore::overrides::OverrideBuilder::new(root);
+    for pattern in BUILTIN_IGNORE_PATTERNS {
+        // Override patterns use `!` prefix to negate (ignore) matches.
+        let _ = overrides.add(&format!("!{}", pattern));
+    }
+    if let Ok(built) = overrides.build() {
+        builder.overrides(built);
+    }
+
+    builder
+}
+
 fn copy_tree(source_root: &Path, destination_root: &Path, apply_skip: bool) -> Result<()> {
-    let walker = WalkDir::new(source_root)
-        .into_iter()
-        .filter_entry(|entry| !apply_skip || !should_skip_path(source_root, entry.path()));
+    copy_tree_with_mode(source_root, destination_root, apply_skip, false)
+}
 
-    for entry in walker {
-        let entry = entry.context("failed while walking source tree for copy")?;
-        let path = entry.path();
-        if path == source_root {
-            continue;
-        }
+fn copy_tree_with_mode(
+    source_root: &Path,
+    destination_root: &Path,
+    apply_skip: bool,
+    colocated: bool,
+) -> Result<()> {
+    if apply_skip {
+        let walker = build_repo_walker(source_root, colocated);
+        for entry in walker.build() {
+            let entry = entry.context("failed while walking source tree for copy")?;
+            let path = entry.path();
+            if path == source_root {
+                continue;
+            }
 
-        let rel = path
-            .strip_prefix(source_root)
-            .context("failed to compute relative path while copying tree")?;
-        if apply_skip && should_skip_relative(rel) {
-            continue;
-        }
+            let rel = path
+                .strip_prefix(source_root)
+                .context("failed to compute relative path while copying tree")?;
 
-        let target = destination_root.join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)
-                .with_context(|| format!("failed to create {}", target.display()))?;
-            continue;
-        }
+            let target = destination_root.join(rel);
+            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                fs::create_dir_all(&target)
+                    .with_context(|| format!("failed to create {}", target.display()))?;
+                continue;
+            }
 
-        if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("failed to create parent directory {}", parent.display())
+            if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory {}", parent.display())
+                    })?;
+                }
+                fs::copy(path, &target).with_context(|| {
+                    format!("failed to copy {} -> {}", path.display(), target.display())
                 })?;
             }
-            fs::copy(path, &target).with_context(|| {
-                format!("failed to copy {} -> {}", path.display(), target.display())
-            })?;
+        }
+    } else {
+        // No filtering — plain walkdir for snapshot directories, etc.
+        for entry in WalkDir::new(source_root) {
+            let entry = entry.context("failed while walking source tree for copy")?;
+            let path = entry.path();
+            if path == source_root {
+                continue;
+            }
+
+            let rel = path
+                .strip_prefix(source_root)
+                .context("failed to compute relative path while copying tree")?;
+            let target = destination_root.join(rel);
+
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&target)
+                    .with_context(|| format!("failed to create {}", target.display()))?;
+                continue;
+            }
+
+            if entry.file_type().is_file() {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory {}", parent.display())
+                    })?;
+                }
+                fs::copy(path, &target).with_context(|| {
+                    format!("failed to copy {} -> {}", path.display(), target.display())
+                })?;
+            }
         }
     }
 
@@ -4366,29 +4655,89 @@ fn clear_directory_except(root: &Path, keep_names: &[&str]) -> Result<()> {
 }
 
 fn collect_source_files(root: &Path, apply_skip: bool) -> Result<BTreeSet<PathBuf>> {
+    collect_source_files_with_mode(root, apply_skip, false)
+}
+
+fn collect_source_files_with_mode(
+    root: &Path,
+    apply_skip: bool,
+    colocated: bool,
+) -> Result<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
 
-    let walker = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|entry| !apply_skip || !should_skip_path(root, entry.path()));
+    if apply_skip {
+        let walker = build_repo_walker(root, colocated);
+        for entry in walker.build() {
+            let entry = entry.context("failed while scanning source files")?;
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                continue;
+            }
 
-    for entry in walker {
-        let entry = entry.context("failed while scanning source files")?;
-        if !entry.file_type().is_file() {
-            continue;
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .context("failed to compute relative source path")?;
+
+            if supported_source(rel) {
+                files.insert(rel.to_path_buf());
+            }
         }
+    } else {
+        for entry in WalkDir::new(root) {
+            let entry = entry.context("failed while scanning source files")?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
 
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .context("failed to compute relative source path")?;
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .context("failed to compute relative source path")?;
 
-        if apply_skip && should_skip_relative(rel) {
-            continue;
+            if supported_source(rel) {
+                files.insert(rel.to_path_buf());
+            }
         }
+    }
 
-        if supported_source(rel) {
-            files.insert(rel.to_path_buf());
+    Ok(files)
+}
+
+/// Collect all files (not just source files) under root, returning relative
+/// path strings. Used by `status()` to compare working directory vs snapshot.
+fn collect_all_files_with_mode(
+    root: &Path,
+    apply_skip: bool,
+    colocated: bool,
+) -> Result<BTreeSet<String>> {
+    let mut files = BTreeSet::new();
+
+    if apply_skip {
+        let walker = build_repo_walker(root, colocated);
+        for entry in walker.build() {
+            let entry = entry.context("failed while scanning files")?;
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                continue;
+            }
+
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .context("failed to compute relative path")?;
+            files.insert(rel.to_string_lossy().replace('\\', "/"));
+        }
+    } else {
+        for entry in WalkDir::new(root) {
+            let entry = entry.context("failed while scanning files")?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .context("failed to compute relative path")?;
+            files.insert(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 
@@ -6735,5 +7084,193 @@ mod tests {
 
         let rebases = repo.list_rebases(None).expect("list rebases");
         assert!(rebases.is_empty());
+    }
+
+    #[test]
+    fn flockignore_filters_default_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Create files in directories that should be ignored by default.
+        let node_mod = dir.path().join("node_modules");
+        fs::create_dir_all(&node_mod).unwrap();
+        fs::write(node_mod.join("dep.js"), "module.exports = {}").unwrap();
+
+        let pycache = dir.path().join("__pycache__");
+        fs::create_dir_all(&pycache).unwrap();
+        fs::write(pycache.join("mod.pyc"), "bytecode").unwrap();
+
+        let target = dir.path().join("target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(target.join("debug").join("binary"), "elf").unwrap();
+
+        // Create a file that should be tracked.
+        fs::write(dir.path().join("main.ts"), "console.log('hello')").unwrap();
+
+        let event = repo
+            .create_checkpoint(Some("test".to_string()))
+            .expect("checkpoint");
+        let EventKind::Checkpoint(payload) = event.kind else {
+            panic!("expected checkpoint event");
+        };
+
+        let snapshot_root = dir.path().join(".flock").join("snapshots").join(payload.snapshot_id.to_string());
+        // main.ts should be in the snapshot.
+        assert!(snapshot_root.join("main.ts").exists());
+        // Ignored directories should NOT be in the snapshot.
+        assert!(!snapshot_root.join("node_modules").exists());
+        assert!(!snapshot_root.join("__pycache__").exists());
+        assert!(!snapshot_root.join("target").exists());
+    }
+
+    #[test]
+    fn flockignore_file_patterns_are_respected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Create a .flockignore file.
+        fs::write(dir.path().join(".flockignore"), "*.log\nbuild/\n").unwrap();
+
+        // Create files matching and not matching the ignore patterns.
+        fs::write(dir.path().join("app.ts"), "const x = 1;").unwrap();
+        fs::write(dir.path().join("debug.log"), "log data").unwrap();
+        let build_dir = dir.path().join("build");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::write(build_dir.join("output.js"), "compiled").unwrap();
+
+        let event = repo
+            .create_checkpoint(Some("ignore-test".to_string()))
+            .expect("checkpoint");
+        let EventKind::Checkpoint(payload) = event.kind else {
+            panic!("expected checkpoint event");
+        };
+
+        let snapshot_root = dir.path().join(".flock").join("snapshots").join(payload.snapshot_id.to_string());
+        // app.ts should be in the snapshot.
+        assert!(snapshot_root.join("app.ts").exists());
+        // Ignored files and directories should NOT be in the snapshot.
+        assert!(!snapshot_root.join("debug.log").exists());
+        assert!(!snapshot_root.join("build").exists());
+    }
+
+    #[test]
+    fn colocated_mode_falls_back_to_gitignore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated().expect("init colocated");
+
+        // Create a .gitignore (no .flockignore).
+        fs::write(dir.path().join(".gitignore"), "*.tmp\ndist/\n").unwrap();
+
+        fs::write(dir.path().join("app.ts"), "const x = 1;").unwrap();
+        fs::write(dir.path().join("temp.tmp"), "temp data").unwrap();
+        let dist_dir = dir.path().join("dist");
+        fs::create_dir_all(&dist_dir).unwrap();
+        fs::write(dist_dir.join("bundle.js"), "bundled").unwrap();
+
+        let event = repo
+            .create_checkpoint(Some("gitignore-test".to_string()))
+            .expect("checkpoint");
+        let EventKind::Checkpoint(payload) = event.kind else {
+            panic!("expected checkpoint event");
+        };
+
+        let snapshot_root = dir.path().join(".flock").join("snapshots").join(payload.snapshot_id.to_string());
+        assert!(snapshot_root.join("app.ts").exists());
+        // .gitignore patterns should be respected in colocated mode.
+        assert!(!snapshot_root.join("temp.tmp").exists());
+        assert!(!snapshot_root.join("dist").exists());
+    }
+
+    #[test]
+    fn colocated_mode_prefers_flockignore_over_gitignore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init_colocated().expect("init colocated");
+
+        // Both ignore files exist — .flockignore should win.
+        fs::write(dir.path().join(".gitignore"), "*.tmp\n").unwrap();
+        fs::write(dir.path().join(".flockignore"), "*.bak\n").unwrap();
+
+        fs::write(dir.path().join("app.ts"), "const x = 1;").unwrap();
+        fs::write(dir.path().join("temp.tmp"), "temp data").unwrap();
+        fs::write(dir.path().join("old.bak"), "backup").unwrap();
+
+        let event = repo
+            .create_checkpoint(Some("prefer-flockignore".to_string()))
+            .expect("checkpoint");
+        let EventKind::Checkpoint(payload) = event.kind else {
+            panic!("expected checkpoint event");
+        };
+
+        let snapshot_root = dir.path().join(".flock").join("snapshots").join(payload.snapshot_id.to_string());
+        assert!(snapshot_root.join("app.ts").exists());
+        // .tmp should NOT be ignored (gitignore is disabled when flockignore exists).
+        assert!(snapshot_root.join("temp.tmp").exists());
+        // .bak should be ignored (flockignore rule).
+        assert!(!snapshot_root.join("old.bak").exists());
+    }
+
+    #[test]
+    fn status_reports_changes_since_last_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Before any checkpoint, all files should be new.
+        fs::write(dir.path().join("main.ts"), "const a = 1;").unwrap();
+        let report = repo.status().expect("status before checkpoint");
+        assert!(report.checkpoint_id.is_none());
+        assert!(report.new_files.contains(&"main.ts".to_string()));
+
+        // Checkpoint.
+        repo.create_checkpoint(Some("initial".to_string()))
+            .expect("checkpoint");
+
+        // No changes — status should be clean.
+        let report = repo.status().expect("status after checkpoint");
+        assert!(report.checkpoint_id.is_some());
+        assert!(report.new_files.is_empty());
+        assert!(report.modified_files.is_empty());
+        assert!(report.deleted_files.is_empty());
+
+        // Modify a file.
+        fs::write(dir.path().join("main.ts"), "const a = 2;").unwrap();
+        let report = repo.status().expect("status after modification");
+        assert!(report.modified_files.contains(&"main.ts".to_string()));
+
+        // Add a new file.
+        fs::write(dir.path().join("helper.ts"), "export {}").unwrap();
+        let report = repo.status().expect("status after new file");
+        assert!(report.new_files.contains(&"helper.ts".to_string()));
+
+        // Delete a file.
+        fs::remove_file(dir.path().join("main.ts")).unwrap();
+        let report = repo.status().expect("status after delete");
+        assert!(report.deleted_files.contains(&"main.ts".to_string()));
+    }
+
+    #[test]
+    fn status_ignores_flockignored_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        fs::write(dir.path().join(".flockignore"), "*.log\n").unwrap();
+        fs::write(dir.path().join("app.ts"), "const x = 1;").unwrap();
+        fs::write(dir.path().join("debug.log"), "log").unwrap();
+
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        // Modify the ignored file.
+        fs::write(dir.path().join("debug.log"), "updated log").unwrap();
+
+        let report = repo.status().expect("status");
+        // The .log file should not appear in any change lists.
+        assert!(!report.modified_files.contains(&"debug.log".to_string()));
+        assert!(!report.new_files.contains(&"debug.log".to_string()));
     }
 }

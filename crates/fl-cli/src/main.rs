@@ -10,7 +10,8 @@ use fl_core::repo::parse_duration_spec;
 use fl_core::{
     ApiCallRecord, ConflictStatus, DecisionAction, EventKind, ExplorationStatus, GateCondition,
     GatePolicy, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
-    SemanticConflictClassification, SemanticRisk, TaskRelation, TaskStatus, UndoRequest,
+    SemanticConflictClassification, SemanticRisk, TaskRelation, TaskStatus,
+    UndoRequest,
 };
 use uuid::Uuid;
 
@@ -36,11 +37,20 @@ enum Command {
     Checkpoint {
         #[arg(short = 'm', long = "message")]
         message: Option<String>,
+        /// Bypass secret detection (recorded in audit log)
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// Show the event log
     Log,
     /// Verify repository integrity
     Fsck,
+    /// Show working directory status vs last checkpoint
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show semantic diff since last checkpoint
     Diff {
         /// Enable semantic diff output
@@ -196,6 +206,16 @@ enum Command {
         /// Migrate to native block-level storage
         #[arg(long)]
         native: bool,
+    },
+    /// Materialize replay state for faster future operations
+    Materialize,
+    /// Migrate event log to segmented format
+    MigrateEventLog,
+    /// Compact the event log by archiving old events
+    Compact {
+        /// Archive events older than this duration (e.g. 180d, 30d, 1y)
+        #[arg(long, default_value = "180d")]
+        older_than: String,
     },
     /// Generate shell completions for bash, zsh, fish, or powershell
     Completions {
@@ -607,9 +627,12 @@ fn main() -> Result<()> {
                 repo.root().display()
             );
         }
-        Command::Checkpoint { message } => {
+        Command::Checkpoint {
+            message,
+            allow_secrets,
+        } => {
             let repo = Repo::discover(cwd)?;
-            let event = repo.create_checkpoint(message)?;
+            let event = repo.create_checkpoint_with_options(message, allow_secrets)?;
             let checkpoint_id = event.id;
             let EventKind::Checkpoint(payload) = event.kind else {
                 bail!("unexpected event payload for checkpoint")
@@ -721,6 +744,49 @@ fn main() -> Result<()> {
                 report.snapshot_count,
                 report.ref_count
             );
+        }
+        Command::Status { json } => {
+            let repo = Repo::discover(cwd)?;
+            let report = repo.status()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "branch": report.branch,
+                        "checkpoint": report.checkpoint_id,
+                        "new": report.new_files,
+                        "modified": report.modified_files,
+                        "deleted": report.deleted_files,
+                    }))?
+                );
+            } else {
+                println!("On branch {}", report.branch);
+                if let Some(ref cp) = report.checkpoint_id {
+                    println!("Latest checkpoint: {}", cp);
+                } else {
+                    println!("No checkpoints yet");
+                }
+                let total =
+                    report.new_files.len() + report.modified_files.len() + report.deleted_files.len();
+                if total == 0 {
+                    println!("\nNothing changed since last checkpoint.");
+                } else {
+                    println!();
+                    for f in &report.new_files {
+                        println!("  new:      {}", f);
+                    }
+                    for f in &report.modified_files {
+                        println!("  modified: {}", f);
+                    }
+                    for f in &report.deleted_files {
+                        println!("  deleted:  {}", f);
+                    }
+                    println!(
+                        "\n{} file(s) changed",
+                        total
+                    );
+                }
+            }
         }
         Command::Diff {
             semantic,
@@ -2306,6 +2372,28 @@ fn main() -> Result<()> {
                     ratio * 100.0
                 );
             }
+        }
+        Command::Materialize => {
+            let repo = Repo::discover(cwd)?;
+            let event_count = repo.materialize()?;
+            println!("materialized state at {} events", event_count);
+        }
+        Command::MigrateEventLog => {
+            let repo = Repo::discover(cwd)?;
+            let report = repo.migrate_event_log()?;
+            println!(
+                "migrated {} events into {} segments",
+                report.events_migrated, report.segments_created
+            );
+        }
+        Command::Compact { older_than } => {
+            let repo = Repo::discover(cwd)?;
+            let duration = parse_duration_spec(&older_than)?;
+            let report = repo.compact(duration)?;
+            println!(
+                "compacted event log: {} total, {} retained, {} archived",
+                report.total_events, report.retained_events, report.archived_events
+            );
         }
         Command::Completions { shell } => {
             let mut cmd = Cli::command();

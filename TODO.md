@@ -31,21 +31,21 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Add repository refs abstraction (branches/tags/workspaces)
 - [x] Add Merkle snapshot hash generation for checkpoints
 - [x] Add storage integrity verifier command (`fl fsck`)
-- [ ] Implement `.flockignore` support:
-  - [ ] `.flockignore` file format (gitignore-compatible glob patterns)
-  - [ ] Respect `.flockignore` during `fl checkpoint` snapshot creation (exclude matched paths)
-  - [ ] Respect `.flockignore` during `fl diff` and `fl quick-save`
-  - [ ] Built-in default ignores (`.flock/`, `.git/`, `node_modules/`, `target/`, `__pycache__/`, `.env`)
-  - [ ] Nested `.flockignore` files (per-directory overrides, like gitignore)
-  - [ ] `fl status` command showing tracked/untracked/ignored files
-  - [ ] In colocated mode, optionally fall back to `.gitignore` if no `.flockignore` exists
-- [ ] Built-in secret detection on commit:
-  - [ ] Scan file contents during `fl checkpoint` for known secret patterns (AWS keys, OpenAI keys, private keys, generic high-entropy tokens)
-  - [ ] Hard block by default — commit fails with warning showing file:line and matched pattern
-  - [ ] `--allow-secrets` flag to override (recorded in event log as audit trail)
-  - [ ] `.flock/secrets.toml` config: custom patterns, allowed paths (test fixtures), toggle block vs warn
-  - [ ] Built-in pattern library: AWS (`AKIA...`), GCP, Azure, OpenAI (`sk-...`), GitHub tokens (`ghp_...`), private keys (`-----BEGIN.*PRIVATE KEY-----`), generic `password=`/`secret=`/`token=` assignments
-  - [ ] No `--no-verify` style escape hatch — `--allow-secrets` is the only bypass and it's auditable
+- [x] Implement `.flockignore` support:
+  - [x] `.flockignore` file format (gitignore-compatible glob patterns)
+  - [x] Respect `.flockignore` during `fl checkpoint` snapshot creation (exclude matched paths)
+  - [x] Respect `.flockignore` during `fl diff` and `fl quick-save`
+  - [x] Built-in default ignores (`.flock/`, `.git/`, `node_modules/`, `target/`, `__pycache__/`, `.env`)
+  - [x] Nested `.flockignore` files (per-directory overrides, like gitignore)
+  - [x] `fl status` command showing tracked/untracked/ignored files
+  - [x] In colocated mode, optionally fall back to `.gitignore` if no `.flockignore` exists
+- [x] Built-in secret detection on commit:
+  - [x] Scan file contents during `fl checkpoint` for known secret patterns (AWS keys, OpenAI keys, private keys, generic high-entropy tokens)
+  - [x] Hard block by default — commit fails with warning showing file:line and matched pattern
+  - [x] `--allow-secrets` flag to override (recorded in event log as audit trail)
+  - [x] `.flock/secrets.toml` config: custom patterns, allowed paths (test fixtures), toggle block vs warn
+  - [x] Built-in pattern library: AWS (`AKIA...`), GCP, Azure, OpenAI (`sk-...`), GitHub tokens (`ghp_...`), private keys (`-----BEGIN.*PRIVATE KEY-----`), generic `password=`/`secret=`/`token=` assignments
+  - [x] No `--no-verify` style escape hatch — `--allow-secrets` is the only bypass and it's auditable
 - [ ] Declarative hook system (`.flock/hooks.toml`, version-controlled):
   - [ ] Hook points: `pre-commit`, `post-commit`, `pre-push`, `post-push`, `pre-merge`, `post-merge`, `pre-explore`, `post-explore-promote`
   - [ ] Declarative config: command, block_on_failure (bool), timeout

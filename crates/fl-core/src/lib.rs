@@ -1,5 +1,6 @@
 pub mod event;
 pub mod repo;
+pub mod secrets;
 pub mod semantic;
 
 pub use event::{
@@ -14,7 +15,7 @@ pub use fl_storage::{RefKind, RepoRef, WorkspaceRefConfig};
 pub use repo::{
     ConflictDetail, ConflictStatus, ConflictSummary, DecisionSummary, ExplorationStatus,
     ExplorationSummary, FsckReport, GateConditionKind, GatePolicyKind, GateStatus, GateSummary,
-    ImpactReport, LockStatus, LockSummary, PresenceSummary, ProvenanceInfo, RebaseResult,
+    ImpactReport, LockStatus, LockSummary, PresenceSummary, ProvenanceInfo, RebaseResult, StatusReport,
     RebaseSummary, ReplayedState, Repo, ResourceUsageTotals, ReviewStats, ReviewSummary,
     SessionReplay, SessionStatus, SessionSummary, ShadowSafetyCheck, ShadowSafetyReport,
     SubscriptionNotify, SubscriptionStatus, SubscriptionSummary, TaskEdge, TaskGraph, TaskRelation,
