@@ -39,6 +39,13 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [ ] Nested `.flockignore` files (per-directory overrides, like gitignore)
   - [ ] `fl status` command showing tracked/untracked/ignored files
   - [ ] In colocated mode, optionally fall back to `.gitignore` if no `.flockignore` exists
+- [ ] Built-in secret detection on commit:
+  - [ ] Scan file contents during `fl checkpoint` for known secret patterns (AWS keys, OpenAI keys, private keys, generic high-entropy tokens)
+  - [ ] Hard block by default — commit fails with warning showing file:line and matched pattern
+  - [ ] `--allow-secrets` flag to override (recorded in event log as audit trail)
+  - [ ] `.flock/secrets.toml` config: custom patterns, allowed paths (test fixtures), toggle block vs warn
+  - [ ] Built-in pattern library: AWS (`AKIA...`), GCP, Azure, OpenAI (`sk-...`), GitHub tokens (`ghp_...`), private keys (`-----BEGIN.*PRIVATE KEY-----`), generic `password=`/`secret=`/`token=` assignments
+  - [ ] No `--no-verify` style escape hatch — `--allow-secrets` is the only bypass and it's auditable
 
 ## 2. Git/JJ Compatibility Layer
 
