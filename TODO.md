@@ -130,6 +130,20 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [ ] verify
   - [ ] record
 
+## 8.5. Semantic Merge Improvements
+
+These should land before the storage rework — they improve merge quality independent of the backend.
+
+- [ ] Auto-resolve StyleOnly vs logic conflicts in semantic merge (one side is whitespace-only → auto-pick the logic change)
+- [ ] Cross-file semantic conflict detection (signature change in file A breaks callers in file B)
+- [ ] Wire `fl impact` dependency data into merge conflict reporting
+- [ ] Add additional language analyzers:
+  - [ ] Python (tree-sitter)
+  - [ ] Go (tree-sitter)
+  - [ ] Rust (tree-sitter)
+  - [ ] C# (tree-sitter — original arch doc target)
+- [ ] AST cache keyed by content hash (don't re-parse unchanged files)
+
 ## 9. Native Storage Engine (Phase 2 Backend)
 
 - [x] Design native `.flock/store` layout
@@ -144,15 +158,70 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Implement migration command `fl migrate --native`
 - [x] Add performance benchmarks against colocated mode
 
-## 10. Scale and Server Components
+## 9.5. Large-Repo Scaling
 
-- [ ] Define server architecture for enterprise features
-- [ ] Add authn/authz model and access control
-- [ ] Add real-time presence service
-- [ ] Add tiered storage policies (hot/warm/cool)
-- [ ] Add background jobs (compaction, pruning, indexing)
-- [ ] Add replication/sync protocol for events + blobs
-- [ ] Add observability (metrics, tracing, logs)
+Critical for repos at scale (millions of LOC, hundreds of thousands of events). Should be built alongside or immediately after the native storage engine.
+
+- [ ] Indexed event log — replace single JSONL scan with segmented log + B-tree/LSM index by event ID, timestamp, and actor (target: O(log n) lookup, not O(n) scan)
+- [ ] Materialized state snapshots — periodically snapshot computed state so replay starts from last materialized point, not from the beginning of time
+- [ ] Content-addressable snapshot dedup — two checkpoints where only 3 files changed should not store the entire repo twice (file-level dedup at minimum, block-level ideally)
+- [ ] Segmented refs — replace single `refs.json` with one-file-per-ref or sorted index with append-only updates to avoid rewriting all refs on every update
+- [ ] Lazy/partial clone — only materialize snapshots and events the client actually needs (analogous to git partial clone + sparse checkout)
+- [ ] Event log compaction — summarize/archive old event ranges while preserving Merkle integrity (keep checkpoints, compact fine-grained events between them)
+- [ ] Incremental semantic indexing — update AST cache and dependency graph incrementally on new events instead of full recompute
+- [ ] Large-repo benchmark suite — test against synthetic repos at 1M+ events, 10K+ files, 5M+ LOC to validate scaling targets
+
+## 10. Flock Remote (Self-Hosted Repo Server)
+
+Flock's own remote hosting — no dependency on GitHub/GitLab. Replaces the traditional forge model with semantic-aware collaboration.
+
+### 10a. Core Transport
+- [ ] Define remote repository URL scheme and discovery (`fl remote add origin flock://host/repo`)
+- [ ] Implement event sync protocol — client sends events after last-known server event ID, server responds with events client is missing
+- [ ] Implement snapshot/blob transport — upload/download content blocks over HTTPS
+- [ ] Implement `fl push` to flock remote
+- [ ] Implement `fl pull` from flock remote
+- [ ] Handle concurrent push conflicts (reject or auto-merge based on semantic analysis)
+
+### 10b. Auth and Multi-User
+- [ ] SSH key and token-based authentication (leverage existing ed25519 signing)
+- [ ] User/agent identity model — map actors to authenticated users
+- [ ] Repository-level access control (read/write/admin per user or team)
+- [ ] Per-branch and per-path write permissions
+
+### 10c. Server-Side Semantic Analysis
+- [ ] Server-side semantic diff computation (so the web UI doesn't need tree-sitter locally)
+- [ ] Server-side merge preview (dry-run semantic merge on push)
+- [ ] Semantic change indexing — maintain searchable index of all semantic changes across history
+
+### 10d. Web UI for Semantic Review
+- [ ] Render `fl review` output in browser — semantic change list grouped by risk
+- [ ] Expandable drill-down into individual semantic changes
+- [ ] Full line-level diff fallback view
+- [ ] Inline commenting on semantic changes (not just lines)
+- [ ] Review approval workflow (approve/request-changes per semantic unit)
+- [ ] Exploration comparison view (side-by-side exploration outcomes)
+
+### 10e. Server Infrastructure
+- [ ] Repository storage layout on server (event log + content store + refs)
+- [ ] Tiered storage policies (hot/warm/cool — recent events on SSD, old history on object storage)
+- [ ] Background jobs: compaction, pruning, semantic indexing, garbage collection
+- [ ] Observability: metrics, tracing, structured logs
+- [ ] Backup and disaster recovery for hosted repos
+- [ ] Webhook system for external integrations (CI, chat, etc.)
+
+## 10.5. Real-Time Collaboration Features
+
+Layer on top of the remote server via websocket event streaming. See `docs/remote-features-brainstorm.md` for full vision.
+
+- [ ] Websocket event stream — clients subscribe to events matching filters (by file, symbol, module, agent)
+- [ ] Ghost text / semantic presence overlays — see what another dev or agent is currently changing at the symbol level, rendered as faint overlay in editor
+- [ ] Semantic feed — real-time stream of meaningful changes ("Agent A added class CurrencyConverter, 3 methods") instead of raw commit notifications
+- [ ] "Heads up" warnings — proactive notification when another agent/dev starts working on a symbol you're currently editing
+- [ ] Exploration spectating — watch an agent's semantic trail in real time (exploration starts, checkpoints, abandons, new approaches)
+- [ ] Continuous review — review semantic changes as they land instead of batch-reviewing a finished PR; approve individual semantic units incrementally
+- [ ] Conflict forecast — server predicts likely conflicts based on active explorations' semantic change sets and warns before they happen
+- [ ] Editor plugin protocol — define LSP-like protocol for editors to consume ghost text, presence, and heads-up warnings
 
 ## 11. Intelligence Layer
 
