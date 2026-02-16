@@ -1,3 +1,4 @@
+pub mod ast_cache;
 pub mod structured;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -110,8 +111,8 @@ pub enum SemanticRisk {
     High,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SymbolKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SymbolKind {
     Function,
     Class,
     Method,
@@ -139,28 +140,28 @@ impl SymbolKind {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SymbolInfo {
-    kind: SymbolKind,
-    name: String,
-    body_hash: String,
-    match_hash: String,
-    signature: Option<CallableSignature>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolInfo {
+    pub kind: SymbolKind,
+    pub name: String,
+    pub body_hash: String,
+    pub match_hash: String,
+    pub signature: Option<CallableSignature>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CallableSignature {
-    parameters: Vec<ParameterSignature>,
-    return_type: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallableSignature {
+    pub parameters: Vec<ParameterSignature>,
+    pub return_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParameterSignature {
-    name: String,
-    type_hint: Option<String>,
-    optional: bool,
-    has_default: bool,
-    is_rest: bool,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterSignature {
+    pub name: String,
+    pub type_hint: Option<String>,
+    pub optional: bool,
+    pub has_default: bool,
+    pub is_rest: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
