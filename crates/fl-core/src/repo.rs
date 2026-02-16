@@ -17,11 +17,11 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::event::{
-    CheckpointEvent, DecisionAction, DecisionEvent, Event, EventKind, ExplorationAction,
-    ExplorationEvent, GateAction, GateCondition, GateEvent, GatePolicy, GitBridgeAction,
-    GitBridgeEvent, LockAction, LockEvent, NotifyConfig, PresenceAction, PresenceEvent,
-    ResourceUsageEvent, SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent,
-    SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
+    CheckpointEvent, ConflictAction, ConflictResolutionEvent, DecisionAction, DecisionEvent, Event,
+    EventKind, ExplorationAction, ExplorationEvent, GateAction, GateCondition, GateEvent,
+    GatePolicy, GitBridgeAction, GitBridgeEvent, LockAction, LockEvent, NotifyConfig,
+    PresenceAction, PresenceEvent, RebaseEvent, ResourceUsageEvent, SessionAction, SessionEvent,
+    SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
 };
 use fl_collab::can_acquire_lock;
 use fl_storage::ApiCallRecord;
@@ -33,8 +33,9 @@ use fl_workflow::{
 };
 
 pub use fl_collab::{
-    GateConditionKind, GatePolicyKind, GateStatus, GateSummary, LockStatus, LockSummary,
-    PresenceSummary, SubscriptionNotify, SubscriptionStatus, SubscriptionSummary,
+    ConflictStatus, ConflictSummary, GateConditionKind, GatePolicyKind, GateStatus, GateSummary,
+    LockStatus, LockSummary, PresenceSummary, RebaseSummary, SubscriptionNotify,
+    SubscriptionStatus, SubscriptionSummary,
 };
 pub use fl_workflow::parse_duration_spec;
 pub use fl_workflow::{
@@ -119,6 +120,24 @@ pub struct ProvenanceInfo {
 pub struct SessionReplay {
     pub session: SessionSummary,
     pub timeline: Vec<Event>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseResult {
+    pub workspace: String,
+    pub old_base_event: Uuid,
+    pub new_base_event: Uuid,
+    pub files_merged: Vec<String>,
+    pub conflicts: Vec<ConflictDetail>,
+    pub already_up_to_date: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictDetail {
+    pub path: String,
+    pub symbol: Option<String>,
+    pub classification: String,
+    pub explanation: String,
 }
 
 fn check_workspace_limits(
@@ -489,6 +508,8 @@ impl Repo {
                 EventKind::Lock(_) => {}
                 EventKind::Subscription(_) => {}
                 EventKind::Gate(_) => {}
+                EventKind::Rebase(_) => {}
+                EventKind::ConflictResolution(_) => {}
             }
         }
 
@@ -3622,6 +3643,523 @@ impl Repo {
         Ok(fl_collab::check_gates_for_path(path, &state.gates))
     }
 
+    // --- Auto-rebase and conflict resolution ---
+
+    /// Rebase a workspace onto a new base checkpoint.
+    ///
+    /// Compares the workspace's current base snapshot against the new checkpoint's
+    /// snapshot and merges any changed files using semantic merge. Returns a list
+    /// of conflicts found (empty if rebase was clean).
+    pub fn rebase_workspace(
+        &self,
+        workspace_name: &str,
+    ) -> Result<RebaseResult> {
+        self.assert_initialized()?;
+
+        let refs = self.list_refs()?;
+        let ws_ref = refs
+            .iter()
+            .find(|r| r.kind == RefKind::Workspace && r.name == workspace_name)
+            .ok_or_else(|| anyhow!("workspace `{}` not found", workspace_name))?
+            .clone();
+
+        let config = ws_ref
+            .workspace
+            .as_ref()
+            .ok_or_else(|| anyhow!("workspace `{}` has no config", workspace_name))?;
+
+        let old_base_event = ws_ref.target_event_id;
+        let old_base_snapshot = config.base_snapshot_id
+            .ok_or_else(|| anyhow!("workspace `{}` has no base snapshot", workspace_name))?;
+
+        // Find the latest checkpoint to rebase onto
+        let latest = self
+            .latest_checkpoint()
+            .ok_or_else(|| anyhow!("no checkpoint exists to rebase onto"))?;
+
+        if latest.id == old_base_event {
+            return Ok(RebaseResult {
+                workspace: workspace_name.to_string(),
+                old_base_event,
+                new_base_event: old_base_event,
+                files_merged: Vec::new(),
+                conflicts: Vec::new(),
+                already_up_to_date: true,
+            });
+        }
+
+        let EventKind::Checkpoint(new_checkpoint) = &latest.kind else {
+            bail!("latest checkpoint event is malformed");
+        };
+        let new_base_snapshot = new_checkpoint.snapshot_id;
+
+        // Compare old base snapshot vs new base snapshot to find changed files
+        let old_snapshot_path = self.snapshot_path(old_base_snapshot);
+        let new_snapshot_path = self.snapshot_path(new_base_snapshot);
+
+        if !old_snapshot_path.exists() || !new_snapshot_path.exists() {
+            bail!("snapshot directories missing for rebase");
+        }
+
+        // Collect files from both snapshots
+        let old_files = collect_snapshot_files(&old_snapshot_path)?;
+        let new_files = collect_snapshot_files(&new_snapshot_path)?;
+
+        let mut files_merged = Vec::new();
+        let mut conflicts = Vec::new();
+
+        // Find files that changed between old and new base
+        let all_paths: BTreeSet<String> = old_files
+            .keys()
+            .chain(new_files.keys())
+            .cloned()
+            .collect();
+
+        for rel_path in &all_paths {
+            let old_content = old_files.get(rel_path);
+            let new_content = new_files.get(rel_path);
+
+            // If the base content didn't change, nothing to merge
+            if old_content == new_content {
+                continue;
+            }
+
+            // Check if the workspace has local changes to this file
+            let workspace_file = self.root.parent().unwrap_or(&self.root).join(rel_path);
+            if !workspace_file.exists() {
+                // File was deleted in workspace; if new base added/changed it, that's a conflict
+                if new_content.is_some() && old_content.is_some() {
+                    conflicts.push(ConflictDetail {
+                        path: rel_path.clone(),
+                        symbol: None,
+                        classification: "DeleteVsEdit".to_string(),
+                        explanation: format!(
+                            "File `{}` was deleted in workspace but modified in new base",
+                            rel_path
+                        ),
+                    });
+                }
+                continue;
+            }
+
+            let workspace_content = fs::read(&workspace_file).ok();
+
+            // If file exists in workspace but hasn't changed from old base, just take new base version
+            if workspace_content.as_deref() == old_content.map(|v| v.as_slice()) {
+                if let Some(new) = new_content {
+                    fs::write(&workspace_file, new)?;
+                    files_merged.push(rel_path.clone());
+                }
+                continue;
+            }
+
+            // Both sides changed — need a three-way merge
+            if let Some(workspace_bytes) = &workspace_content {
+                let path = PathBuf::from(rel_path);
+                let merge_result = fl_semantic::merge(
+                    &path,
+                    old_content.map(|v| v.as_slice()),
+                    Some(workspace_bytes.as_slice()),
+                    new_content.map(|v| v.as_slice()),
+                );
+
+                match merge_result {
+                    Ok(Some(result)) => {
+                        if result.conflicts.is_empty() {
+                            // Clean merge — apply it
+                            fs::write(&workspace_file, &result.merged_source)?;
+                            files_merged.push(rel_path.clone());
+                        } else {
+                            // Conflicts found
+                            for conflict in &result.conflicts {
+                                conflicts.push(ConflictDetail {
+                                    path: rel_path.clone(),
+                                    symbol: Some(conflict.symbol.clone()),
+                                    classification: format!("{:?}", conflict.classification),
+                                    explanation: conflict.explanation.clone(),
+                                });
+                            }
+                            // Write merged source with conflict markers
+                            fs::write(&workspace_file, &result.merged_source)?;
+                            files_merged.push(rel_path.clone());
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        // Unsupported file type or merge error — text fallback
+                        conflicts.push(ConflictDetail {
+                            path: rel_path.clone(),
+                            symbol: None,
+                            classification: "TextFallback".to_string(),
+                            explanation: format!(
+                                "Could not perform semantic merge on `{}`",
+                                rel_path
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Record the rebase event
+        self.append_event(EventKind::Rebase(RebaseEvent {
+            workspace: workspace_name.to_string(),
+            old_base_event,
+            new_base_event: latest.id,
+            files_merged: files_merged.clone(),
+            conflicts_found: conflicts.len(),
+            auto: false,
+        }))?;
+
+        // Update workspace ref to point to new base
+        let store = RefStore::for_root(self.root());
+        store.upsert(RepoRef {
+            kind: RefKind::Workspace,
+            name: workspace_name.to_string(),
+            target_event_id: latest.id,
+            workspace: Some(WorkspaceRefConfig {
+                auto_rebase: config.auto_rebase,
+                base_snapshot_id: Some(new_base_snapshot),
+                max_snapshots: config.max_snapshots,
+                max_events: config.max_events,
+            }),
+        })?;
+
+        // Record detected conflicts as events
+        for conflict in &conflicts {
+            let conflict_id = Uuid::new_v4();
+            self.append_event(EventKind::ConflictResolution(ConflictResolutionEvent {
+                conflict_id,
+                action: ConflictAction::Detect,
+                workspace: Some(workspace_name.to_string()),
+                path: Some(conflict.path.clone()),
+                symbol: conflict.symbol.clone(),
+                classification: None,
+                suggestion: None,
+                resolution: None,
+                resolved_by: None,
+                verified: None,
+                reason: None,
+            }))?;
+            // Also classify immediately since we have that info
+            self.append_event(EventKind::ConflictResolution(ConflictResolutionEvent {
+                conflict_id,
+                action: ConflictAction::Classify,
+                workspace: Some(workspace_name.to_string()),
+                path: Some(conflict.path.clone()),
+                symbol: conflict.symbol.clone(),
+                classification: Some(conflict.classification.clone()),
+                suggestion: None,
+                resolution: None,
+                resolved_by: None,
+                verified: None,
+                reason: None,
+            }))?;
+        }
+
+        Ok(RebaseResult {
+            workspace: workspace_name.to_string(),
+            old_base_event,
+            new_base_event: latest.id,
+            files_merged,
+            conflicts,
+            already_up_to_date: false,
+        })
+    }
+
+    /// Auto-rebase all workspaces that have auto_rebase enabled.
+    pub fn auto_rebase_workspaces(&self) -> Result<Vec<RebaseResult>> {
+        self.assert_initialized()?;
+
+        let workspaces = self.list_workspaces()?;
+        let mut results = Vec::new();
+
+        for ws in &workspaces {
+            let config = ws.workspace.as_ref();
+            if config.is_some_and(|c| c.auto_rebase) {
+                match self.rebase_workspace(&ws.name) {
+                    Ok(result) => results.push(result),
+                    Err(e) => {
+                        // Log but don't fail the whole batch
+                        eprintln!("warning: auto-rebase failed for `{}`: {}", ws.name, e);
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Detect conflicts between workspace state and a target checkpoint.
+    pub fn detect_conflicts(&self, workspace_name: &str) -> Result<Vec<ConflictDetail>> {
+        self.assert_initialized()?;
+
+        let refs = self.list_refs()?;
+        let ws_ref = refs
+            .iter()
+            .find(|r| r.kind == RefKind::Workspace && r.name == workspace_name)
+            .ok_or_else(|| anyhow!("workspace `{}` not found", workspace_name))?;
+
+        let config = ws_ref
+            .workspace
+            .as_ref()
+            .ok_or_else(|| anyhow!("workspace `{}` has no config", workspace_name))?;
+
+        let base_snapshot = config.base_snapshot_id
+            .ok_or_else(|| anyhow!("workspace has no base snapshot"))?;
+
+        let base_snapshot_path = self.snapshot_path(base_snapshot);
+        if !base_snapshot_path.exists() {
+            bail!("base snapshot directory does not exist");
+        }
+
+        let base_files = collect_snapshot_files(&base_snapshot_path)?;
+        let mut conflicts = Vec::new();
+
+        // Compare workspace against latest checkpoint
+        let latest = self.latest_checkpoint()
+            .ok_or_else(|| anyhow!("no checkpoint exists"))?;
+
+        if latest.id == ws_ref.target_event_id {
+            return Ok(conflicts); // Already up to date
+        }
+
+        let EventKind::Checkpoint(new_cp) = &latest.kind else {
+            bail!("latest checkpoint event is malformed");
+        };
+
+        let new_snapshot_path = self.snapshot_path(new_cp.snapshot_id);
+        if !new_snapshot_path.exists() {
+            bail!("target snapshot directory does not exist");
+        }
+        let new_files = collect_snapshot_files(&new_snapshot_path)?;
+
+        let all_paths: BTreeSet<String> = base_files
+            .keys()
+            .chain(new_files.keys())
+            .cloned()
+            .collect();
+
+        for rel_path in &all_paths {
+            let base_content = base_files.get(rel_path);
+            let new_content = new_files.get(rel_path);
+
+            if base_content == new_content {
+                continue;
+            }
+
+            let workspace_file = self.root.parent().unwrap_or(&self.root).join(rel_path);
+            let ws_content = fs::read(&workspace_file).ok();
+
+            // If workspace changed the same file as the new base, there's a potential conflict
+            if ws_content.as_deref() != base_content.map(|v| v.as_slice()) {
+                let path = PathBuf::from(rel_path);
+                let merge_result = fl_semantic::merge(
+                    &path,
+                    base_content.map(|v| v.as_slice()),
+                    ws_content.as_deref(),
+                    new_content.map(|v| v.as_slice()),
+                );
+
+                match merge_result {
+                    Ok(Some(result)) if !result.conflicts.is_empty() => {
+                        for conflict in &result.conflicts {
+                            conflicts.push(ConflictDetail {
+                                path: rel_path.clone(),
+                                symbol: Some(conflict.symbol.clone()),
+                                classification: format!("{:?}", conflict.classification),
+                                explanation: conflict.explanation.clone(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(conflicts)
+    }
+
+    /// Suggest a resolution strategy for a conflict.
+    pub fn suggest_resolution(&self, conflict_id: Uuid) -> Result<String> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let conflict = state
+            .conflicts
+            .get(&conflict_id)
+            .ok_or_else(|| anyhow!("conflict `{}` not found", conflict_id))?;
+
+        let suggestion = match conflict.classification.as_deref() {
+            Some("DivergentEdit") => {
+                "Both sides modified the same symbol. Review both versions and choose one, or manually merge the changes.".to_string()
+            }
+            Some("DeleteVsEdit") => {
+                "One side deleted a symbol while the other modified it. Decide whether the deletion or the modification should win.".to_string()
+            }
+            Some("ConcurrentAddition") => {
+                "Both sides added the same symbol with different implementations. Choose one implementation or combine them.".to_string()
+            }
+            Some("KindMismatch") => {
+                "The symbol was changed to different kinds on each side. Choose which kind is correct.".to_string()
+            }
+            Some("TextFallback") => {
+                "Could not perform semantic merge. Resolve conflict markers manually in the file.".to_string()
+            }
+            _ => {
+                "Review the conflict and resolve manually.".to_string()
+            }
+        };
+
+        // Record the suggestion
+        self.append_event(EventKind::ConflictResolution(ConflictResolutionEvent {
+            conflict_id,
+            action: ConflictAction::Suggest,
+            workspace: Some(conflict.workspace.clone()),
+            path: Some(conflict.path.clone()),
+            symbol: conflict.symbol.clone(),
+            classification: conflict.classification.clone(),
+            suggestion: Some(suggestion.clone()),
+            resolution: None,
+            resolved_by: None,
+            verified: None,
+            reason: None,
+        }))?;
+
+        Ok(suggestion)
+    }
+
+    /// Mark a conflict as resolved.
+    pub fn resolve_conflict(
+        &self,
+        conflict_id: Uuid,
+        resolution: String,
+    ) -> Result<()> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let conflict = state
+            .conflicts
+            .get(&conflict_id)
+            .ok_or_else(|| anyhow!("conflict `{}` not found", conflict_id))?;
+
+        fl_collab::can_advance_conflict(conflict.status, ConflictStatus::Resolved)?;
+
+        self.append_event(EventKind::ConflictResolution(ConflictResolutionEvent {
+            conflict_id,
+            action: ConflictAction::Resolve,
+            workspace: Some(conflict.workspace.clone()),
+            path: Some(conflict.path.clone()),
+            symbol: conflict.symbol.clone(),
+            classification: conflict.classification.clone(),
+            suggestion: conflict.suggestion.clone(),
+            resolution: Some(resolution),
+            resolved_by: Some(self.current_actor()),
+            verified: None,
+            reason: None,
+        }))?;
+
+        Ok(())
+    }
+
+    /// Verify a resolved conflict.
+    pub fn verify_conflict(&self, conflict_id: Uuid, passed: bool) -> Result<()> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let conflict = state
+            .conflicts
+            .get(&conflict_id)
+            .ok_or_else(|| anyhow!("conflict `{}` not found", conflict_id))?;
+
+        fl_collab::can_advance_conflict(conflict.status, ConflictStatus::Verified)?;
+
+        self.append_event(EventKind::ConflictResolution(ConflictResolutionEvent {
+            conflict_id,
+            action: ConflictAction::Verify,
+            workspace: Some(conflict.workspace.clone()),
+            path: Some(conflict.path.clone()),
+            symbol: conflict.symbol.clone(),
+            classification: conflict.classification.clone(),
+            suggestion: conflict.suggestion.clone(),
+            resolution: conflict.resolution.clone(),
+            resolved_by: conflict.resolved_by.clone(),
+            verified: Some(passed),
+            reason: None,
+        }))?;
+
+        Ok(())
+    }
+
+    /// Record a conflict resolution (final step).
+    pub fn record_conflict(&self, conflict_id: Uuid, reason: Option<String>) -> Result<()> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let conflict = state
+            .conflicts
+            .get(&conflict_id)
+            .ok_or_else(|| anyhow!("conflict `{}` not found", conflict_id))?;
+
+        fl_collab::can_advance_conflict(conflict.status, ConflictStatus::Recorded)?;
+
+        self.append_event(EventKind::ConflictResolution(ConflictResolutionEvent {
+            conflict_id,
+            action: ConflictAction::Record,
+            workspace: Some(conflict.workspace.clone()),
+            path: Some(conflict.path.clone()),
+            symbol: conflict.symbol.clone(),
+            classification: conflict.classification.clone(),
+            suggestion: conflict.suggestion.clone(),
+            resolution: conflict.resolution.clone(),
+            resolved_by: conflict.resolved_by.clone(),
+            verified: Some(conflict.verified),
+            reason,
+        }))?;
+
+        Ok(())
+    }
+
+    /// List all conflicts, optionally filtered by status.
+    pub fn list_conflicts(
+        &self,
+        status_filter: Option<ConflictStatus>,
+    ) -> Result<Vec<ConflictSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let conflicts: Vec<ConflictSummary> = state
+            .conflicts
+            .into_values()
+            .filter(|c| status_filter.is_none() || Some(c.status) == status_filter)
+            .collect();
+
+        Ok(conflicts)
+    }
+
+    /// List all rebase operations for a workspace.
+    pub fn list_rebases(&self, workspace_filter: Option<&str>) -> Result<Vec<RebaseSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let rebases: Vec<RebaseSummary> = state
+            .rebases
+            .into_iter()
+            .filter(|r| workspace_filter.is_none() || Some(r.workspace.as_str()) == workspace_filter)
+            .collect();
+
+        Ok(rebases)
+    }
+
     // --- Helper methods for collaboration ---
 
     fn current_actor(&self) -> String {
@@ -3640,6 +4178,25 @@ impl Repo {
     fn now_nanos_str(&self) -> String {
         self.now_nanos().to_string()
     }
+}
+
+fn collect_snapshot_files(snapshot_dir: &Path) -> Result<HashMap<String, Vec<u8>>> {
+    let mut files = HashMap::new();
+    for entry in WalkDir::new(snapshot_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() {
+            let rel = entry
+                .path()
+                .strip_prefix(snapshot_dir)
+                .unwrap_or(entry.path());
+            let rel_str = rel.to_string_lossy().to_string();
+            let content = fs::read(entry.path())?;
+            files.insert(rel_str, content);
+        }
+    }
+    Ok(files)
 }
 
 fn should_skip_path(root: &Path, path: &Path) -> bool {
@@ -6012,5 +6569,95 @@ mod tests {
         let raw = "semantic_default = \"typescript\"\n";
         let updated = update_config_mode(raw, "native");
         assert!(updated.contains("mode = \"native\""));
+    }
+
+    #[test]
+    fn rebase_workspace_already_up_to_date() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        fs::write(dir.path().join("main.ts"), "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        repo.create_workspace("ws1".to_string(), false)
+            .expect("create workspace");
+
+        let result = repo.rebase_workspace("ws1").expect("rebase");
+        assert!(result.already_up_to_date);
+        assert!(result.files_merged.is_empty());
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn rebase_workspace_merges_clean_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Create initial file and checkpoint
+        fs::write(dir.path().join("main.ts"), "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        // Create workspace
+        repo.create_workspace("ws1".to_string(), true)
+            .expect("create workspace");
+
+        // Make a change and create a new checkpoint (simulating upstream changes)
+        fs::write(dir.path().join("other.ts"), "export const y = 2;").expect("write new file");
+        repo.create_checkpoint(Some("upstream".to_string()))
+            .expect("checkpoint 2");
+
+        // Rebase the workspace
+        let result = repo.rebase_workspace("ws1").expect("rebase");
+        assert!(!result.already_up_to_date);
+        assert!(result.conflicts.is_empty());
+    }
+
+    #[test]
+    fn auto_rebase_only_processes_enabled_workspaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        fs::write(dir.path().join("main.ts"), "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        // Create workspaces: one with auto-rebase, one without
+        repo.create_workspace("auto-ws".to_string(), true)
+            .expect("create auto workspace");
+        repo.create_workspace("manual-ws".to_string(), false)
+            .expect("create manual workspace");
+
+        // Make changes and checkpoint
+        fs::write(dir.path().join("extra.ts"), "export const z = 3;").expect("write");
+        repo.create_checkpoint(Some("upstream".to_string()))
+            .expect("checkpoint 2");
+
+        let results = repo.auto_rebase_workspaces().expect("auto rebase");
+        // Only the auto-rebase workspace should be processed
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].workspace, "auto-ws");
+    }
+
+    #[test]
+    fn conflict_resolution_workflow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        fs::write(dir.path().join("main.ts"), "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        // Verify list_conflicts and list_rebases work on empty state
+        let conflicts = repo.list_conflicts(None).expect("list conflicts");
+        assert!(conflicts.is_empty());
+
+        let rebases = repo.list_rebases(None).expect("list rebases");
+        assert!(rebases.is_empty());
     }
 }

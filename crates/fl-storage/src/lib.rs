@@ -9,10 +9,11 @@ pub mod refs;
 pub use chunking::{Chunk, ChunkConfig, chunk_data};
 pub use content_store::ContentStore;
 pub use event::{
-    ApiCallRecord, CURRENT_EVENT_SCHEMA_VERSION, CheckpointEvent, DecisionAction, DecisionEvent,
-    Event, EventKind, EventRecord, ExplorationAction, ExplorationEvent, GateAction, GateCondition,
-    GateEvent, GatePolicy, GitBridgeAction, GitBridgeEvent, LockAction, LockEvent, NotifyConfig,
-    PresenceAction, PresenceEvent, ResourceUsageEvent, SessionAction, SessionEvent,
+    ApiCallRecord, CURRENT_EVENT_SCHEMA_VERSION, CheckpointEvent, ConflictAction,
+    ConflictResolutionEvent, DecisionAction, DecisionEvent, Event, EventKind, EventRecord,
+    ExplorationAction, ExplorationEvent, GateAction, GateCondition, GateEvent, GatePolicy,
+    GitBridgeAction, GitBridgeEvent, LockAction, LockEvent, NotifyConfig, PresenceAction,
+    PresenceEvent, RebaseEvent, ResourceUsageEvent, SessionAction, SessionEvent,
     SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
     UndoMode, event_signing_payload,
 };

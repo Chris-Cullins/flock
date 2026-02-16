@@ -219,6 +219,83 @@ impl fmt::Display for GatePolicyKind {
     }
 }
 
+// --- Conflict Resolution ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConflictStatus {
+    Detected,
+    Classified,
+    Suggested,
+    Resolved,
+    Verified,
+    Recorded,
+}
+
+impl fmt::Display for ConflictStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Detected => f.write_str("detected"),
+            Self::Classified => f.write_str("classified"),
+            Self::Suggested => f.write_str("suggested"),
+            Self::Resolved => f.write_str("resolved"),
+            Self::Verified => f.write_str("verified"),
+            Self::Recorded => f.write_str("recorded"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictSummary {
+    pub id: Uuid,
+    pub workspace: String,
+    pub path: String,
+    pub symbol: Option<String>,
+    pub classification: Option<String>,
+    pub suggestion: Option<String>,
+    pub resolution: Option<String>,
+    pub resolved_by: Option<String>,
+    pub verified: bool,
+    pub status: ConflictStatus,
+    pub detected_at: String,
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebaseSummary {
+    pub workspace: String,
+    pub old_base_event: Uuid,
+    pub new_base_event: Uuid,
+    pub files_merged: Vec<String>,
+    pub conflicts_found: usize,
+    pub auto: bool,
+    pub timestamp: String,
+}
+
+/// Check if a conflict can advance to the next workflow state.
+pub fn can_advance_conflict(
+    current: ConflictStatus,
+    target: ConflictStatus,
+) -> Result<()> {
+    let valid = match (current, target) {
+        (ConflictStatus::Detected, ConflictStatus::Classified) => true,
+        (ConflictStatus::Classified, ConflictStatus::Suggested) => true,
+        (ConflictStatus::Suggested, ConflictStatus::Resolved) => true,
+        (ConflictStatus::Resolved, ConflictStatus::Verified) => true,
+        (ConflictStatus::Verified, ConflictStatus::Recorded) => true,
+        _ => false,
+    };
+    if !valid {
+        bail!(
+            "cannot advance conflict from {} to {}",
+            current,
+            target
+        );
+    }
+    Ok(())
+}
+
+// --- Gates ---
+
 /// Check if any active gates would block a given file path.
 pub fn check_gates_for_path(
     path: &str,

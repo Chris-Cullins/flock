@@ -4,13 +4,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use fl_collab::{
-    GateConditionKind, GatePolicyKind, GateStatus, GateSummary, LockStatus, LockSummary,
-    PresenceSummary, SubscriptionNotify, SubscriptionStatus, SubscriptionSummary,
+    ConflictStatus, ConflictSummary, GateConditionKind, GatePolicyKind, GateStatus, GateSummary,
+    LockStatus, LockSummary, PresenceSummary, RebaseSummary, SubscriptionNotify,
+    SubscriptionStatus, SubscriptionSummary,
 };
 use fl_storage::{
-    ApiCallRecord, DecisionAction, Event, EventKind, ExplorationAction, GateAction, GateCondition,
-    GatePolicy, LockAction, NotifyConfig, PresenceAction, SessionAction, SubscriptionAction,
-    TaskAction, UndoMode,
+    ApiCallRecord, ConflictAction, DecisionAction, Event, EventKind, ExplorationAction, GateAction,
+    GateCondition, GatePolicy, LockAction, NotifyConfig, PresenceAction, SessionAction,
+    SubscriptionAction, TaskAction, UndoMode,
 };
 use uuid::Uuid;
 
@@ -183,6 +184,8 @@ pub struct ReplayedState {
     pub locks: BTreeMap<Uuid, LockSummary>,
     pub subscriptions: BTreeMap<Uuid, SubscriptionSummary>,
     pub gates: BTreeMap<Uuid, GateSummary>,
+    pub rebases: Vec<RebaseSummary>,
+    pub conflicts: BTreeMap<Uuid, ConflictSummary>,
     pub applied_event_ids: Vec<Uuid>,
 }
 
@@ -197,6 +200,8 @@ struct ReplayAccumulator {
     locks: BTreeMap<Uuid, LockSummary>,
     subscriptions: BTreeMap<Uuid, SubscriptionSummary>,
     gates: BTreeMap<Uuid, GateSummary>,
+    rebases: Vec<RebaseSummary>,
+    conflicts: BTreeMap<Uuid, ConflictSummary>,
     applied_event_ids: Vec<Uuid>,
 }
 
@@ -226,6 +231,8 @@ impl ReplayAccumulator {
             locks: self.locks,
             subscriptions: self.subscriptions,
             gates: self.gates,
+            rebases: self.rebases,
+            conflicts: self.conflicts,
             applied_event_ids: self.applied_event_ids,
         }
     }
@@ -516,6 +523,69 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     }
                 }
             },
+            EventKind::Rebase(rebase) => {
+                state.rebases.push(RebaseSummary {
+                    workspace: rebase.workspace.clone(),
+                    old_base_event: rebase.old_base_event,
+                    new_base_event: rebase.new_base_event,
+                    files_merged: rebase.files_merged.clone(),
+                    conflicts_found: rebase.conflicts_found,
+                    auto: rebase.auto,
+                    timestamp: event.timestamp.clone(),
+                });
+            }
+            EventKind::ConflictResolution(cr) => match cr.action {
+                ConflictAction::Detect => {
+                    state.conflicts.insert(
+                        cr.conflict_id,
+                        ConflictSummary {
+                            id: cr.conflict_id,
+                            workspace: cr.workspace.clone().unwrap_or_default(),
+                            path: cr.path.clone().unwrap_or_default(),
+                            symbol: cr.symbol.clone(),
+                            classification: None,
+                            suggestion: None,
+                            resolution: None,
+                            resolved_by: None,
+                            verified: false,
+                            status: ConflictStatus::Detected,
+                            detected_at: event.timestamp.clone(),
+                            resolved_at: None,
+                        },
+                    );
+                }
+                ConflictAction::Classify => {
+                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                        entry.classification = cr.classification.clone();
+                        entry.status = ConflictStatus::Classified;
+                    }
+                }
+                ConflictAction::Suggest => {
+                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                        entry.suggestion = cr.suggestion.clone();
+                        entry.status = ConflictStatus::Suggested;
+                    }
+                }
+                ConflictAction::Resolve => {
+                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                        entry.resolution = cr.resolution.clone();
+                        entry.resolved_by = cr.resolved_by.clone();
+                        entry.status = ConflictStatus::Resolved;
+                        entry.resolved_at = Some(event.timestamp.clone());
+                    }
+                }
+                ConflictAction::Verify => {
+                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                        entry.verified = cr.verified.unwrap_or(false);
+                        entry.status = ConflictStatus::Verified;
+                    }
+                }
+                ConflictAction::Record => {
+                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                        entry.status = ConflictStatus::Recorded;
+                    }
+                }
+            },
             EventKind::Task(task) => match task.action {
                 TaskAction::Create => {
                     state.tasks.insert(
@@ -614,6 +684,14 @@ pub fn replay_subscriptions(events: &[Event]) -> Result<BTreeMap<Uuid, Subscript
 
 pub fn replay_gates(events: &[Event]) -> Result<BTreeMap<Uuid, GateSummary>> {
     Ok(replay_state(events)?.gates)
+}
+
+pub fn replay_rebases(events: &[Event]) -> Result<Vec<RebaseSummary>> {
+    Ok(replay_state(events)?.rebases)
+}
+
+pub fn replay_conflicts(events: &[Event]) -> Result<BTreeMap<Uuid, ConflictSummary>> {
+    Ok(replay_state(events)?.conflicts)
 }
 
 pub fn build_task_graph(tasks: &BTreeMap<Uuid, TaskSummary>) -> TaskGraph {
@@ -1595,6 +1673,168 @@ mod tests {
 
         let not_blocking = fl_collab::check_gates_for_path("src/utils.ts", &gates);
         assert!(not_blocking.is_empty());
+    }
+
+    #[test]
+    fn replay_rebase_event() {
+        let rebase = make_event(
+            1,
+            None,
+            EventKind::Rebase(fl_storage::RebaseEvent {
+                workspace: "dev".to_string(),
+                old_base_event: Uuid::from_u128(100),
+                new_base_event: Uuid::from_u128(200),
+                files_merged: vec!["src/main.ts".to_string()],
+                conflicts_found: 0,
+                auto: true,
+            }),
+        );
+
+        let state = replay_state(&[rebase]).unwrap();
+        assert_eq!(state.rebases.len(), 1);
+        assert_eq!(state.rebases[0].workspace, "dev");
+        assert_eq!(state.rebases[0].files_merged.len(), 1);
+        assert!(state.rebases[0].auto);
+        assert_eq!(state.rebases[0].conflicts_found, 0);
+    }
+
+    #[test]
+    fn replay_conflict_resolution_workflow() {
+        let conflict_id = Uuid::from_u128(42);
+
+        let detect = make_event(
+            1,
+            None,
+            EventKind::ConflictResolution(fl_storage::ConflictResolutionEvent {
+                conflict_id,
+                action: fl_storage::ConflictAction::Detect,
+                workspace: Some("dev".to_string()),
+                path: Some("src/main.ts".to_string()),
+                symbol: Some("handleClick".to_string()),
+                classification: None,
+                suggestion: None,
+                resolution: None,
+                resolved_by: None,
+                verified: None,
+                reason: None,
+            }),
+        );
+
+        let classify = make_event(
+            2,
+            Some(Uuid::from_u128(1)),
+            EventKind::ConflictResolution(fl_storage::ConflictResolutionEvent {
+                conflict_id,
+                action: fl_storage::ConflictAction::Classify,
+                workspace: Some("dev".to_string()),
+                path: Some("src/main.ts".to_string()),
+                symbol: Some("handleClick".to_string()),
+                classification: Some("DivergentEdit".to_string()),
+                suggestion: None,
+                resolution: None,
+                resolved_by: None,
+                verified: None,
+                reason: None,
+            }),
+        );
+
+        let suggest = make_event(
+            3,
+            Some(Uuid::from_u128(2)),
+            EventKind::ConflictResolution(fl_storage::ConflictResolutionEvent {
+                conflict_id,
+                action: fl_storage::ConflictAction::Suggest,
+                workspace: Some("dev".to_string()),
+                path: Some("src/main.ts".to_string()),
+                symbol: Some("handleClick".to_string()),
+                classification: Some("DivergentEdit".to_string()),
+                suggestion: Some("Take left side".to_string()),
+                resolution: None,
+                resolved_by: None,
+                verified: None,
+                reason: None,
+            }),
+        );
+
+        let resolve = make_event(
+            4,
+            Some(Uuid::from_u128(3)),
+            EventKind::ConflictResolution(fl_storage::ConflictResolutionEvent {
+                conflict_id,
+                action: fl_storage::ConflictAction::Resolve,
+                workspace: Some("dev".to_string()),
+                path: Some("src/main.ts".to_string()),
+                symbol: Some("handleClick".to_string()),
+                classification: Some("DivergentEdit".to_string()),
+                suggestion: Some("Take left side".to_string()),
+                resolution: Some("Used left version".to_string()),
+                resolved_by: Some("alice".to_string()),
+                verified: None,
+                reason: None,
+            }),
+        );
+
+        let verify = make_event(
+            5,
+            Some(Uuid::from_u128(4)),
+            EventKind::ConflictResolution(fl_storage::ConflictResolutionEvent {
+                conflict_id,
+                action: fl_storage::ConflictAction::Verify,
+                workspace: Some("dev".to_string()),
+                path: Some("src/main.ts".to_string()),
+                symbol: Some("handleClick".to_string()),
+                classification: Some("DivergentEdit".to_string()),
+                suggestion: None,
+                resolution: Some("Used left version".to_string()),
+                resolved_by: Some("alice".to_string()),
+                verified: Some(true),
+                reason: None,
+            }),
+        );
+
+        let record = make_event(
+            6,
+            Some(Uuid::from_u128(5)),
+            EventKind::ConflictResolution(fl_storage::ConflictResolutionEvent {
+                conflict_id,
+                action: fl_storage::ConflictAction::Record,
+                workspace: Some("dev".to_string()),
+                path: Some("src/main.ts".to_string()),
+                symbol: Some("handleClick".to_string()),
+                classification: Some("DivergentEdit".to_string()),
+                suggestion: None,
+                resolution: Some("Used left version".to_string()),
+                resolved_by: Some("alice".to_string()),
+                verified: Some(true),
+                reason: Some("Confirmed fix".to_string()),
+            }),
+        );
+
+        // After detect
+        let state = replay_state(&[detect.clone()]).unwrap();
+        assert_eq!(state.conflicts.len(), 1);
+        let c = state.conflicts.get(&conflict_id).unwrap();
+        assert_eq!(c.status, ConflictStatus::Detected);
+        assert_eq!(c.path, "src/main.ts");
+
+        // After classify
+        let state = replay_state(&[detect.clone(), classify.clone()]).unwrap();
+        let c = state.conflicts.get(&conflict_id).unwrap();
+        assert_eq!(c.status, ConflictStatus::Classified);
+        assert_eq!(c.classification.as_deref(), Some("DivergentEdit"));
+
+        // After suggest
+        let state = replay_state(&[detect.clone(), classify.clone(), suggest.clone()]).unwrap();
+        let c = state.conflicts.get(&conflict_id).unwrap();
+        assert_eq!(c.status, ConflictStatus::Suggested);
+        assert_eq!(c.suggestion.as_deref(), Some("Take left side"));
+
+        // Full workflow
+        let state = replay_state(&[detect, classify, suggest, resolve, verify, record]).unwrap();
+        let c = state.conflicts.get(&conflict_id).unwrap();
+        assert_eq!(c.status, ConflictStatus::Recorded);
+        assert!(c.verified);
+        assert_eq!(c.resolved_by.as_deref(), Some("alice"));
     }
 
     fn make_event(id: u128, parent_id: Option<Uuid>, kind: EventKind) -> Event {

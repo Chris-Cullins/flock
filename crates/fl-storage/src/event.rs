@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -33,6 +33,8 @@ pub enum EventKind {
     Lock(LockEvent),
     Subscription(SubscriptionEvent),
     Gate(GateEvent),
+    Rebase(RebaseEvent),
+    ConflictResolution(ConflictResolutionEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -281,6 +283,52 @@ pub enum GateCondition {
 pub enum GatePolicy {
     Block,
     QueueAndContinue,
+}
+
+// --- Rebase and conflict resolution events ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RebaseEvent {
+    pub workspace: String,
+    pub old_base_event: Uuid,
+    pub new_base_event: Uuid,
+    pub files_merged: Vec<String>,
+    pub conflicts_found: usize,
+    pub auto: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConflictResolutionEvent {
+    pub conflict_id: Uuid,
+    pub action: ConflictAction,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub classification: Option<String>,
+    #[serde(default)]
+    pub suggestion: Option<String>,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub resolved_by: Option<String>,
+    #[serde(default)]
+    pub verified: Option<bool>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConflictAction {
+    Detect,
+    Classify,
+    Suggest,
+    Resolve,
+    Verify,
+    Record,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

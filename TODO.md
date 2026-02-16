@@ -121,14 +121,14 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [x] `fl lock release`
 - [x] Implement change subscriptions and notification filters
 - [x] Implement human-in-the-loop gates and policies
-- [ ] Implement continuous auto-rebase for active workspaces
-- [ ] Implement conflict resolution workflow:
-  - [ ] detect
-  - [ ] classify
-  - [ ] suggest
-  - [ ] resolve
-  - [ ] verify
-  - [ ] record
+- [x] Implement continuous auto-rebase for active workspaces
+- [x] Implement conflict resolution workflow:
+  - [x] detect
+  - [x] classify
+  - [x] suggest
+  - [x] resolve
+  - [x] verify
+  - [x] record
 
 ## 8.5. Semantic Merge Improvements
 

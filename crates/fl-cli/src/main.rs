@@ -8,8 +8,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{self, Shell};
 use fl_core::repo::parse_duration_spec;
 use fl_core::{
-    ApiCallRecord, DecisionAction, EventKind, ExplorationStatus, GateCondition, GatePolicy,
-    RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
+    ApiCallRecord, ConflictStatus, DecisionAction, EventKind, ExplorationStatus, GateCondition,
+    GatePolicy, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
     SemanticConflictClassification, SemanticRisk, TaskRelation, TaskStatus, UndoRequest,
 };
 use uuid::Uuid;
@@ -177,6 +177,19 @@ enum Command {
     Gate {
         #[command(subcommand)]
         command: GateCommand,
+    },
+    /// Rebase a workspace onto the latest checkpoint
+    Rebase {
+        /// Workspace to rebase
+        #[arg(long)]
+        workspace: String,
+    },
+    /// Auto-rebase all workspaces with auto_rebase enabled
+    AutoRebase,
+    /// Conflict resolution workflow
+    Conflict {
+        #[command(subcommand)]
+        command: ConflictCommand,
     },
     /// Migrate repository storage backend
     Migrate {
@@ -474,6 +487,58 @@ enum GateCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ConflictCommand {
+    /// Detect conflicts for a workspace against the latest checkpoint
+    Detect {
+        #[arg(long)]
+        workspace: String,
+    },
+    /// Suggest resolution for a conflict
+    Suggest {
+        id: String,
+    },
+    /// Mark a conflict as resolved
+    Resolve {
+        id: String,
+        /// Description of how the conflict was resolved
+        #[arg(long)]
+        resolution: String,
+    },
+    /// Verify a resolved conflict
+    Verify {
+        id: String,
+        /// Whether verification passed
+        #[arg(long)]
+        passed: bool,
+    },
+    /// Record a verified conflict (final step)
+    Record {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// List conflicts
+    List {
+        /// Filter by status
+        #[arg(long)]
+        status: Option<ConflictStatusArg>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum ConflictStatusArg {
+    Detected,
+    Classified,
+    Suggested,
+    Resolved,
+    Verified,
+    Recorded,
+}
+
 #[derive(Debug, Clone, ValueEnum)]
 enum GateConditionArg {
     FileTouched,
@@ -631,6 +696,17 @@ fn main() -> Result<()> {
                     EventKind::Gate(g) => println!(
                         "{}  gate:{:?}  {}",
                         event.timestamp, g.action, g.gate_id
+                    ),
+                    EventKind::Rebase(r) => println!(
+                        "{}  rebase  workspace={}  files={}  conflicts={}",
+                        event.timestamp, r.workspace, r.files_merged.len(), r.conflicts_found
+                    ),
+                    EventKind::ConflictResolution(cr) => println!(
+                        "{}  conflict:{:?}  {}  path={}",
+                        event.timestamp,
+                        cr.action,
+                        cr.conflict_id,
+                        cr.path.as_deref().unwrap_or("-")
                     ),
                 }
             }
@@ -2069,6 +2145,131 @@ fn main() -> Result<()> {
                     let gate_id = parse_uuid(&id)?;
                     repo.delete_gate(gate_id)?;
                     println!("gate {} deleted", &id[..8.min(id.len())]);
+                }
+            }
+        }
+        Command::Rebase { workspace } => {
+            let repo = Repo::discover(cwd)?;
+            let result = repo.rebase_workspace(&workspace)?;
+            if result.already_up_to_date {
+                println!("workspace `{}` is already up to date", workspace);
+            } else {
+                println!(
+                    "rebased workspace `{}` ({} -> {})",
+                    workspace,
+                    &result.old_base_event.to_string()[..8],
+                    &result.new_base_event.to_string()[..8],
+                );
+                if !result.files_merged.is_empty() {
+                    println!("  files merged: {}", result.files_merged.len());
+                    for f in &result.files_merged {
+                        println!("    {}", f);
+                    }
+                }
+                if !result.conflicts.is_empty() {
+                    println!("  conflicts: {}", result.conflicts.len());
+                    for c in &result.conflicts {
+                        println!(
+                            "    {} [{}]: {}",
+                            c.path,
+                            c.classification,
+                            c.explanation
+                        );
+                    }
+                }
+            }
+        }
+        Command::AutoRebase => {
+            let repo = Repo::discover(cwd)?;
+            let results = repo.auto_rebase_workspaces()?;
+            if results.is_empty() {
+                println!("no workspaces with auto-rebase enabled");
+            } else {
+                for result in &results {
+                    if result.already_up_to_date {
+                        println!("workspace `{}`: up to date", result.workspace);
+                    } else {
+                        println!(
+                            "workspace `{}`: rebased ({} files, {} conflicts)",
+                            result.workspace,
+                            result.files_merged.len(),
+                            result.conflicts.len(),
+                        );
+                    }
+                }
+            }
+        }
+        Command::Conflict { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                ConflictCommand::Detect { workspace } => {
+                    let conflicts = repo.detect_conflicts(&workspace)?;
+                    if conflicts.is_empty() {
+                        println!("no conflicts detected for workspace `{}`", workspace);
+                    } else {
+                        println!("{} conflict(s) detected:", conflicts.len());
+                        for c in &conflicts {
+                            println!(
+                                "  {} [{}]: {}",
+                                c.path,
+                                c.classification,
+                                c.explanation
+                            );
+                        }
+                    }
+                }
+                ConflictCommand::Suggest { id } => {
+                    let conflict_id = parse_uuid(&id)?;
+                    let suggestion = repo.suggest_resolution(conflict_id)?;
+                    println!("suggestion: {}", suggestion);
+                }
+                ConflictCommand::Resolve { id, resolution } => {
+                    let conflict_id = parse_uuid(&id)?;
+                    repo.resolve_conflict(conflict_id, resolution)?;
+                    println!("conflict {} marked as resolved", &id[..8.min(id.len())]);
+                }
+                ConflictCommand::Verify { id, passed } => {
+                    let conflict_id = parse_uuid(&id)?;
+                    repo.verify_conflict(conflict_id, passed)?;
+                    println!(
+                        "conflict {} verification: {}",
+                        &id[..8.min(id.len())],
+                        if passed { "passed" } else { "failed" }
+                    );
+                }
+                ConflictCommand::Record { id, reason } => {
+                    let conflict_id = parse_uuid(&id)?;
+                    repo.record_conflict(conflict_id, reason)?;
+                    println!("conflict {} recorded", &id[..8.min(id.len())]);
+                }
+                ConflictCommand::List { status, json } => {
+                    let status_filter = status.map(|s| match s {
+                        ConflictStatusArg::Detected => ConflictStatus::Detected,
+                        ConflictStatusArg::Classified => ConflictStatus::Classified,
+                        ConflictStatusArg::Suggested => ConflictStatus::Suggested,
+                        ConflictStatusArg::Resolved => ConflictStatus::Resolved,
+                        ConflictStatusArg::Verified => ConflictStatus::Verified,
+                        ConflictStatusArg::Recorded => ConflictStatus::Recorded,
+                    });
+
+                    let conflicts = repo.list_conflicts(status_filter)?;
+
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&conflicts)?);
+                    } else if conflicts.is_empty() {
+                        println!("no conflicts found");
+                    } else {
+                        for c in &conflicts {
+                            println!(
+                                "{}  {}  {}  [{}]  {}",
+                                &c.id.to_string()[..8],
+                                c.status,
+                                c.path,
+                                c.classification.as_deref().unwrap_or("-"),
+                                c.symbol.as_deref().unwrap_or("-"),
+                            );
+                        }
+                    }
                 }
             }
         }

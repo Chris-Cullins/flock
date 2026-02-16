@@ -12,12 +12,13 @@ pub use event::{
 pub use fl_storage::ApiCallRecord;
 pub use fl_storage::{RefKind, RepoRef, WorkspaceRefConfig};
 pub use repo::{
-    DecisionSummary, ExplorationStatus, ExplorationSummary, FsckReport, GateConditionKind,
-    GatePolicyKind, GateStatus, GateSummary, ImpactReport, LockStatus, LockSummary,
-    PresenceSummary, ProvenanceInfo, ReplayedState, Repo, ResourceUsageTotals, ReviewStats,
-    ReviewSummary, SessionReplay, SessionStatus, SessionSummary, ShadowSafetyCheck,
-    ShadowSafetyReport, SubscriptionNotify, SubscriptionStatus, SubscriptionSummary, TaskEdge,
-    TaskGraph, TaskRelation, TaskStatus, TaskSummary, UndoRequest, UndoResult, WorkspaceInfo,
+    ConflictDetail, ConflictStatus, ConflictSummary, DecisionSummary, ExplorationStatus,
+    ExplorationSummary, FsckReport, GateConditionKind, GatePolicyKind, GateStatus, GateSummary,
+    ImpactReport, LockStatus, LockSummary, PresenceSummary, ProvenanceInfo, RebaseResult,
+    RebaseSummary, ReplayedState, Repo, ResourceUsageTotals, ReviewStats, ReviewSummary,
+    SessionReplay, SessionStatus, SessionSummary, ShadowSafetyCheck, ShadowSafetyReport,
+    SubscriptionNotify, SubscriptionStatus, SubscriptionSummary, TaskEdge, TaskGraph, TaskRelation,
+    TaskStatus, TaskSummary, UndoRequest, UndoResult, WorkspaceInfo,
 };
 pub use semantic::{
     SemanticChange, SemanticChangeKind, SemanticCompatibility, SemanticCompatibilityStatus,
