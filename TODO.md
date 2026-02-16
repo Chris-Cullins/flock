@@ -49,6 +49,7 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [ ] Post-conversion validation (`fl fsck` + compare checkout against original)
   - [ ] `--branch` filter to convert only specific branches
   - [ ] `--shallow` option to import only recent history (last N commits) for quick onboarding
+  - [ ] `fl convert --to git` — export full flock history back to a clean `.git/` repo (checkpoints → commits, explorations → branches, tags preserved), then optionally remove `.flock/`
 
 ## 3. Semantic Layer (TS/JS First)
 
