@@ -249,12 +249,16 @@ Client-side commands and protocol for syncing with a Flock remote (server lives 
 
 ## 10-R. Remote Server (Roost — `../roost`)
 
-Server-side features live in the Roost repo. Tracked here for cross-reference only.
+Server-side features live in the Roost repo. Tracked here for cross-reference only. See `../roost-git/TODO.md` for canonical Roost backlog. Items marked `[x]` are done in Roost.
 
 ### 10-R.a. Server Core
-- [ ] Receive and store events and content blocks
+- [x] WebSocket gateway with auth, heartbeat, reconnect, backpressure
+- [x] Event routing — receive events from clients, broadcast to subscribers
+- [x] Task broker — atomic task claiming, claim TTL, force-release
+- [x] Presence manager — file-level presence tracking, stale record expiration
+- [x] Storage layer — authoritative event log with indexes, content block store, task DB
+- [x] Token-based auth (personal tokens and service tokens)
 - [ ] Concurrent push conflict detection (reject or auto-merge based on semantic analysis)
-- [ ] Repository storage layout on server (event log + content store + refs)
 - [ ] User/agent identity model — map actors to authenticated users
 - [ ] Repository-level access control (read/write/admin per user or team)
 - [ ] Per-branch and per-path write permissions
@@ -264,13 +268,18 @@ Server-side features live in the Roost repo. Tracked here for cross-reference on
 - [ ] Server-side merge preview (dry-run semantic merge on push)
 - [ ] Semantic change indexing — maintain searchable index of all semantic changes across history
 
-### 10-R.c. Web UI for Semantic Review
-- [ ] Render `fl review` output in browser — semantic change list grouped by risk
-- [ ] Expandable drill-down into individual semantic changes
+### 10-R.c. Web UI
+- [x] Phase 1 minimal web UI — live dashboard, task board, basic review placeholder, presence panel
+- [ ] Semantic review page — risk-sorted semantic changes with per-unit approval flow
+- [ ] Expandable drill-down into individual semantic changes with actual code diff
 - [ ] Full line-level diff fallback view
-- [ ] Inline commenting on semantic changes (not just lines)
-- [ ] Review approval workflow (approve/request-changes per semantic unit)
-- [ ] Exploration comparison view (side-by-side exploration outcomes)
+- [ ] Inline threaded commenting on semantic changes (not just lines)
+- [ ] Cross-file change grouping and impact visualization
+- [ ] Review policies — auto-approve StyleOnly, require reviewers for Medium/High-risk
+- [ ] Continuous review mode — review changes as they land, not batch PRs
+- [ ] Exploration inspector — tree view of agent's problem-solving process (attempts, abandoned branches, reasons, promotion path, resource usage)
+- [ ] Agent console — fleet management dashboard (status, task assignments, token usage, throughput, anomaly detection, intervention controls)
+- [ ] Timeline/history — semantic-level event history filtered by actor/intent/scope, grouped by logical unit of work
 
 ### 10-R.d. Server Infrastructure
 - [ ] Tiered storage policies (hot/warm/cool — recent events on SSD, old history on object storage)
@@ -291,6 +300,9 @@ Server-side features live in the Roost repo. Tracked here for cross-reference on
   - [ ] Task dependency resolution propagates live (task done → blocked tasks unblock across all clients)
   - [ ] Cross-repo task visibility — tasks in repo A can reference/block tasks in repo B
   - [ ] Dashboard view of all agent activity across connected repos (who's working on what, task throughput, queue depth)
+- [ ] Agent directives — hot-swap redirection, pause/resume/abort messages from server to agent
+- [ ] Streaming code review — `LiveReviewUpdate` messages as agent works
+- [ ] Cross-repo coordination — detect cross-repo dependencies, alert on breaking changes
 
 ## 11. Intelligence Layer
 
@@ -308,6 +320,97 @@ Server-side features live in the Roost repo. Tracked here for cross-reference on
 - [x] Offline mode behavior and reconnect reconciliation (`fl_core::reconcile` — divergence detection, auto-merge)
 - [x] Backup and restore strategy for `.flock` data (`fl backup create/restore/verify`)
 - [x] Disaster recovery playbooks (`docs/disaster-recovery.md`)
+
+## 12.5. Agent Governance & Policy Engine (Client-Side)
+
+Enforce quality, consistency, and safety at the point of creation. Policies are configured in `.flock/policies.toml` (versioned with code) and enforced locally before events reach the server. See `../roost-git/docs/flock-agent-governance.md` for full design.
+
+### 12.5a. Policy Engine Core
+- [ ] Parse and validate `.flock/policies.toml` configuration
+- [ ] Policy evaluation pipeline — intercept file writes, checkpoints, promotions, merges, and task lifecycle events
+- [ ] Three-verdict model: Allow / Gate (pause for human review) / Block (reject with structured error)
+- [ ] Policy decision audit trail — log which policies were evaluated and their verdicts in the event log
+
+### 12.5b. Scope Enforcement
+- [ ] Check file writes against task-defined scope (path patterns or semantic scope)
+- [ ] Three enforcement modes: Block (reject out-of-scope), Gate (allow with justification), Split (auto-extract to discovery task)
+- [ ] Auto-create discovery tasks for out-of-scope observations in split mode
+- [ ] Configuration: `[scope] enforce = "split"`, `default_scope_mode = "path" | "semantic" | "module"`
+
+### 12.5c. Change Budget Limits
+- [ ] Track files modified and lines changed per exploration and per task
+- [ ] Track semantic changes per exploration
+- [ ] Enforce configurable budgets with pause_and_flag / block / warn actions
+- [ ] Configuration: `[budget] max_files_per_task`, `max_lines_per_task`, `max_semantic_changes_per_exploration`
+
+### 12.5d. Commit Hygiene & Structured Intent Metadata
+- [ ] Extend checkpoint/commit events with structured intent fields: category (bugfix/feature/refactor/test/docs/style/chore), scope, confidence (high/medium/low), structured description
+- [ ] Enforce required intent metadata at checkpoint time (configurable per field)
+- [ ] Checkpoint frequency prompting — warn if agent works >N minutes without checkpointing
+- [ ] Configuration: `[commit_hygiene] require_category`, `require_scope`, `require_confidence`, `max_time_between_checkpoints`
+
+### 12.5e. DRY / Duplication Prevention
+- [ ] Layer 1: Signature matching — compare new methods against existing symbol table by return type, parameter types, name similarity
+- [ ] Layer 2: Body analysis — AST structural comparison of method bodies
+- [ ] Layer 3: Pattern conformance — detect when new code should implement existing interfaces/patterns
+- [ ] Proactive reuse suggestions — surface relevant existing code when agent claims a task
+- [ ] Protected domains — stricter enforcement for sensitive areas (financial calculations, compliance)
+- [ ] Configuration: `[reuse] enforce`, `similarity_threshold`, `check_signatures`, `check_bodies`, `check_patterns`
+
+### 12.5f. Architecture Rules
+- [ ] Parse `.flock/arch-rules.toml` for layer boundary, dependency direction, interface requirement, and namespace convention rules
+- [ ] Enforce architecture rules at file write time using AST and dependency graph
+- [ ] Configuration: `[architecture] rules = ".flock/arch-rules.toml"`, `enforce = "block" | "gate" | "warn"`
+
+### 12.5g. Anti-Pattern Detection
+- [ ] Parse `.flock/anti-patterns.toml` for domain-specific AST query rules
+- [ ] Check file writes against anti-pattern rules (e.g., float for currency, hardcoded rates, audit bypass, PII exposure)
+- [ ] Structured explanations with fix suggestions on violation
+- [ ] Configuration: `[anti_patterns] rules = ".flock/anti-patterns.toml"`, `enforce = "block_with_explanation"`
+
+### 12.5h. Dependency & Compatibility Checks
+- [ ] Parse `.flock/approved-deps.toml` for package allowlist with version ranges
+- [ ] License blocklist enforcement (e.g., GPL-3.0, AGPL-3.0)
+- [ ] Vulnerability scanning for new dependencies (CVE checks)
+- [ ] Run consumer test suites when shared libraries are modified
+- [ ] Configuration: `[dependencies] approved_packages`, `license_blocklist`, `vuln_check`
+
+### 12.5i. Test Requirements
+- [ ] Enforce existing tests pass before exploration promotion
+- [ ] Require new test coverage for new behavior (new method → corresponding test)
+- [ ] Coverage threshold enforcement for modified modules
+- [ ] Configuration: `[tests] require_passing`, `require_new_coverage`, `min_coverage_percent`
+
+### 12.5j. Rate Limits & Runaway Prevention
+- [ ] Track explorations per task, wall-clock time per exploration, undo operations per exploration, token budget per task
+- [ ] Enforce configurable limits with pause_and_escalate / warn / block actions
+- [ ] Escalation notifications with context (what the agent tried, links to exploration tree)
+- [ ] Configuration: `[rate_limits] max_explorations_per_task`, `max_time_per_exploration`, `max_undos_per_exploration`, `max_tokens_per_task`
+
+### 12.5k. Regression Detection & Automatic Rollback
+- [ ] Post-merge monitoring — watch for test failures and benchmark regressions traceable to recently merged changes
+- [ ] Automatic rollback via append-only revert event when post-merge issues detected
+- [ ] Notify originating agent with context for re-exploration
+- [ ] Configuration: `[regression] monitor_after_merge`, `monitor_window`, `benchmark_threshold`; `[rollback] auto_rollback`, `rollback_on_test_failure`
+
+### Implementation Priority
+
+| Phase | Policies | Rationale | Depends On |
+|-------|----------|-----------|------------|
+| **1** | Scope, Budget, Rate Limits | Highest impact, lowest complexity | Core event pipeline only |
+| **2** | Commit Hygiene, Test Requirements | Improves review quality, prevents broken promotions | Exploration and promotion flow |
+| **3** | Architecture Rules, Anti-Patterns | Requires semantic layer (AST, dependency graph) | Semantic layer |
+| **4** | DRY/Reuse Enforcement | Requires mature semantic index with body analysis | Semantic index, symbol table |
+| **5** | Dependencies, Regression, Rollback | Requires integration with build/test systems | CI integration, test runner |
+
+## 12.6. CLI Gaps for Server Integration
+
+Features the Flock CLI needs to fully support the Roost server coordination model.
+
+- [ ] `fl who` command — show active actors and what they're working on (queries presence from server or local presence table)
+- [ ] Agent directive handling — background listener thread to receive and act on Pause/Resume/Redirect/Abort directives from server
+- [ ] Method-level presence — upgrade `PresenceUpdate` from file-level to symbol-level granularity (Phase 3 readiness)
+- [ ] `WorkspacePreview` streaming — optionally stream workspace diffs through WebSocket at configurable frequency for ghost text
 
 ## 13. QA and Performance
 
