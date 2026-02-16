@@ -209,7 +209,14 @@ Critical for repos at scale (millions of LOC, hundreds of thousands of events). 
 - [x] Materialized state snapshots — periodically snapshot computed state so replay starts from last materialized point, not from the beginning of time
 - [x] Content-addressable snapshot dedup — two checkpoints where only 3 files changed should not store the entire repo twice (file-level dedup at minimum, block-level ideally)
 - [x] Segmented refs — replace single `refs.json` with one-file-per-ref or sorted index with append-only updates to avoid rewriting all refs on every update
-- [ ] Lazy/partial clone — only materialize snapshots and events the client actually needs (analogous to git partial clone + sparse checkout)
+- [x] Lazy/partial clone — only materialize snapshots and events the client actually needs (analogous to git partial clone + sparse checkout)
+  - [x] Phase 1: `fl clone` command — convenience wrapper for init + remote add + pull
+  - [x] Phase 2: Shallow clone (`--depth N`) — add `depth` to EventPullRequest, graft markers, `fl fetch --deepen N`
+  - [x] Phase 3: Sparse checkout (`--sparse "pattern"`) — pull all events but only fetch blocks for matching files; `fl sparse add/remove/list`
+  - [x] Phase 4: Focus clone (`--focus <build-target>`) — parse build manifests (Cargo.toml, package.json, go.mod) to compute package dependency closure, fetch only those paths
+  - [x] Phase 5: Lazy block fetching (`--lazy`) — download events + snapshot indices only, fault-in blocks on demand via BlockFaultHandler
+  - [x] Phase 6: `fl pin <pattern>` — eagerly fetch blocks matching pattern for offline access
+  - [x] Phase 7: Build-integrated recovery (`fl fetch --resolve-missing`) — detect missing files from build errors, auto-fetch needed blocks
 - [x] Event log compaction — summarize/archive old event ranges while preserving Merkle integrity (keep checkpoints, compact fine-grained events between them)
 - [x] Incremental semantic indexing — update AST cache and dependency graph incrementally on new events instead of full recompute
 - [x] Large-repo benchmark suite — test against synthetic repos at 1M+ events, 10K+ files, 5M+ LOC to validate scaling targets
