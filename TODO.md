@@ -288,6 +288,14 @@ Layer on top of the remote server via websocket event streaming. See `docs/remot
 - [x] M1.4 Add `fl undo` basic variants on event timeline
 - [x] M1.5 Add basic git-colocated commit/push/pull bridge stubs
 
+## Terminology / UX Polish
+
+- [ ] Add `fl commit` as a user-facing alias for `fl checkpoint` (keep checkpoint as the internal event type)
+- [ ] Update CLI help text to use "commit" instead of "checkpoint" in user-facing descriptions
+- [ ] Update README to use "commit" terminology
+- [ ] Update `fl log` output to say "commit" instead of "checkpoint"
+- [ ] Audit all CLI output strings and error messages for consistent terminology
+
 ## Bugs
 
 - [ ] `fl init --colocated` writes `mode = "git-compatible"` in `.flock/config.toml` instead of `"git-colocated"` — the `--colocated` flag is ignored when writing the config
