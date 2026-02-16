@@ -1,6 +1,7 @@
 pub mod chunking;
 pub mod compaction;
 pub mod content_store;
+pub mod credential_store;
 pub mod event;
 pub mod event_log;
 pub mod event_log_migration;
@@ -8,6 +9,8 @@ pub mod file_index;
 pub mod layout;
 pub mod materialized_state;
 pub mod refs;
+pub mod remote_config;
+pub mod remote_protocol;
 pub mod segmented_event_log;
 pub mod segmented_refs;
 pub mod snapshot_store;
@@ -20,9 +23,9 @@ pub use event::{
     ConflictResolutionEvent, DecisionAction, DecisionEvent, Event, EventKind, EventRecord,
     ExplorationAction, ExplorationEvent, GateAction, GateCondition, GateEvent, GatePolicy,
     GitBridgeAction, GitBridgeEvent, HookEvent, LockAction, LockEvent, NotifyConfig, PresenceAction,
-    PresenceEvent, RebaseEvent, ResourceUsageEvent, SessionAction, SessionEvent,
-    SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
-    UndoMode, event_signing_payload,
+    PresenceEvent, RebaseEvent, RemoteSyncAction, RemoteSyncEvent, ResourceUsageEvent,
+    SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent, SubscriptionFilter,
+    TaskAction, TaskEvent, UndoEvent, UndoMode, event_signing_payload,
 };
 pub use event_log::EventLog;
 pub use event_log_migration::{MigrationReport as EventLogMigrationReport, migrate_to_segmented};
@@ -37,6 +40,20 @@ pub use materialized_state::MaterializedStateStore;
 pub use refs::{
     CURRENT_REFS_SCHEMA_VERSION, RefKind, RefRecord, RefStore, RepoRef, WorkspaceRefConfig,
 };
+pub use remote_config::{
+    RoostEntry, RoostsConfig, add_roost, find_roost, find_roost_mut, load_roosts, remove_roost,
+    save_roosts,
+};
+pub use remote_protocol::{
+    BlockNeedRequest, BlockNeedResponse, BlockPayload, BlockUploadRequest, BlockUploadResponse,
+    EventPullRequest, EventPullResponse, EventPushRequest, EventPushResponse, PullReport,
+    PushReport, RemoteScheme, RemoteUrl, SnapshotNeedRequest, SnapshotNeedResponse,
+    SshAuthChallengeRequest, SshAuthChallengeResponse, SshAuthVerifyRequest, SshAuthVerifyResponse,
+    TokenLoginRequest, TokenLoginResponse,
+};
 pub use segmented_event_log::SegmentedEventLog;
 pub use segmented_refs::SegmentedRefStore;
 pub use snapshot_store::{IncrementalSnapshotReport, build_incremental_index, store_snapshot_incremental};
+pub use credential_store::{
+    AuthMethod, CredentialEntry, CredentialStore, credentials_path, resolve_token,
+};

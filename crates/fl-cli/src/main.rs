@@ -217,6 +217,12 @@ enum Command {
         #[arg(long)]
         native: bool,
     },
+    /// Rebuild or clear the semantic index (AST cache + dependency graph)
+    Index {
+        /// Clear all cached semantic data instead of rebuilding
+        #[arg(long)]
+        clear: bool,
+    },
     /// Materialize replay state for faster future operations
     Materialize,
     /// Migrate event log to segmented format
@@ -232,10 +238,76 @@ enum Command {
         #[command(subcommand)]
         command: ConvertCommand,
     },
+    /// Manage remote authentication
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
+    /// Manage roosts (Flock remotes)
+    Roost {
+        #[command(subcommand)]
+        command: RoostCommand,
+    },
+    /// Push events and content to a roost
+    Push {
+        /// Roost name (defaults to "origin")
+        roost: Option<String>,
+        /// Branch to push
+        branch: Option<String>,
+    },
+    /// Pull events and content from a roost
+    Pull {
+        /// Roost name (defaults to "origin")
+        roost: Option<String>,
+        /// Branch to pull
+        branch: Option<String>,
+    },
     /// Generate shell completions for bash, zsh, fish, or powershell
     Completions {
         /// Shell to generate completions for
         shell: Shell,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RemoteCommand {
+    /// Authenticate with a remote host using a token
+    Login {
+        /// Remote host to authenticate with (e.g. "example.com")
+        host: String,
+        /// Bearer token for authentication
+        #[arg(long)]
+        token: Option<String>,
+        /// Authenticate using SSH key (ed25519 challenge-response)
+        #[arg(long)]
+        ssh_key: bool,
+    },
+    /// Remove stored credentials for a remote host
+    Logout {
+        /// Remote host to log out from
+        host: String,
+    },
+    /// List stored credentials
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum RoostCommand {
+    /// Add a new roost
+    Add {
+        name: String,
+        url: String,
+    },
+    /// Remove a roost
+    Remove {
+        name: String,
+    },
+    /// List configured roosts
+    List,
+    /// Change the URL of a roost
+    SetUrl {
+        name: String,
+        url: String,
     },
 }
 
@@ -788,6 +860,11 @@ fn main() -> Result<()> {
                             event.timestamp, h.hook_point, h.hook_name, status, h.duration_ms
                         );
                     }
+                    EventKind::RemoteSync(rs) => println!(
+                        "{}  sync:{:?}  roost={}  events={}  blocks={}  success={}",
+                        event.timestamp, rs.action, rs.roost_name, rs.event_count,
+                        rs.block_count, rs.success
+                    ),
                 }
             }
         }
@@ -2439,6 +2516,19 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::Index { clear } => {
+            let repo = Repo::discover(cwd)?;
+            if clear {
+                repo.clear_index()?;
+                println!("semantic index cleared");
+            } else {
+                let report = repo.build_index()?;
+                println!(
+                    "indexed {} files, {} dependency edges",
+                    report.files_indexed, report.edges_computed
+                );
+            }
+        }
         Command::Materialize => {
             let repo = Repo::discover(cwd)?;
             let event_count = repo.materialize()?;
@@ -2478,6 +2568,143 @@ fn main() -> Result<()> {
                 println!("{report}");
             }
         },
+        Command::Remote { command } => {
+            match command {
+                RemoteCommand::Login { host, token, ssh_key } => {
+                    if ssh_key {
+                        let repo = Repo::discover(cwd)?;
+                        let result = repo.remote_login_ssh(&host)?;
+                        if result.success {
+                            println!(
+                                "authenticated with {} via SSH key{}",
+                                host,
+                                result.identity.map(|id| format!(" ({})", id)).unwrap_or_default()
+                            );
+                        } else {
+                            eprintln!(
+                                "authentication failed: {}",
+                                result.error.as_deref().unwrap_or("unknown error")
+                            );
+                            std::process::exit(1);
+                        }
+                    } else {
+                        let tok = match token {
+                            Some(t) => t,
+                            None => {
+                                // Read token from stdin.
+                                eprint!("token: ");
+                                io::stderr().flush()?;
+                                let mut buf = String::new();
+                                io::stdin().read_line(&mut buf)?;
+                                buf.trim().to_string()
+                            }
+                        };
+                        if tok.is_empty() {
+                            bail!("token cannot be empty; provide --token or enter interactively");
+                        }
+                        let repo = Repo::discover(cwd)?;
+                        let result = repo.remote_login(&host, &tok)?;
+                        if result.success {
+                            println!(
+                                "authenticated with {}{}",
+                                host,
+                                result.identity.map(|id| format!(" ({})", id)).unwrap_or_default()
+                            );
+                        } else {
+                            eprintln!(
+                                "authentication failed: {}",
+                                result.error.as_deref().unwrap_or("unknown error")
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                RemoteCommand::Logout { host } => {
+                    let repo = Repo::discover(cwd)?;
+                    let removed = repo.remote_logout(&host)?;
+                    if removed {
+                        println!("credentials removed for {}", host);
+                    } else {
+                        println!("no credentials stored for {}", host);
+                    }
+                }
+                RemoteCommand::Status => {
+                    let repo = Repo::discover(cwd)?;
+                    let creds = repo.remote_credentials_list()?;
+                    if creds.is_empty() {
+                        println!("no stored credentials");
+                    } else {
+                        for c in &creds {
+                            println!("{}  ({})", c.host, c.method);
+                        }
+                    }
+                }
+            }
+        }
+        Command::Roost { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                RoostCommand::Add { name, url } => {
+                    repo.roost_add(&name, &url)?;
+                    println!("roost '{}' added: {}", name, url);
+                }
+                RoostCommand::Remove { name } => {
+                    repo.roost_remove(&name)?;
+                    println!("roost '{}' removed", name);
+                }
+                RoostCommand::List => {
+                    let roosts = repo.roost_list()?;
+                    if roosts.is_empty() {
+                        println!("no roosts configured");
+                    } else {
+                        for r in &roosts {
+                            let synced = r
+                                .last_synced_event
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "never".to_string());
+                            println!("{}  {}  (last sync: {})", r.name, r.url, synced);
+                        }
+                    }
+                }
+                RoostCommand::SetUrl { name, url } => {
+                    repo.roost_set_url(&name, &url)?;
+                    println!("roost '{}' url updated to {}", name, url);
+                }
+            }
+        }
+        Command::Push { roost, branch } => {
+            let repo = Repo::discover(cwd)?;
+            let roost_name = roost.as_deref().unwrap_or("origin");
+            let report = repo.push(roost_name, branch.as_deref())?;
+            if report.rejected {
+                eprintln!(
+                    "push rejected: {}",
+                    report.detail.as_deref().unwrap_or("unknown reason")
+                );
+                std::process::exit(1);
+            } else {
+                println!(
+                    "pushed {} event(s), {} block(s) to '{}'",
+                    report.events_pushed, report.blocks_uploaded, report.roost_name
+                );
+            }
+        }
+        Command::Pull { roost, branch } => {
+            let repo = Repo::discover(cwd)?;
+            let roost_name = roost.as_deref().unwrap_or("origin");
+            let report = repo.pull(roost_name, branch.as_deref())?;
+            if report.events_pulled == 0 {
+                println!("already up to date with '{}'", report.roost_name);
+            } else {
+                println!(
+                    "pulled {} event(s), {} block(s) from '{}'",
+                    report.events_pulled, report.blocks_downloaded, report.roost_name
+                );
+                if !report.refs_updated.is_empty() {
+                    println!("refs updated: {}", report.refs_updated.join(", "));
+                }
+            }
+        }
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "fl", &mut io::stdout());

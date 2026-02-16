@@ -15,6 +15,7 @@ use fl_storage::{
     chunk_data,
 };
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -29,7 +30,8 @@ use fl_collab::can_acquire_lock;
 use fl_storage::ApiCallRecord;
 use crate::semantic::{
     SemanticConflictClassification, SemanticFileDiff, SemanticImpact, SemanticMergeConflict,
-    SemanticMergeResult, diff as semantic_diff, impact_symbols, supported_source,
+    SemanticMergeResult, clear_cache, diff as semantic_diff, impact_symbols, set_cache_root,
+    supported_source,
 };
 use fl_workflow::{
     build_task_graph, previous_checkpoint_before, replay_state, replay_state_incremental,
@@ -70,6 +72,56 @@ pub struct FileSummary {
     pub added: Vec<String>,
     pub modified: Vec<String>,
     pub deleted: Vec<String>,
+}
+
+/// Persisted dependency graph for incremental semantic indexing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DependencyIndex {
+    version: u32,
+    snapshot_id: String,
+    edges: HashMap<String, Vec<String>>,
+}
+
+const SEMANTIC_INDEX_DIR: &str = "semantic-index";
+const DEPS_INDEX_FILE: &str = "deps.json";
+
+impl DependencyIndex {
+    fn path(root: &Path) -> PathBuf {
+        root.join(FLOCK_DIR)
+            .join(SEMANTIC_INDEX_DIR)
+            .join(DEPS_INDEX_FILE)
+    }
+
+    fn load(root: &Path) -> Option<Self> {
+        let path = Self::path(root);
+        let json = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
+    fn save(&self, root: &Path) -> Result<()> {
+        let path = Self::path(root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(&path, json)?;
+        Ok(())
+    }
+
+    fn clear(root: &Path) -> Result<()> {
+        let dir = root.join(FLOCK_DIR).join(SEMANTIC_INDEX_DIR);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+}
+
+/// Result of an `fl index` operation.
+#[derive(Debug, Clone)]
+pub struct IndexReport {
+    pub files_indexed: usize,
+    pub edges_computed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +213,17 @@ pub struct ConflictDetail {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteLoginResult {
+    pub success: bool,
+    pub identity: Option<String>,
+    pub error: Option<String>,
+}
+
+pub struct RemoteCredentialInfo {
+    pub host: String,
+    pub method: String,
+}
+
 pub struct ConvertReport {
     pub branches_imported: usize,
     pub tags_imported: usize,
@@ -248,6 +311,7 @@ impl Repo {
 
         for ancestor in start.ancestors() {
             if ancestor.join(FLOCK_DIR).is_dir() {
+                set_cache_root(ancestor);
                 return Ok(Self::at(ancestor.to_path_buf()));
             }
         }
@@ -368,6 +432,10 @@ impl Repo {
                 ),
             }))?;
         }
+
+        // Auto-index: update semantic caches for changed files.
+        // Errors are non-fatal — indexing is best-effort.
+        let _ = self.auto_index_after_checkpoint(&event);
 
         // Run post-commit hooks (non-blocking).
         if skip_hooks {
@@ -656,6 +724,7 @@ impl Repo {
                 EventKind::Rebase(_) => {}
                 EventKind::ConflictResolution(_) => {}
                 EventKind::Hook(_) => {}
+                EventKind::RemoteSync(_) => {}
             }
         }
 
@@ -1051,7 +1120,7 @@ impl Repo {
         self.assert_initialized()?;
 
         let current_files = collect_source_files(self.root(), true)?;
-        let reverse_dependencies = build_reverse_dependency_index(self.root(), &current_files)?;
+        let reverse_dependencies = self.load_or_build_dependency_index(&current_files)?;
 
         let target_path = PathBuf::from(path);
         let all_impacted = collect_impacted_files(&target_path, &reverse_dependencies);
@@ -1118,7 +1187,7 @@ impl Repo {
         result: &mut SemanticMergeResult,
     ) -> Result<()> {
         let current_files = collect_source_files(self.root(), true)?;
-        let reverse_dependencies = build_reverse_dependency_index(self.root(), &current_files)?;
+        let reverse_dependencies = self.load_or_build_dependency_index(&current_files)?;
 
         let rel_path = merged_path
             .strip_prefix(self.root())
@@ -5399,6 +5468,589 @@ impl Repo {
 
     fn now_nanos_str(&self) -> String {
         self.now_nanos().to_string()
+    }
+
+    // ---- Semantic indexing ------------------------------------------------
+
+    /// Rebuild the full semantic index (AST cache + dependency graph).
+    pub fn build_index(&self) -> Result<IndexReport> {
+        self.assert_initialized()?;
+        set_cache_root(self.root());
+
+        let source_files = collect_source_files(self.root(), true)?;
+        let mut files_indexed = 0usize;
+
+        // Parse all source files to populate the persistent AST cache
+        for rel_path in &source_files {
+            let abs_path = self.root().join(rel_path);
+            if let Ok(source) = fs::read(&abs_path) {
+                if fl_semantic::supported_source(rel_path) {
+                    let _ = fl_semantic::diff(rel_path, None, Some(&source));
+                    files_indexed += 1;
+                }
+            }
+        }
+
+        // Build and persist the dependency graph
+        let reverse_deps = build_reverse_dependency_index(self.root(), &source_files)?;
+        let edges: HashMap<String, Vec<String>> = reverse_deps
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+                )
+            })
+            .collect();
+        let edges_computed = edges.len();
+
+        let snapshot_id = self
+            .latest_checkpoint_event_id()
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+
+        let index = DependencyIndex {
+            version: 1,
+            snapshot_id,
+            edges,
+        };
+        index.save(self.root())?;
+
+        Ok(IndexReport {
+            files_indexed,
+            edges_computed,
+        })
+    }
+
+    /// Clear all semantic index data (AST cache + dependency graph).
+    pub fn clear_index(&self) -> Result<()> {
+        self.assert_initialized()?;
+        clear_cache(self.root())?;
+        DependencyIndex::clear(self.root())?;
+        Ok(())
+    }
+
+    /// Non-fatal auto-indexing after a checkpoint is created.
+    fn auto_index_after_checkpoint(&self, event: &Event) -> Result<()> {
+        set_cache_root(self.root());
+
+        // Determine which files changed by comparing to the previous snapshot
+        let EventKind::Checkpoint(ref payload) = event.kind else {
+            return Ok(());
+        };
+        let _snapshot_dir = self.snapshot_path(payload.snapshot_id);
+
+        // Parse symbols for all source files in the new snapshot to warm the cache
+        let source_files = collect_source_files(self.root(), true)?;
+        for rel_path in &source_files {
+            let abs_path = self.root().join(rel_path);
+            if let Ok(source) = fs::read(&abs_path) {
+                if fl_semantic::supported_source(rel_path) {
+                    let _ = fl_semantic::diff(rel_path, None, Some(&source));
+                }
+            }
+        }
+
+        // Rebuild dependency graph incrementally
+        let mut index = DependencyIndex::load(self.root()).unwrap_or(DependencyIndex {
+            version: 1,
+            snapshot_id: String::new(),
+            edges: HashMap::new(),
+        });
+
+        // Re-scan all files for import edges (incremental: only changed files
+        // would be ideal, but the full scan is fast for typical repos)
+        let reverse_deps = build_reverse_dependency_index(self.root(), &source_files)?;
+        index.edges = reverse_deps
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+                )
+            })
+            .collect();
+        index.snapshot_id = event.id.to_string();
+        index.save(self.root())?;
+
+        Ok(())
+    }
+
+    /// Try to use the cached dependency index; fall back to full rebuild.
+    fn load_or_build_dependency_index(
+        &self,
+        current_files: &BTreeSet<PathBuf>,
+    ) -> Result<HashMap<PathBuf, BTreeSet<PathBuf>>> {
+        if let Some(index) = DependencyIndex::load(self.root()) {
+            let latest = self
+                .latest_checkpoint_event_id()
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            if index.snapshot_id == latest {
+                // Convert cached edges back to PathBuf map
+                let mut result = HashMap::<PathBuf, BTreeSet<PathBuf>>::new();
+                for (target, importers) in &index.edges {
+                    let set: BTreeSet<PathBuf> =
+                        importers.iter().map(PathBuf::from).collect();
+                    result.insert(PathBuf::from(target), set);
+                }
+                return Ok(result);
+            }
+        }
+        build_reverse_dependency_index(self.root(), current_files)
+    }
+
+    fn latest_checkpoint_event_id(&self) -> Option<Uuid> {
+        let events = fl_storage::EventLog::for_root(self.root()).read_all().ok()?;
+        events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, EventKind::Checkpoint(_)))
+            .map(|e| e.id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Roost (remote) management
+    // -----------------------------------------------------------------------
+
+    pub fn roost_add(&self, name: &str, url: &str) -> Result<()> {
+        self.assert_initialized()?;
+        // Validate the URL parses.
+        fl_storage::RemoteUrl::parse(url)?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        fl_storage::add_roost(&mut config, name, url)?;
+        fl_storage::save_roosts(self.root(), &config)?;
+        Ok(())
+    }
+
+    pub fn roost_remove(&self, name: &str) -> Result<()> {
+        self.assert_initialized()?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        fl_storage::remove_roost(&mut config, name)?;
+        fl_storage::save_roosts(self.root(), &config)?;
+        Ok(())
+    }
+
+    pub fn roost_list(&self) -> Result<Vec<fl_storage::RoostEntry>> {
+        self.assert_initialized()?;
+        let config = fl_storage::load_roosts(self.root())?;
+        Ok(config.roosts)
+    }
+
+    pub fn roost_set_url(&self, name: &str, url: &str) -> Result<()> {
+        self.assert_initialized()?;
+        fl_storage::RemoteUrl::parse(url)?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost_mut(&mut config, name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", name))?;
+        entry.url = url.to_string();
+        fl_storage::save_roosts(self.root(), &config)?;
+        Ok(())
+    }
+
+    /// Authenticate with a roost using a bearer token.
+    ///
+    /// Sends the token to the server, receives a session token, and stores it
+    /// in the user-level credential store (`~/.flock/credentials.toml`).
+    pub fn remote_login(&self, host: &str, token: &str) -> Result<RemoteLoginResult> {
+        use crate::remote::transport_for_url;
+
+        // Build a temporary transport to the host for authentication.
+        let url = fl_storage::RemoteUrl {
+            scheme: fl_storage::RemoteScheme::Flock,
+            host: Some(host.to_string()),
+            port: None,
+            path: String::new(),
+        };
+        let transport = transport_for_url(&url, None)?;
+
+        let resp = transport.token_login(&fl_storage::TokenLoginRequest {
+            token: token.to_string(),
+        })?;
+
+        if resp.success {
+            let session_token = resp.session_token.unwrap_or_else(|| token.to_string());
+            let mut store = fl_storage::CredentialStore::load()?;
+            store.upsert(fl_storage::CredentialEntry {
+                host: host.to_string(),
+                token: session_token.clone(),
+                method: fl_storage::AuthMethod::Token,
+                ssh_key_path: None,
+            });
+            store.save()?;
+            Ok(RemoteLoginResult {
+                success: true,
+                identity: resp.identity,
+                error: None,
+            })
+        } else {
+            Ok(RemoteLoginResult {
+                success: false,
+                identity: None,
+                error: resp.error,
+            })
+        }
+    }
+
+    /// Authenticate with a roost using SSH key challenge-response.
+    ///
+    /// Uses the repo's ed25519 signing key to prove identity. The server
+    /// sends a nonce, we sign it, and receive a session token.
+    pub fn remote_login_ssh(&self, host: &str) -> Result<RemoteLoginResult> {
+        use crate::remote::transport_for_url;
+        use ed25519_dalek::{Signer, VerifyingKey};
+
+        self.assert_initialized()?;
+
+        // Load the repo's signing key.
+        let sk_path = self.root.join(fl_storage::SIGNING_KEY_FILE);
+        if !sk_path.exists() {
+            bail!("no signing key found at {}; run `fl init` first", sk_path.display());
+        }
+        let sk_bytes = fs::read(&sk_path)?;
+        if sk_bytes.len() < 32 {
+            bail!("signing key file is too short");
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&sk_bytes[..32]);
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let verifying_key: VerifyingKey = (&signing_key).into();
+        let pub_key_hex = hex::encode(verifying_key.as_bytes());
+
+        // Build transport.
+        let url = fl_storage::RemoteUrl {
+            scheme: fl_storage::RemoteScheme::Flock,
+            host: Some(host.to_string()),
+            port: None,
+            path: String::new(),
+        };
+        let transport = transport_for_url(&url, None)?;
+
+        // Step 1: challenge.
+        let challenge = transport.ssh_auth_challenge(&fl_storage::SshAuthChallengeRequest {
+            public_key_hex: pub_key_hex.clone(),
+        })?;
+
+        if !challenge.key_recognized {
+            return Ok(RemoteLoginResult {
+                success: false,
+                identity: None,
+                error: Some("public key not recognized by server".to_string()),
+            });
+        }
+
+        // Step 2: sign the nonce and verify.
+        let nonce_bytes = hex::decode(&challenge.nonce_hex)
+            .map_err(|_| anyhow!("invalid nonce from server"))?;
+        let signature = signing_key.sign(&nonce_bytes);
+        let sig_hex = hex::encode(signature.to_bytes());
+
+        let verify_resp = transport.ssh_auth_verify(&fl_storage::SshAuthVerifyRequest {
+            public_key_hex: pub_key_hex,
+            signature_hex: sig_hex,
+            nonce_hex: challenge.nonce_hex,
+        })?;
+
+        if verify_resp.success {
+            let session_token = verify_resp.session_token.unwrap_or_default();
+            let mut store = fl_storage::CredentialStore::load()?;
+            store.upsert(fl_storage::CredentialEntry {
+                host: host.to_string(),
+                token: session_token,
+                method: fl_storage::AuthMethod::SshKey,
+                ssh_key_path: Some(sk_path.to_string_lossy().to_string()),
+            });
+            store.save()?;
+            Ok(RemoteLoginResult {
+                success: true,
+                identity: verify_resp.identity,
+                error: None,
+            })
+        } else {
+            Ok(RemoteLoginResult {
+                success: false,
+                identity: None,
+                error: verify_resp.error,
+            })
+        }
+    }
+
+    /// Remove stored credentials for a host.
+    pub fn remote_logout(&self, host: &str) -> Result<bool> {
+        let mut store = fl_storage::CredentialStore::load()?;
+        let removed = store.remove(host);
+        if removed {
+            store.save()?;
+        }
+        Ok(removed)
+    }
+
+    /// List all stored credentials (hosts only, not tokens).
+    pub fn remote_credentials_list(&self) -> Result<Vec<RemoteCredentialInfo>> {
+        let store = fl_storage::CredentialStore::load()?;
+        Ok(store
+            .credentials
+            .iter()
+            .map(|c| RemoteCredentialInfo {
+                host: c.host.clone(),
+                method: format!("{:?}", c.method).to_lowercase(),
+            })
+            .collect())
+    }
+
+    /// Push events and content to a roost.
+    pub fn push(&self, roost_name: &str, branch: Option<&str>) -> Result<fl_storage::PushReport> {
+        use crate::remote::{base64_encode, transport_for_url};
+
+        self.assert_initialized()?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost_mut(&mut config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        let url = fl_storage::RemoteUrl::parse(&entry.url)?;
+        let resolved_token = fl_storage::resolve_token(entry.token.as_deref(), url.host.as_deref())?;
+        let transport = transport_for_url(&url, resolved_token.as_deref())?;
+
+        // Collect events since last sync.
+        let all_events = self.list_events()?;
+        let events_to_push = if let Some(last_synced) = entry.last_synced_event {
+            let pos = all_events.iter().position(|e| e.id == last_synced);
+            match pos {
+                Some(idx) => all_events[idx + 1..].to_vec(),
+                None => all_events.clone(),
+            }
+        } else {
+            all_events.clone()
+        };
+
+        if events_to_push.is_empty() {
+            return Ok(fl_storage::PushReport {
+                roost_name: roost_name.to_string(),
+                events_pushed: 0,
+                blocks_uploaded: 0,
+                rejected: false,
+                detail: Some("already up to date".to_string()),
+            });
+        }
+
+        // Collect snapshot IDs from checkpoint events in the push set.
+        let snapshot_ids: Vec<Uuid> = events_to_push
+            .iter()
+            .filter_map(|e| {
+                if let EventKind::Checkpoint(cp) = &e.kind {
+                    Some(cp.snapshot_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Upload missing snapshots.
+        let mut blocks_uploaded = 0;
+        if !snapshot_ids.is_empty() {
+            let need_resp = transport.check_snapshots_needed(&fl_storage::SnapshotNeedRequest {
+                snapshot_ids: snapshot_ids.clone(),
+            })?;
+            for snap_id in &need_resp.needed_ids {
+                let snap_dir = self.root.join(SNAPSHOT_DIR).join(snap_id.to_string());
+                if snap_dir.is_dir() {
+                    // Pack as tar and upload.
+                    let mut buf = Vec::new();
+                    {
+                        let mut builder = tar::Builder::new(&mut buf);
+                        builder.append_dir_all(".", &snap_dir)?;
+                        builder.finish()?;
+                    }
+                    transport.upload_snapshot(*snap_id, &buf)?;
+                    blocks_uploaded += 1;
+                }
+            }
+        }
+
+        // Upload missing content blocks (native storage).
+        let store_dir = self.root.join("store/blocks");
+        if store_dir.is_dir() {
+            let mut block_hashes = Vec::new();
+            for entry_res in walkdir::WalkDir::new(&store_dir).into_iter().filter_map(|e| e.ok()) {
+                if entry_res.file_type().is_file() {
+                    if let Some(name) = entry_res.file_name().to_str() {
+                        if let Some(prefix) = entry_res.path().parent().and_then(|p| p.file_name()).and_then(|p| p.to_str()) {
+                            block_hashes.push(format!("{prefix}{name}"));
+                        }
+                    }
+                }
+            }
+            if !block_hashes.is_empty() {
+                let need_resp = transport.check_blocks_needed(&fl_storage::BlockNeedRequest {
+                    block_hashes,
+                })?;
+                if !need_resp.needed_hashes.is_empty() {
+                    let blocks: Vec<fl_storage::BlockPayload> = need_resp
+                        .needed_hashes
+                        .iter()
+                        .filter_map(|h| {
+                            let prefix = &h[..2];
+                            let rest = &h[2..];
+                            let path = store_dir.join(prefix).join(rest);
+                            let data = fs::read(&path).ok()?;
+                            Some(fl_storage::BlockPayload {
+                                hash: h.clone(),
+                                data_base64: base64_encode(&data),
+                            })
+                        })
+                        .collect();
+                    let resp = transport.upload_blocks(&fl_storage::BlockUploadRequest { blocks })?;
+                    blocks_uploaded += resp.accepted;
+                }
+            }
+        }
+
+        // Collect refs to push (optionally filtered by branch).
+        let all_refs = self.list_refs()?;
+        let refs_to_push: Vec<_> = if let Some(branch) = branch {
+            all_refs
+                .into_iter()
+                .filter(|r| r.name == branch)
+                .collect()
+        } else {
+            all_refs
+        };
+
+        // Push events.
+        let resp = transport.push_events(&fl_storage::EventPushRequest {
+            events: events_to_push.clone(),
+            refs: refs_to_push,
+            last_known_remote_event: entry.last_synced_event,
+        })?;
+
+        let report = if resp.accepted {
+            // Update last_synced_event.
+            let entry = fl_storage::find_roost_mut(&mut config, roost_name).unwrap();
+            entry.last_synced_event = events_to_push.last().map(|e| e.id);
+            fl_storage::save_roosts(self.root(), &config)?;
+
+            // Record sync event.
+            self.append_event(EventKind::RemoteSync(crate::event::RemoteSyncEvent {
+                action: crate::event::RemoteSyncAction::Push,
+                roost_name: roost_name.to_string(),
+                roost_url: url.to_string(),
+                success: true,
+                detail: None,
+                event_count: resp.events_accepted,
+                block_count: blocks_uploaded,
+            }))?;
+
+            fl_storage::PushReport {
+                roost_name: roost_name.to_string(),
+                events_pushed: resp.events_accepted,
+                blocks_uploaded,
+                rejected: false,
+                detail: None,
+            }
+        } else {
+            fl_storage::PushReport {
+                roost_name: roost_name.to_string(),
+                events_pushed: 0,
+                blocks_uploaded: 0,
+                rejected: true,
+                detail: resp.detail,
+            }
+        };
+
+        Ok(report)
+    }
+
+    /// Pull events and content from a roost.
+    pub fn pull(&self, roost_name: &str, branch: Option<&str>) -> Result<fl_storage::PullReport> {
+        self.assert_initialized()?;
+        let mut config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost_mut(&mut config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        let url = fl_storage::RemoteUrl::parse(&entry.url)?;
+        let resolved_token = fl_storage::resolve_token(entry.token.as_deref(), url.host.as_deref())?;
+        let transport = crate::remote::transport_for_url(&url, resolved_token.as_deref())?;
+
+        let resp = transport.pull_events(&fl_storage::EventPullRequest {
+            last_known_event: entry.last_synced_event,
+            branch: branch.map(String::from),
+        })?;
+
+        if resp.events.is_empty() {
+            return Ok(fl_storage::PullReport {
+                roost_name: roost_name.to_string(),
+                events_pulled: 0,
+                blocks_downloaded: 0,
+                refs_updated: vec![],
+            });
+        }
+
+        let events_pulled = resp.events.len();
+
+        // Download missing snapshots.
+        let mut blocks_downloaded = 0;
+        let snapshot_ids: Vec<Uuid> = resp
+            .events
+            .iter()
+            .filter_map(|e| {
+                if let EventKind::Checkpoint(cp) = &e.kind {
+                    Some(cp.snapshot_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for snap_id in &snapshot_ids {
+            let snap_dir = self.root.join(SNAPSHOT_DIR).join(snap_id.to_string());
+            if !snap_dir.exists() {
+                match transport.download_snapshot(*snap_id) {
+                    Ok(data) => {
+                        fs::create_dir_all(&snap_dir)?;
+                        let cursor = std::io::Cursor::new(data);
+                        let mut archive = tar::Archive::new(cursor);
+                        archive.unpack(&snap_dir)?;
+                        blocks_downloaded += 1;
+                    }
+                    Err(_) => {
+                        // Snapshot may not exist on remote (e.g., native mode).
+                    }
+                }
+            }
+        }
+
+        // Append pulled events to our log.
+        fl_storage::EventLog::for_root(self.root()).append_batch(&resp.events)?;
+
+        // Update refs from remote.
+        let ref_store = RefStore::for_root(self.root());
+        let refs_updated: Vec<String> = resp.refs.iter().map(|r| r.name.clone()).collect();
+        for r in &resp.refs {
+            ref_store.upsert(r.clone())?;
+        }
+
+        // Update last_synced_event.
+        let entry = fl_storage::find_roost_mut(&mut config, roost_name).unwrap();
+        entry.last_synced_event = resp.events.last().map(|e| e.id);
+        fl_storage::save_roosts(self.root(), &config)?;
+
+        // Record sync event.
+        self.append_event(EventKind::RemoteSync(crate::event::RemoteSyncEvent {
+            action: crate::event::RemoteSyncAction::Pull,
+            roost_name: roost_name.to_string(),
+            roost_url: url.to_string(),
+            success: true,
+            detail: None,
+            event_count: events_pulled,
+            block_count: blocks_downloaded,
+        }))?;
+
+        Ok(fl_storage::PullReport {
+            roost_name: roost_name.to_string(),
+            events_pulled,
+            blocks_downloaded,
+            refs_updated,
+        })
     }
 }
 

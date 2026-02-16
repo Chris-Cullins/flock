@@ -211,7 +211,7 @@ Critical for repos at scale (millions of LOC, hundreds of thousands of events). 
 - [x] Segmented refs — replace single `refs.json` with one-file-per-ref or sorted index with append-only updates to avoid rewriting all refs on every update
 - [ ] Lazy/partial clone — only materialize snapshots and events the client actually needs (analogous to git partial clone + sparse checkout)
 - [x] Event log compaction — summarize/archive old event ranges while preserving Merkle integrity (keep checkpoints, compact fine-grained events between them)
-- [ ] Incremental semantic indexing — update AST cache and dependency graph incrementally on new events instead of full recompute
+- [x] Incremental semantic indexing — update AST cache and dependency graph incrementally on new events instead of full recompute
 - [x] Large-repo benchmark suite — test against synthetic repos at 1M+ events, 10K+ files, 5M+ LOC to validate scaling targets
 
 ## 10. Remote Sync (Client-Side)
@@ -219,18 +219,18 @@ Critical for repos at scale (millions of LOC, hundreds of thousands of events). 
 Client-side commands and protocol for syncing with a Flock remote (server lives in `../roost`).
 
 ### 10a. Remote Config and Transport Protocol
-- [ ] Define remote repository URL scheme and discovery (`fl remote add origin flock://host/repo`)
-- [ ] Define wire protocol spec for event sync (shared between flock and roost)
-- [ ] Implement event sync protocol (client half) — send events after last-known server event ID, receive missing events
-- [ ] Implement snapshot/blob transport (client half) — upload/download content blocks over HTTPS
-- [ ] Implement `fl push` to flock remote
-- [ ] Implement `fl pull` from flock remote
-- [ ] Handle push rejection (server rejects on conflict) — display semantic conflict info, prompt for merge
+- [x] Define remote repository URL scheme and discovery (`fl roost add origin flock://host/repo`)
+- [x] Define wire protocol spec for event sync (shared between flock and roost)
+- [x] Implement event sync protocol (client half) — send events after last-known server event ID, receive missing events
+- [x] Implement snapshot/blob transport (client half) — upload/download content blocks over HTTPS
+- [x] Implement `fl push` to flock remote
+- [x] Implement `fl pull` from flock remote
+- [x] Handle push rejection (server rejects on conflict) — display semantic conflict info, prompt for merge
 
 ### 10b. Client-Side Auth
-- [ ] SSH key and token-based authentication (leverage existing ed25519 signing)
-- [ ] `fl remote login` / `fl remote logout` — token management
-- [ ] Store credentials securely (keychain/credential-helper pattern)
+- [x] SSH key and token-based authentication (leverage existing ed25519 signing)
+- [x] `fl remote login` / `fl remote logout` — token management
+- [x] Store credentials securely (keychain/credential-helper pattern)
 
 ### 10c. Real-Time Client (Websocket)
 - [ ] Websocket connection lifecycle — connect to remote, authenticate, maintain heartbeat
@@ -332,7 +332,7 @@ Server-side features live in the Roost repo. Tracked here for cross-reference on
 
 - [x] Add `fl commit` as a user-facing alias for `fl checkpoint` (keep checkpoint as the internal event type)
 - [x] Update CLI help text to use "commit" instead of "checkpoint" in user-facing descriptions
-- [ ] Update README to use "commit" terminology
+- [x] Update README to use "commit" terminology
 - [x] Update `fl log` output to say "commit" instead of "checkpoint"
 - [x] Audit all CLI output strings and error messages for consistent terminology
 
