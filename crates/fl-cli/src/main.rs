@@ -33,8 +33,9 @@ enum Command {
         #[arg(long)]
         native: bool,
     },
-    /// Create a checkpoint (commit equivalent)
-    Checkpoint {
+    /// Create a commit (save current state)
+    #[command(alias = "checkpoint")]
+    Commit {
         #[arg(short = 'm', long = "message")]
         message: Option<String>,
         /// Bypass secret detection (recorded in audit log)
@@ -48,13 +49,13 @@ enum Command {
     Log,
     /// Verify repository integrity
     Fsck,
-    /// Show working directory status vs last checkpoint
+    /// Show working directory status vs last commit
     Status {
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Show semantic diff between checkpoints or against working directory
+    /// Show semantic diff between commits or against working directory
     Diff {
         /// Enable semantic diff output
         #[arg(long)]
@@ -65,10 +66,10 @@ enum Command {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-        /// First checkpoint ID/prefix (compare against working dir if only one given)
+        /// First commit ID/prefix (compare against working dir if only one given)
         #[arg(name = "FROM")]
         from: Option<String>,
-        /// Second checkpoint ID/prefix (compare FROM..TO)
+        /// Second commit ID/prefix (compare FROM..TO)
         #[arg(name = "TO")]
         to: Option<String>,
     },
@@ -153,7 +154,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Quick checkpoint for agents
+    /// Quick commit for agents
     QuickSave {
         #[arg(long)]
         tag: Option<String>,
@@ -451,12 +452,12 @@ enum TaskCommand {
         #[arg(long)]
         assignee: Option<String>,
     },
-    /// Mark a task as completed (auto-checkpoints unless --no-checkpoint)
+    /// Mark a task as completed (auto-commits unless --no-checkpoint)
     Done {
         id: String,
         #[arg(long)]
         result: Option<String>,
-        /// Skip the automatic checkpoint
+        /// Skip the automatic commit
         #[arg(long)]
         no_checkpoint: bool,
     },
@@ -669,22 +670,22 @@ fn main() -> Result<()> {
                 repo.root().display()
             );
         }
-        Command::Checkpoint {
+        Command::Commit {
             message,
             allow_secrets,
             skip_hooks,
         } => {
             let repo = Repo::discover(cwd)?;
             let event = repo.create_checkpoint_with_options(message, allow_secrets, skip_hooks)?;
-            let checkpoint_id = event.id;
+            let commit_id = event.id;
             let EventKind::Checkpoint(payload) = event.kind else {
-                bail!("unexpected event payload for checkpoint")
+                bail!("unexpected event payload for commit")
             };
             println!(
-                "checkpoint {} ({}) id={} parent={} merkle={}",
+                "commit {} ({}) id={} parent={} merkle={}",
                 payload.label,
                 payload.snapshot_id,
-                checkpoint_id,
+                commit_id,
                 payload
                     .parent_checkpoint_event
                     .map(|id| id.to_string())
@@ -699,7 +700,7 @@ fn main() -> Result<()> {
             for event in events {
                 match event.kind {
                     EventKind::Checkpoint(cp) => println!(
-                        "{}  checkpoint  {}  {}  parent={}",
+                        "{}  commit  {}  {}  parent={}",
                         event.timestamp,
                         cp.label,
                         cp.snapshot_id,
@@ -794,7 +795,7 @@ fn main() -> Result<()> {
             let repo = Repo::discover(cwd)?;
             let report = repo.fsck()?;
             println!(
-                "fsck ok: events={} checkpoints={} snapshots={} refs={}",
+                "fsck ok: events={} commits={} snapshots={} refs={}",
                 report.event_count,
                 report.checkpoint_count,
                 report.snapshot_count,
@@ -818,14 +819,14 @@ fn main() -> Result<()> {
             } else {
                 println!("On branch {}", report.branch);
                 if let Some(ref cp) = report.checkpoint_id {
-                    println!("Latest checkpoint: {}", cp);
+                    println!("Latest commit: {}", cp);
                 } else {
-                    println!("No checkpoints yet");
+                    println!("No commits yet");
                 }
                 let total =
                     report.new_files.len() + report.modified_files.len() + report.deleted_files.len();
                 if total == 0 {
-                    println!("\nNothing changed since last checkpoint.");
+                    println!("\nNothing changed since last commit.");
                 } else {
                     println!();
                     for f in &report.new_files {
@@ -901,7 +902,7 @@ fn main() -> Result<()> {
                         print_intent_diff(&groups, json)?;
                     } else {
                         if !semantic {
-                            bail!("only `fl diff --semantic` or `fl diff --intent` is implemented;\nor use `fl diff <checkpoint-id>` to diff a specific checkpoint");
+                            bail!("only `fl diff --semantic` or `fl diff --intent` is implemented;\nor use `fl diff <commit-id>` to diff a specific commit");
                         }
                         let diffs = repo.semantic_diff_from_latest_checkpoint()?;
                         print_semantic_diffs(&diffs, json)?;
@@ -1049,7 +1050,7 @@ fn main() -> Result<()> {
             );
             println!("  Exploration: {}", summary.exploration.id);
             println!(
-                "  Base checkpoint: {}",
+                "  Base commit: {}",
                 summary
                     .exploration
                     .base_checkpoint_event
@@ -1254,7 +1255,7 @@ fn main() -> Result<()> {
 
             println!("undo target event: {}", result.target_event_id);
             if let Some(checkpoint_id) = result.restored_checkpoint_event {
-                println!("restored checkpoint event: {}", checkpoint_id);
+                println!("restored commit event: {}", checkpoint_id);
             }
         }
         Command::Git { command } => {
@@ -1843,8 +1844,7 @@ fn main() -> Result<()> {
                     }
                 }
                 TaskCommand::Show { id, json } => {
-                    let task_id = parse_uuid(&id)?;
-                    let task = repo.task_info(task_id)?;
+                    let task = repo.find_task_by_prefix(&id)?;
 
                     if json {
                         println!(
@@ -1896,7 +1896,7 @@ fn main() -> Result<()> {
                     }
                 }
                 TaskCommand::Claim { id, assignee } => {
-                    let task_id = parse_uuid(&id)?;
+                    let task_id = repo.find_task_by_prefix(&id)?.id;
                     let task = repo.claim_task(task_id, assignee)?;
                     println!(
                         "task {} claimed by {}",
@@ -1909,7 +1909,7 @@ fn main() -> Result<()> {
                     result,
                     no_checkpoint,
                 } => {
-                    let task_id = parse_uuid(&id)?;
+                    let task_id = repo.find_task_by_prefix(&id)?.id;
                     let task = repo.complete_task(task_id, result)?;
                     println!("task {} completed", &task.id.to_string()[..8]);
 
@@ -1918,19 +1918,19 @@ fn main() -> Result<()> {
                         match repo.create_checkpoint(Some(message.clone())) {
                             Ok(event) => {
                                 println!(
-                                    "checkpoint {} created: {}",
+                                    "commit {} created: {}",
                                     &event.id.to_string()[..8],
                                     message
                                 );
                             }
                             Err(e) => {
-                                eprintln!("warning: auto-checkpoint failed: {}", e);
+                                eprintln!("warning: auto-commit failed: {}", e);
                             }
                         }
                     }
                 }
                 TaskCommand::Fail { id, reason } => {
-                    let task_id = parse_uuid(&id)?;
+                    let task_id = repo.find_task_by_prefix(&id)?.id;
                     let task = repo.fail_task(task_id, reason)?;
                     println!("task {} failed", &task.id.to_string()[..8]);
                 }
@@ -1958,7 +1958,7 @@ fn main() -> Result<()> {
                     print_task_graph(&graph);
                 }
                 TaskCommand::Link { task_id, event_ids } => {
-                    let tid = parse_uuid(&task_id)?;
+                    let tid = repo.find_task_by_prefix(&task_id)?.id;
                     let eids = event_ids
                         .iter()
                         .map(|id| parse_uuid(id))
@@ -2016,7 +2016,7 @@ fn main() -> Result<()> {
             let result = repo.quick_restore()?;
             println!("restored to before event {}", result.target_event_id);
             if let Some(cp) = result.restored_checkpoint_event {
-                println!("new checkpoint: {}", cp);
+                println!("new commit: {}", cp);
             }
         }
         Command::Presence { command } => {
@@ -2764,7 +2764,7 @@ fn print_exploration_tree(explorations: &[fl_core::ExplorationSummary]) {
 
     for (base_idx, base) in bases.iter().enumerate() {
         let base_label = base
-            .map(|id| format!("checkpoint {}", &id.to_string()[..8]))
+            .map(|id| format!("commit {}", &id.to_string()[..8]))
             .unwrap_or_else(|| "no base".to_string());
         let is_last_base = base_idx == bases.len() - 1;
         let base_prefix = if is_last_base { "└── " } else { "├── " };

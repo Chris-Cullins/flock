@@ -330,13 +330,13 @@ Server-side features live in the Roost repo. Tracked here for cross-reference on
 
 ## Terminology / UX Polish
 
-- [ ] Add `fl commit` as a user-facing alias for `fl checkpoint` (keep checkpoint as the internal event type)
-- [ ] Update CLI help text to use "commit" instead of "checkpoint" in user-facing descriptions
+- [x] Add `fl commit` as a user-facing alias for `fl checkpoint` (keep checkpoint as the internal event type)
+- [x] Update CLI help text to use "commit" instead of "checkpoint" in user-facing descriptions
 - [ ] Update README to use "commit" terminology
-- [ ] Update `fl log` output to say "commit" instead of "checkpoint"
-- [ ] Audit all CLI output strings and error messages for consistent terminology
+- [x] Update `fl log` output to say "commit" instead of "checkpoint"
+- [x] Audit all CLI output strings and error messages for consistent terminology
 
 ## Bugs
 
-- [ ] `fl init --colocated` writes `mode = "git-compatible"` in `.flock/config.toml` instead of `"git-colocated"` — the `--colocated` flag is ignored when writing the config
-- [ ] `fl task show/claim/done/fail` require full UUIDs — short prefixes (e.g. first 8 chars) should work like `fl diff <checkpoint>` does with prefix matching
+- [x] `fl init --colocated` writes `mode = "git-compatible"` in `.flock/config.toml` instead of `"git-colocated"` — the `--colocated` flag is ignored when writing the config (verified: already working correctly)
+- [x] `fl task show/claim/done/fail` require full UUIDs — short prefixes (e.g. first 8 chars) should work like `fl diff <checkpoint>` does with prefix matching

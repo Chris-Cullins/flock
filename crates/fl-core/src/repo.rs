@@ -1826,6 +1826,24 @@ impl Repo {
             .ok_or_else(|| anyhow!("task {} not found", task_id))
     }
 
+    /// Finds a task by exact UUID or UUID prefix.
+    pub fn find_task_by_prefix(&self, prefix: &str) -> Result<TaskSummary> {
+        let tasks = self.list_tasks()?;
+        let matches: Vec<_> = tasks
+            .into_iter()
+            .filter(|t| t.id.to_string().starts_with(prefix))
+            .collect();
+        match matches.len() {
+            0 => bail!("no task matching prefix '{}'", prefix),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            n => bail!(
+                "ambiguous prefix '{}' matches {} tasks; use a longer prefix",
+                prefix,
+                n
+            ),
+        }
+    }
+
     pub fn claim_task(&self, task_id: Uuid, assignee: Option<String>) -> Result<TaskSummary> {
         self.assert_initialized()?;
 
@@ -8429,5 +8447,31 @@ mod tests {
             err.unwrap_err().to_string().contains("no checkpoint matching"),
             "should report no matching checkpoint"
         );
+    }
+
+    #[test]
+    fn find_task_by_prefix_resolves_short_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        let task = repo
+            .create_task("test task".to_string(), None, vec![], None)
+            .expect("create task");
+        let full_id = task.id.to_string();
+        let prefix = &full_id[..8];
+
+        // Exact match
+        let found = repo.find_task_by_prefix(&full_id).expect("exact match");
+        assert_eq!(found.id, task.id);
+
+        // Prefix match
+        let found = repo.find_task_by_prefix(prefix).expect("prefix match");
+        assert_eq!(found.id, task.id);
+
+        // No match
+        let err = repo.find_task_by_prefix("00000000");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("no task matching"));
     }
 }
