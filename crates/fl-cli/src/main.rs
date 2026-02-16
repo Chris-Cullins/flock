@@ -451,11 +451,14 @@ enum TaskCommand {
         #[arg(long)]
         assignee: Option<String>,
     },
-    /// Mark a task as completed
+    /// Mark a task as completed (auto-checkpoints unless --no-checkpoint)
     Done {
         id: String,
         #[arg(long)]
         result: Option<String>,
+        /// Skip the automatic checkpoint
+        #[arg(long)]
+        no_checkpoint: bool,
     },
     /// Mark a task as failed
     Fail {
@@ -1901,10 +1904,30 @@ fn main() -> Result<()> {
                         task.assignee.as_deref().unwrap_or("unknown")
                     );
                 }
-                TaskCommand::Done { id, result } => {
+                TaskCommand::Done {
+                    id,
+                    result,
+                    no_checkpoint,
+                } => {
                     let task_id = parse_uuid(&id)?;
                     let task = repo.complete_task(task_id, result)?;
                     println!("task {} completed", &task.id.to_string()[..8]);
+
+                    if !no_checkpoint {
+                        let message = format!("task done: {}", task.title);
+                        match repo.create_checkpoint(Some(message.clone())) {
+                            Ok(event) => {
+                                println!(
+                                    "checkpoint {} created: {}",
+                                    &event.id.to_string()[..8],
+                                    message
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("warning: auto-checkpoint failed: {}", e);
+                            }
+                        }
+                    }
                 }
                 TaskCommand::Fail { id, reason } => {
                     let task_id = parse_uuid(&id)?;
