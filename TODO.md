@@ -46,14 +46,14 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [x] `.flock/secrets.toml` config: custom patterns, allowed paths (test fixtures), toggle block vs warn
   - [x] Built-in pattern library: AWS (`AKIA...`), GCP, Azure, OpenAI (`sk-...`), GitHub tokens (`ghp_...`), private keys (`-----BEGIN.*PRIVATE KEY-----`), generic `password=`/`secret=`/`token=` assignments
   - [x] No `--no-verify` style escape hatch — `--allow-secrets` is the only bypass and it's auditable
-- [ ] Declarative hook system (`.flock/hooks.toml`, version-controlled):
-  - [ ] Hook points: `pre-commit`, `post-commit`, `pre-push`, `post-push`, `pre-merge`, `post-merge`, `pre-explore`, `post-explore-promote`
-  - [ ] Declarative config: command, block_on_failure (bool), timeout
-  - [ ] Hooks auto-apply to everyone who clones — no manual installation step
-  - [ ] Structured output (hooks can emit JSON for richer error messages / warnings)
-  - [ ] No `--no-verify` — skip requires `--skip-hooks` flag, recorded in event log
-  - [ ] Agent-aware: hooks can check `$FL_ACTOR` to run different rules for agents vs humans
-  - [ ] Hook execution report in `fl log` (which hooks ran, pass/fail, duration)
+- [x] Declarative hook system (`.flock/hooks.toml`, version-controlled):
+  - [x] Hook points: `pre-commit`, `post-commit`, `pre-push`, `post-push`, `pre-merge`, `post-merge`, `pre-explore`, `post-explore-promote`
+  - [x] Declarative config: command, block_on_failure (bool), timeout
+  - [x] Hooks auto-apply to everyone who clones — no manual installation step
+  - [x] Structured output (hooks can emit JSON for richer error messages / warnings)
+  - [x] No `--no-verify` — skip requires `--skip-hooks` flag, recorded in event log
+  - [x] Agent-aware: hooks can check `$FL_ACTOR` to run different rules for agents vs humans
+  - [x] Hook execution report in `fl log` (which hooks ran, pass/fail, duration)
 
 ## 2. Git/JJ Compatibility Layer
 

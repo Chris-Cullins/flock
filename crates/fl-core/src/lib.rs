@@ -1,4 +1,5 @@
 pub mod event;
+pub mod hooks;
 pub mod repo;
 pub mod secrets;
 pub mod semantic;
@@ -6,7 +7,7 @@ pub mod semantic;
 pub use event::{
     CheckpointEvent, DecisionAction, DecisionEvent, Event, EventKind, ExplorationAction,
     ExplorationEvent, GateAction, GateCondition, GateEvent, GatePolicy, GitBridgeAction,
-    GitBridgeEvent, LockAction, LockEvent, NotifyConfig, PresenceAction, PresenceEvent,
+    GitBridgeEvent, HookEvent, LockAction, LockEvent, NotifyConfig, PresenceAction, PresenceEvent,
     ResourceUsageEvent, SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent,
     SubscriptionFilter, TaskAction, TaskEvent, UndoEvent, UndoMode,
 };

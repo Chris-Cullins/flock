@@ -3,6 +3,7 @@ use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use fl_collab::{
     ConflictStatus, ConflictSummary, GateConditionKind, GatePolicyKind, GateStatus, GateSummary,
     LockStatus, LockSummary, PresenceSummary, RebaseSummary, SubscriptionNotify,
@@ -15,7 +16,8 @@ use fl_storage::{
 };
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ExplorationStatus {
     Active,
     Promoted,
@@ -32,7 +34,7 @@ impl fmt::Display for ExplorationStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplorationSummary {
     pub id: Uuid,
     pub title: String,
@@ -42,7 +44,8 @@ pub struct ExplorationSummary {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     Active,
     Completed,
@@ -59,7 +62,7 @@ impl fmt::Display for SessionStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: Uuid,
     pub agent: String,
@@ -74,7 +77,7 @@ pub struct SessionSummary {
     pub result: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionSummary {
     pub exploration_id: Uuid,
     pub action: DecisionAction,
@@ -83,7 +86,7 @@ pub struct DecisionSummary {
     pub timestamp: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ResourceUsageTotals {
     pub total_tokens: u64,
     pub total_runtime_ms: u64,
@@ -104,7 +107,8 @@ pub struct UndoResult {
     pub restored_checkpoint_event: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
     Open,
     Claimed,
@@ -123,7 +127,7 @@ impl fmt::Display for TaskStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub id: Uuid,
     pub title: String,
@@ -154,26 +158,27 @@ impl TaskSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskGraph {
     pub tasks: Vec<TaskSummary>,
     pub edges: Vec<TaskEdge>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskEdge {
     pub from_task: Uuid,
     pub to_task: Uuid,
     pub relation: TaskRelation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TaskRelation {
     DependsOn,
     DiscoveredFrom,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayedState {
     pub latest_checkpoint_event_id: Option<Uuid>,
     pub latest_checkpoint_snapshot_id: Option<Uuid>,
@@ -203,6 +208,25 @@ struct ReplayAccumulator {
     rebases: Vec<RebaseSummary>,
     conflicts: BTreeMap<Uuid, ConflictSummary>,
     applied_event_ids: Vec<Uuid>,
+}
+
+impl From<ReplayedState> for ReplayAccumulator {
+    fn from(state: ReplayedState) -> Self {
+        Self {
+            latest_checkpoint_event_id: state.latest_checkpoint_event_id,
+            latest_checkpoint_snapshot_id: state.latest_checkpoint_snapshot_id,
+            explorations: state.explorations,
+            sessions: state.sessions,
+            tasks: state.tasks,
+            presence: state.presence,
+            locks: state.locks,
+            subscriptions: state.subscriptions,
+            gates: state.gates,
+            rebases: state.rebases,
+            conflicts: state.conflicts,
+            applied_event_ids: state.applied_event_ids,
+        }
+    }
 }
 
 impl ReplayAccumulator {
@@ -236,34 +260,21 @@ impl ReplayAccumulator {
             applied_event_ids: self.applied_event_ids,
         }
     }
-}
 
-pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
-    let checkpoints: BTreeMap<Uuid, Uuid> = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            EventKind::Checkpoint(checkpoint) => Some((event.id, checkpoint.snapshot_id)),
-            _ => None,
-        })
-        .collect();
-
-    let mut state = ReplayAccumulator::default();
-    let mut state_before_event = BTreeMap::<Uuid, ReplayAccumulator>::new();
-
-    for event in events {
-        if state_before_event.contains_key(&event.id) {
-            bail!("duplicate event id {} encountered during replay", event.id);
-        }
-        state_before_event.insert(event.id, state.clone());
-
+    fn apply_event(
+        &mut self,
+        event: &Event,
+        checkpoints: &BTreeMap<Uuid, Uuid>,
+        state_before_event: &BTreeMap<Uuid, ReplayAccumulator>,
+    ) -> Result<()> {
         match &event.kind {
             EventKind::Checkpoint(checkpoint) => {
-                state.latest_checkpoint_event_id = Some(event.id);
-                state.latest_checkpoint_snapshot_id = Some(checkpoint.snapshot_id);
+                self.latest_checkpoint_event_id = Some(event.id);
+                self.latest_checkpoint_snapshot_id = Some(checkpoint.snapshot_id);
             }
             EventKind::Exploration(exploration) => match exploration.action {
                 ExplorationAction::Start => {
-                    state.explorations.insert(
+                    self.explorations.insert(
                         exploration.exploration_id,
                         ExplorationSummary {
                             id: exploration.exploration_id,
@@ -276,13 +287,13 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     );
                 }
                 ExplorationAction::Promote => {
-                    if let Some(entry) = state.explorations.get_mut(&exploration.exploration_id) {
+                    if let Some(entry) = self.explorations.get_mut(&exploration.exploration_id) {
                         entry.status = ExplorationStatus::Promoted;
                         entry.updated_at = event.timestamp.clone();
                     }
                 }
                 ExplorationAction::Abandon => {
-                    if let Some(entry) = state.explorations.get_mut(&exploration.exploration_id) {
+                    if let Some(entry) = self.explorations.get_mut(&exploration.exploration_id) {
                         entry.status = ExplorationStatus::Abandoned;
                         entry.updated_at = event.timestamp.clone();
                     }
@@ -304,7 +315,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                                 undo.target_event_id
                             )
                         })?;
-                    state = rewound;
+                    *self = rewound;
                 }
 
                 if let Some(restored_checkpoint_event) = undo.restored_checkpoint_event {
@@ -318,17 +329,18 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                                 restored_checkpoint_event
                             )
                         })?;
-                    state.latest_checkpoint_event_id = Some(restored_checkpoint_event);
-                    state.latest_checkpoint_snapshot_id = Some(snapshot_id);
-                    if !state.applied_event_ids.contains(&restored_checkpoint_event) {
-                        state.applied_event_ids.push(restored_checkpoint_event);
+                    self.latest_checkpoint_event_id = Some(restored_checkpoint_event);
+                    self.latest_checkpoint_snapshot_id = Some(snapshot_id);
+                    if !self.applied_event_ids.contains(&restored_checkpoint_event) {
+                        self.applied_event_ids.push(restored_checkpoint_event);
                     }
                 }
             }
             EventKind::GitBridge(_) => {}
+            EventKind::Hook(_) => {}
             EventKind::Session(session) => match session.action {
                 SessionAction::Start => {
-                    state.sessions.insert(
+                    self.sessions.insert(
                         session.session_id,
                         SessionSummary {
                             id: session.session_id,
@@ -346,7 +358,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     );
                 }
                 SessionAction::Link => {
-                    if let Some(entry) = state.sessions.get_mut(&session.session_id) {
+                    if let Some(entry) = self.sessions.get_mut(&session.session_id) {
                         if let Some(exploration_id) = session.exploration_id {
                             if !entry.explorations.contains(&exploration_id) {
                                 entry.explorations.push(exploration_id);
@@ -355,21 +367,21 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     }
                 }
                 SessionAction::Unlink => {
-                    if let Some(entry) = state.sessions.get_mut(&session.session_id) {
+                    if let Some(entry) = self.sessions.get_mut(&session.session_id) {
                         if let Some(exploration_id) = session.exploration_id {
                             entry.explorations.retain(|id| *id != exploration_id);
                         }
                     }
                 }
                 SessionAction::Complete => {
-                    if let Some(entry) = state.sessions.get_mut(&session.session_id) {
+                    if let Some(entry) = self.sessions.get_mut(&session.session_id) {
                         entry.status = SessionStatus::Completed;
                         entry.completed_at = Some(event.timestamp.clone());
                         entry.result = session.result.clone();
                     }
                 }
                 SessionAction::Fail => {
-                    if let Some(entry) = state.sessions.get_mut(&session.session_id) {
+                    if let Some(entry) = self.sessions.get_mut(&session.session_id) {
                         entry.status = SessionStatus::Failed;
                         entry.completed_at = Some(event.timestamp.clone());
                         entry.result = session.result.clone();
@@ -377,7 +389,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                 }
             },
             EventKind::Decision(decision) => {
-                if let Some(entry) = state.sessions.get_mut(&decision.session_id) {
+                if let Some(entry) = self.sessions.get_mut(&decision.session_id) {
                     entry.decisions.push(DecisionSummary {
                         exploration_id: decision.exploration_id,
                         action: decision.action,
@@ -388,7 +400,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                 }
             }
             EventKind::ResourceUsage(usage) => {
-                if let Some(entry) = state.sessions.get_mut(&usage.session_id) {
+                if let Some(entry) = self.sessions.get_mut(&usage.session_id) {
                     if let Some(tokens) = usage.tokens_consumed {
                         entry.resource_usage.total_tokens += tokens;
                     }
@@ -403,7 +415,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
             EventKind::Presence(presence) => match presence.action {
                 PresenceAction::Heartbeat => {
                     let key = format!("{}@{}", presence.actor, presence.workspace);
-                    state.presence.insert(
+                    self.presence.insert(
                         key,
                         PresenceSummary {
                             actor: presence.actor.clone(),
@@ -417,12 +429,12 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                 }
                 PresenceAction::Depart => {
                     let key = format!("{}@{}", presence.actor, presence.workspace);
-                    state.presence.remove(&key);
+                    self.presence.remove(&key);
                 }
             },
             EventKind::Lock(lock) => match lock.action {
                 LockAction::Acquire => {
-                    state.locks.insert(
+                    self.locks.insert(
                         lock.lock_id,
                         LockSummary {
                             id: lock.lock_id,
@@ -436,7 +448,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     );
                 }
                 LockAction::Release => {
-                    if let Some(entry) = state.locks.get_mut(&lock.lock_id) {
+                    if let Some(entry) = self.locks.get_mut(&lock.lock_id) {
                         entry.status = LockStatus::Released;
                         entry.released_at = Some(event.timestamp.clone());
                     }
@@ -450,7 +462,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                         Some(NotifyConfig::Batched) => SubscriptionNotify::Batched,
                         Some(NotifyConfig::Digest) => SubscriptionNotify::Digest,
                     };
-                    state.subscriptions.insert(
+                    self.subscriptions.insert(
                         sub.subscription_id,
                         SubscriptionSummary {
                             id: sub.subscription_id,
@@ -466,7 +478,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     );
                 }
                 SubscriptionAction::Unsubscribe => {
-                    if let Some(entry) = state.subscriptions.get_mut(&sub.subscription_id) {
+                    if let Some(entry) = self.subscriptions.get_mut(&sub.subscription_id) {
                         entry.status = SubscriptionStatus::Cancelled;
                         entry.cancelled_at = Some(event.timestamp.clone());
                     }
@@ -486,7 +498,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                         Some(GatePolicy::QueueAndContinue) => GatePolicyKind::QueueAndContinue,
                         Some(GatePolicy::Block) | None => GatePolicyKind::Block,
                     };
-                    state.gates.insert(
+                    self.gates.insert(
                         gate.gate_id,
                         GateSummary {
                             id: gate.gate_id,
@@ -501,7 +513,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     );
                 }
                 GateAction::Approve => {
-                    if let Some(entry) = state.gates.get_mut(&gate.gate_id) {
+                    if let Some(entry) = self.gates.get_mut(&gate.gate_id) {
                         entry.status = GateStatus::Approved;
                         entry.approved_by = gate.approved_by.clone();
                         entry.reason = gate.reason.clone();
@@ -509,7 +521,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     }
                 }
                 GateAction::Reject => {
-                    if let Some(entry) = state.gates.get_mut(&gate.gate_id) {
+                    if let Some(entry) = self.gates.get_mut(&gate.gate_id) {
                         entry.status = GateStatus::Rejected;
                         entry.approved_by = gate.approved_by.clone();
                         entry.reason = gate.reason.clone();
@@ -517,14 +529,14 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     }
                 }
                 GateAction::Delete => {
-                    if let Some(entry) = state.gates.get_mut(&gate.gate_id) {
+                    if let Some(entry) = self.gates.get_mut(&gate.gate_id) {
                         entry.status = GateStatus::Deleted;
                         entry.resolved_at = Some(event.timestamp.clone());
                     }
                 }
             },
             EventKind::Rebase(rebase) => {
-                state.rebases.push(RebaseSummary {
+                self.rebases.push(RebaseSummary {
                     workspace: rebase.workspace.clone(),
                     old_base_event: rebase.old_base_event,
                     new_base_event: rebase.new_base_event,
@@ -536,7 +548,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
             }
             EventKind::ConflictResolution(cr) => match cr.action {
                 ConflictAction::Detect => {
-                    state.conflicts.insert(
+                    self.conflicts.insert(
                         cr.conflict_id,
                         ConflictSummary {
                             id: cr.conflict_id,
@@ -555,19 +567,19 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     );
                 }
                 ConflictAction::Classify => {
-                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                    if let Some(entry) = self.conflicts.get_mut(&cr.conflict_id) {
                         entry.classification = cr.classification.clone();
                         entry.status = ConflictStatus::Classified;
                     }
                 }
                 ConflictAction::Suggest => {
-                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                    if let Some(entry) = self.conflicts.get_mut(&cr.conflict_id) {
                         entry.suggestion = cr.suggestion.clone();
                         entry.status = ConflictStatus::Suggested;
                     }
                 }
                 ConflictAction::Resolve => {
-                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                    if let Some(entry) = self.conflicts.get_mut(&cr.conflict_id) {
                         entry.resolution = cr.resolution.clone();
                         entry.resolved_by = cr.resolved_by.clone();
                         entry.status = ConflictStatus::Resolved;
@@ -575,20 +587,20 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     }
                 }
                 ConflictAction::Verify => {
-                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                    if let Some(entry) = self.conflicts.get_mut(&cr.conflict_id) {
                         entry.verified = cr.verified.unwrap_or(false);
                         entry.status = ConflictStatus::Verified;
                     }
                 }
                 ConflictAction::Record => {
-                    if let Some(entry) = state.conflicts.get_mut(&cr.conflict_id) {
+                    if let Some(entry) = self.conflicts.get_mut(&cr.conflict_id) {
                         entry.status = ConflictStatus::Recorded;
                     }
                 }
             },
             EventKind::Task(task) => match task.action {
                 TaskAction::Create => {
-                    state.tasks.insert(
+                    self.tasks.insert(
                         task.task_id,
                         TaskSummary {
                             id: task.task_id,
@@ -608,7 +620,7 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     );
                 }
                 TaskAction::Claim => {
-                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                    if let Some(entry) = self.tasks.get_mut(&task.task_id) {
                         entry.status = TaskStatus::Claimed;
                         entry.assignee = task
                             .assignee
@@ -618,28 +630,28 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
                     }
                 }
                 TaskAction::Unclaim => {
-                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                    if let Some(entry) = self.tasks.get_mut(&task.task_id) {
                         entry.status = TaskStatus::Open;
                         entry.assignee = None;
                         entry.claimed_at = None;
                     }
                 }
                 TaskAction::Complete => {
-                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                    if let Some(entry) = self.tasks.get_mut(&task.task_id) {
                         entry.status = TaskStatus::Completed;
                         entry.completed_at = Some(event.timestamp.clone());
                         entry.result = task.result.clone();
                     }
                 }
                 TaskAction::Fail => {
-                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                    if let Some(entry) = self.tasks.get_mut(&task.task_id) {
                         entry.status = TaskStatus::Failed;
                         entry.completed_at = Some(event.timestamp.clone());
                         entry.result = task.result.clone();
                     }
                 }
                 TaskAction::Link => {
-                    if let Some(entry) = state.tasks.get_mut(&task.task_id) {
+                    if let Some(entry) = self.tasks.get_mut(&task.task_id) {
                         for linked in &task.linked_events {
                             if !entry.linked_events.contains(linked) {
                                 entry.linked_events.push(*linked);
@@ -650,9 +662,67 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
             },
         }
 
-        if !state.applied_event_ids.contains(&event.id) {
-            state.applied_event_ids.push(event.id);
+        if !self.applied_event_ids.contains(&event.id) {
+            self.applied_event_ids.push(event.id);
         }
+
+        Ok(())
+    }
+}
+
+pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
+    let checkpoints: BTreeMap<Uuid, Uuid> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Checkpoint(checkpoint) => Some((event.id, checkpoint.snapshot_id)),
+            _ => None,
+        })
+        .collect();
+
+    let mut state = ReplayAccumulator::default();
+    let mut state_before_event = BTreeMap::<Uuid, ReplayAccumulator>::new();
+
+    for event in events {
+        if state_before_event.contains_key(&event.id) {
+            bail!("duplicate event id {} encountered during replay", event.id);
+        }
+        state_before_event.insert(event.id, state.clone());
+
+        state.apply_event(event, &checkpoints, &state_before_event)?;
+    }
+
+    Ok(state.into_state())
+}
+
+/// Replay state incrementally starting from a materialized state.
+/// Only processes events after `start_index`.
+pub fn replay_state_incremental(
+    events: &[Event],
+    start_index: usize,
+    base_state: ReplayedState,
+) -> Result<ReplayedState> {
+    if start_index >= events.len() {
+        return Ok(base_state);
+    }
+
+    let checkpoints: BTreeMap<Uuid, Uuid> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Checkpoint(checkpoint) => Some((event.id, checkpoint.snapshot_id)),
+            _ => None,
+        })
+        .collect();
+
+    let mut state = ReplayAccumulator::from(base_state);
+    let mut state_before_event = BTreeMap::<Uuid, ReplayAccumulator>::new();
+
+    for event in &events[start_index..] {
+        if state_before_event.contains_key(&event.id) {
+            bail!("duplicate event id {} encountered during replay", event.id);
+        }
+        state_before_event.insert(event.id, state.clone());
+
+        state.apply_event(event, &checkpoints, &state_before_event)?;
     }
 
     Ok(state.into_state())
@@ -1835,6 +1905,58 @@ mod tests {
         assert_eq!(c.status, ConflictStatus::Recorded);
         assert!(c.verified);
         assert_eq!(c.resolved_by.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn replay_state_incremental_matches_full_replay() {
+        let checkpoint_event = make_event(
+            1,
+            None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(10),
+                parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
+            }),
+        );
+        let exploration_start = make_event(
+            2,
+            Some(checkpoint_event.id),
+            EventKind::Exploration(ExplorationEvent {
+                exploration_id: Uuid::from_u128(20),
+                title: "exp".to_string(),
+                base_checkpoint_event: Some(checkpoint_event.id),
+                action: ExplorationAction::Start,
+            }),
+        );
+        let exploration_promote = make_event(
+            3,
+            Some(exploration_start.id),
+            EventKind::Exploration(ExplorationEvent {
+                exploration_id: Uuid::from_u128(20),
+                title: "".to_string(),
+                base_checkpoint_event: None,
+                action: ExplorationAction::Promote,
+            }),
+        );
+
+        let events = vec![checkpoint_event, exploration_start, exploration_promote];
+
+        // Full replay
+        let full_state = replay_state(&events).unwrap();
+
+        // Incremental replay from index 2 (only the promotion event)
+        let base_state = replay_state(&events[..2]).unwrap();
+        let incremental_state = replay_state_incremental(&events, 2, base_state).unwrap();
+
+        // They should match
+        assert_eq!(full_state.explorations, incremental_state.explorations);
+        assert_eq!(full_state.applied_event_ids, incremental_state.applied_event_ids);
+
+        // Verify the exploration was promoted
+        let exploration = incremental_state.explorations.get(&Uuid::from_u128(20)).unwrap();
+        assert_eq!(exploration.status, ExplorationStatus::Promoted);
     }
 
     fn make_event(id: u128, parent_id: Option<Uuid>, kind: EventKind) -> Event {

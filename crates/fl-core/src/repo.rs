@@ -9,9 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::{Signer, SigningKey};
 use fl_storage::{
-    BlockRef, CONFIG_FILE, ChunkConfig, ContentStore, FLOCK_DIR, FileEntry, FileIndex, KEY_DIR,
-    MaterializedStateStore, RefKind, RefStore, RepoRef, SECRETS_CONFIG_FILE, SIGNING_KEY_FILE,
-    SNAPSHOT_DIR, SnapshotIndex, WorkspaceRefConfig, chunk_data,
+    BlockRef, CONFIG_FILE, ChunkConfig, ContentStore, FLOCK_DIR, FileEntry, FileIndex,
+    HOOKS_CONFIG_FILE, HookEvent, KEY_DIR, MaterializedStateStore, RefKind, RefStore, RepoRef,
+    SECRETS_CONFIG_FILE, SIGNING_KEY_FILE, SNAPSHOT_DIR, SnapshotIndex, WorkspaceRefConfig,
+    chunk_data,
 };
 use ignore::WalkBuilder;
 use uuid::Uuid;
@@ -275,6 +276,14 @@ impl Repo {
                 })?;
         }
 
+        let hooks_config = self.root.join(HOOKS_CONFIG_FILE);
+        if !hooks_config.exists() {
+            fs::write(&hooks_config, crate::hooks::DEFAULT_HOOKS_TOML)
+                .with_context(|| {
+                    format!("failed to write {}", hooks_config.display())
+                })?;
+        }
+
         if mode == RepoMode::GitColocated {
             self.ensure_git_repository()?;
             self.ensure_git_exclude_entry(".flock/")?;
@@ -284,15 +293,23 @@ impl Repo {
     }
 
     pub fn create_checkpoint(&self, message: Option<String>) -> Result<Event> {
-        self.create_checkpoint_with_options(message, false)
+        self.create_checkpoint_with_options(message, false, false)
     }
 
     pub fn create_checkpoint_with_options(
         &self,
         message: Option<String>,
         allow_secrets: bool,
+        skip_hooks: bool,
     ) -> Result<Event> {
         self.assert_initialized()?;
+
+        // Run pre-commit hooks (unless skipped).
+        if skip_hooks {
+            self.record_hook_bypass("pre-commit")?;
+        } else {
+            self.run_hooks_blocking("pre-commit")?;
+        }
 
         // Run secret detection before creating the checkpoint.
         if !allow_secrets {
@@ -318,6 +335,13 @@ impl Repo {
                     event.id
                 ),
             }))?;
+        }
+
+        // Run post-commit hooks (non-blocking).
+        if skip_hooks {
+            self.record_hook_bypass("post-commit")?;
+        } else {
+            self.run_hooks_reporting("post-commit");
         }
 
         Ok(event)
@@ -599,6 +623,7 @@ impl Repo {
                 EventKind::Gate(_) => {}
                 EventKind::Rebase(_) => {}
                 EventKind::ConflictResolution(_) => {}
+                EventKind::Hook(_) => {}
             }
         }
 
@@ -2371,6 +2396,103 @@ impl Repo {
             } else {
                 eprintln!("warning: {}", msg);
             }
+        }
+
+        Ok(())
+    }
+
+    /// Run hooks for a given hook point. If any blocking hook fails, bail.
+    /// Records all hook results in the event log.
+    fn run_hooks_blocking(&self, hook_point: &str) -> Result<()> {
+        use crate::hooks::{execute_hooks, format_hook_report, load_hooks_config};
+
+        let config = load_hooks_config(self.root());
+        let matching_hooks = config.hooks.iter().any(|h| h.hook_point == hook_point);
+        if !matching_hooks {
+            return Ok(());
+        }
+
+        let report = execute_hooks(self.root(), hook_point, &config)?;
+
+        // Record each hook execution in the event log.
+        for result in &report.results {
+            self.append_event(EventKind::Hook(HookEvent {
+                hook_point: result.hook_point.clone(),
+                hook_name: result.name.clone(),
+                command: result.command.clone(),
+                success: result.success,
+                duration_ms: result.duration_ms,
+                output: result.output.clone(),
+                bypassed: false,
+            }))?;
+        }
+
+        if report.blocked {
+            let msg = format_hook_report(&report);
+            bail!("{}", msg);
+        } else if report.has_failures() {
+            let msg = format_hook_report(&report);
+            eprint!("{}", msg);
+        }
+
+        Ok(())
+    }
+
+    /// Run hooks for a given hook point, printing results but never blocking.
+    fn run_hooks_reporting(&self, hook_point: &str) {
+        use crate::hooks::{execute_hooks, format_hook_report, load_hooks_config};
+
+        let config = load_hooks_config(self.root());
+        let matching_hooks = config.hooks.iter().any(|h| h.hook_point == hook_point);
+        if !matching_hooks {
+            return;
+        }
+
+        match execute_hooks(self.root(), hook_point, &config) {
+            Ok(report) => {
+                // Record hook executions (best-effort for post-hooks).
+                for result in &report.results {
+                    let _ = self.append_event(EventKind::Hook(HookEvent {
+                        hook_point: result.hook_point.clone(),
+                        hook_name: result.name.clone(),
+                        command: result.command.clone(),
+                        success: result.success,
+                        duration_ms: result.duration_ms,
+                        output: result.output.clone(),
+                        bypassed: false,
+                    }));
+                }
+                if report.has_failures() {
+                    let msg = format_hook_report(&report);
+                    eprint!("{}", msg);
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: post-hook execution failed: {}", e);
+            }
+        }
+    }
+
+    /// Record that hooks were bypassed via --skip-hooks for a given hook point.
+    fn record_hook_bypass(&self, hook_point: &str) -> Result<()> {
+        use crate::hooks::load_hooks_config;
+
+        let config = load_hooks_config(self.root());
+        let matching: Vec<_> = config.hooks.iter().filter(|h| h.hook_point == hook_point).collect();
+        if matching.is_empty() {
+            return Ok(());
+        }
+
+        for hook in &matching {
+            self.append_event(EventKind::Hook(HookEvent {
+                hook_point: hook_point.to_string(),
+                hook_name: hook.name.clone(),
+                command: hook.command.clone(),
+                success: true,
+                duration_ms: 0,
+                output: None,
+                bypassed: true,
+            }))?;
         }
 
         Ok(())

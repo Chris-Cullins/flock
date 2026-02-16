@@ -40,6 +40,9 @@ enum Command {
         /// Bypass secret detection (recorded in audit log)
         #[arg(long)]
         allow_secrets: bool,
+        /// Skip hook execution (recorded in audit log)
+        #[arg(long)]
+        skip_hooks: bool,
     },
     /// Show the event log
     Log,
@@ -630,9 +633,10 @@ fn main() -> Result<()> {
         Command::Checkpoint {
             message,
             allow_secrets,
+            skip_hooks,
         } => {
             let repo = Repo::discover(cwd)?;
-            let event = repo.create_checkpoint_with_options(message, allow_secrets)?;
+            let event = repo.create_checkpoint_with_options(message, allow_secrets, skip_hooks)?;
             let checkpoint_id = event.id;
             let EventKind::Checkpoint(payload) = event.kind else {
                 bail!("unexpected event payload for checkpoint")
@@ -731,6 +735,19 @@ fn main() -> Result<()> {
                         cr.conflict_id,
                         cr.path.as_deref().unwrap_or("-")
                     ),
+                    EventKind::Hook(h) => {
+                        let status = if h.bypassed {
+                            "skipped"
+                        } else if h.success {
+                            "pass"
+                        } else {
+                            "FAIL"
+                        };
+                        println!(
+                            "{}  hook:{}  {}  {}  {}ms",
+                            event.timestamp, h.hook_point, h.hook_name, status, h.duration_ms
+                        );
+                    }
                 }
             }
         }

@@ -35,6 +35,7 @@ pub enum EventKind {
     Gate(GateEvent),
     Rebase(RebaseEvent),
     ConflictResolution(ConflictResolutionEvent),
+    Hook(HookEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -329,6 +330,19 @@ pub enum ConflictAction {
     Resolve,
     Verify,
     Record,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HookEvent {
+    pub hook_point: String,
+    pub hook_name: String,
+    pub command: String,
+    pub success: bool,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub bypassed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
