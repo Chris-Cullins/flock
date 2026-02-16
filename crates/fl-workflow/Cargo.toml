@@ -8,4 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 fl-collab = { path = "../fl-collab" }
 fl-storage = { path = "../fl-storage" }
+serde.workspace = true
+serde_json.workspace = true
 uuid.workspace = true

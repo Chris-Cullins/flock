@@ -16,3 +16,10 @@ walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+
+[[bench]]
+name = "large_repo"
+harness = false
