@@ -31,6 +31,14 @@ This file tracks the full build-out from current scaffold to the complete archit
 - [x] Add repository refs abstraction (branches/tags/workspaces)
 - [x] Add Merkle snapshot hash generation for checkpoints
 - [x] Add storage integrity verifier command (`fl fsck`)
+- [ ] Implement `.flockignore` support:
+  - [ ] `.flockignore` file format (gitignore-compatible glob patterns)
+  - [ ] Respect `.flockignore` during `fl checkpoint` snapshot creation (exclude matched paths)
+  - [ ] Respect `.flockignore` during `fl diff` and `fl quick-save`
+  - [ ] Built-in default ignores (`.flock/`, `.git/`, `node_modules/`, `target/`, `__pycache__/`, `.env`)
+  - [ ] Nested `.flockignore` files (per-directory overrides, like gitignore)
+  - [ ] `fl status` command showing tracked/untracked/ignored files
+  - [ ] In colocated mode, optionally fall back to `.gitignore` if no `.flockignore` exists
 
 ## 2. Git/JJ Compatibility Layer
 
