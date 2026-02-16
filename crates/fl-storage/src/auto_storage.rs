@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use crate::event::Event;
 use crate::event_log::EventLog;
 use crate::event_log_migration::migrate_to_segmented;
+use crate::file_lock::{FileLock, LockPaths};
 use crate::refs::{RefKind, RefStore, RepoRef};
 use crate::refs_migration::migrate_refs_to_segmented;
 use crate::segmented_event_log::SegmentedEventLog;
@@ -46,6 +47,15 @@ impl AutoEventLog {
         self.segmented().exists()
     }
 
+    /// Ensure the backing store exists.
+    pub fn ensure_exists(&self) -> Result<()> {
+        if self.use_segmented() {
+            self.segmented().ensure_exists()
+        } else {
+            self.monolithic().ensure_exists()
+        }
+    }
+
     /// Read all events, preferring segmented format.
     pub fn read_all(&self) -> Result<Vec<Event>> {
         if self.use_segmented() {
@@ -57,7 +67,13 @@ impl AutoEventLog {
 
     /// Append a single event. If using monolithic format, checks size threshold
     /// after append and migrates to segmented if exceeded.
+    ///
+    /// Acquires an exclusive filesystem lock to prevent corruption from
+    /// concurrent writers.
     pub fn append(&self, event: &Event) -> Result<()> {
+        let _lock = FileLock::acquire(&LockPaths::event_log(&self.root))
+            .context("failed to acquire event log lock")?;
+
         if self.use_segmented() {
             return self.segmented().append(event);
         }
@@ -68,7 +84,13 @@ impl AutoEventLog {
     }
 
     /// Append a batch of events.
+    ///
+    /// Acquires an exclusive filesystem lock to prevent corruption from
+    /// concurrent writers.
     pub fn append_batch(&self, events: &[Event]) -> Result<()> {
+        let _lock = FileLock::acquire(&LockPaths::event_log(&self.root))
+            .context("failed to acquire event log lock")?;
+
         if self.use_segmented() {
             let seg = self.segmented();
             for event in events {
@@ -142,7 +164,13 @@ impl AutoRefStore {
     }
 
     /// Write all refs (used during init and bulk operations).
+    ///
+    /// Acquires an exclusive filesystem lock to prevent corruption from
+    /// concurrent writers.
     pub fn write_all(&self, refs: &[RepoRef]) -> Result<()> {
+        let _lock = FileLock::acquire(&LockPaths::refs(&self.root))
+            .context("failed to acquire refs lock")?;
+
         if self.use_segmented() {
             let seg = self.segmented();
             seg.ensure_exists()?;
@@ -161,7 +189,13 @@ impl AutoRefStore {
     }
 
     /// Upsert a single ref. Checks size threshold after write.
+    ///
+    /// Acquires an exclusive filesystem lock to prevent corruption from
+    /// concurrent writers.
     pub fn upsert(&self, reference: RepoRef) -> Result<()> {
+        let _lock = FileLock::acquire(&LockPaths::refs(&self.root))
+            .context("failed to acquire refs lock")?;
+
         if self.use_segmented() {
             return self.segmented().upsert(reference);
         }
@@ -172,7 +206,13 @@ impl AutoRefStore {
     }
 
     /// Delete a ref.
+    ///
+    /// Acquires an exclusive filesystem lock to prevent corruption from
+    /// concurrent writers.
     pub fn delete(&self, kind: RefKind, name: &str) -> Result<bool> {
+        let _lock = FileLock::acquire(&LockPaths::refs(&self.root))
+            .context("failed to acquire refs lock")?;
+
         if self.use_segmented() {
             self.segmented().delete(kind, name)
         } else {

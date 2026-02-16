@@ -268,8 +268,12 @@ impl SegmentedEventLog {
     fn write_index(&self, index: &EventLogIndex) -> Result<()> {
         let json = serde_json::to_string_pretty(index)
             .context("failed to serialize event log index")?;
-        fs::write(&self.index_path, json)
-            .with_context(|| format!("failed to write event log index {}", self.index_path.display()))
+        // Write to temp file then rename for atomicity
+        let tmp_path = self.index_path.with_extension("json.tmp");
+        fs::write(&tmp_path, &json)
+            .with_context(|| format!("failed to write temp index {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &self.index_path)
+            .with_context(|| format!("failed to rename temp index to {}", self.index_path.display()))
     }
 
     fn segment_path(&self, segment_num: u32) -> PathBuf {

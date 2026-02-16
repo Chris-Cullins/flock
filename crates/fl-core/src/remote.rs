@@ -2,13 +2,13 @@ use std::fs;
 
 use anyhow::{Context, Result, bail};
 use fl_storage::{
+    AutoEventLog, AutoRefStore,
     BlockNeedRequest, BlockNeedResponse, BlockUploadRequest, BlockUploadResponse,
-    EventKind, EventLog, EventPullRequest, EventPullResponse, EventPushRequest, EventPushResponse,
+    EventKind, EventPullRequest, EventPullResponse, EventPushRequest, EventPushResponse,
     RemoteScheme, RemoteUrl, SnapshotNeedRequest, SnapshotNeedResponse,
     SshAuthChallengeRequest, SshAuthChallengeResponse, SshAuthVerifyRequest, SshAuthVerifyResponse,
     TokenLoginRequest, TokenLoginResponse,
 };
-use fl_storage::refs::RefStore;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -194,12 +194,12 @@ impl LocalFsTransport {
         Ok(())
     }
 
-    fn event_log(&self) -> EventLog {
-        EventLog::for_root(&self.root)
+    fn event_log(&self) -> AutoEventLog {
+        AutoEventLog::for_root(&self.root)
     }
 
-    fn ref_store(&self) -> RefStore {
-        RefStore::for_root(&self.root)
+    fn ref_store(&self) -> AutoRefStore {
+        AutoRefStore::for_root(&self.root)
     }
 
     fn blocks_dir(&self) -> std::path::PathBuf {

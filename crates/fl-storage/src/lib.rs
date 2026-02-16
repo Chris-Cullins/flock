@@ -5,6 +5,7 @@ pub mod content_store;
 pub mod credential_store;
 pub mod event;
 pub mod event_log;
+pub mod file_lock;
 pub mod event_log_migration;
 pub mod file_index;
 pub mod layout;
@@ -32,6 +33,7 @@ pub use event::{
     TaskAction, TaskEvent, UndoEvent, UndoMode, compute_event_hash, event_signing_payload,
 };
 pub use event_log::EventLog;
+pub use file_lock::{FileLock, LockPaths};
 pub use event_log_migration::{MigrationReport as EventLogMigrationReport, migrate_to_segmented};
 pub use file_index::{BlockRef, FileEntry, FileIndex, SnapshotIndex};
 pub use layout::{

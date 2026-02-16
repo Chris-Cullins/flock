@@ -119,8 +119,12 @@ impl RefStore {
 
         let contents = serde_json::to_string_pretty(&RefRecord::new(normalized))
             .context("failed to serialize refs record")?;
-        fs::write(&self.path, format!("{}\n", contents))
-            .with_context(|| format!("failed to write {}", self.path.display()))
+        // Write to temp file then rename for atomicity
+        let tmp_path = self.path.with_extension("json.tmp");
+        fs::write(&tmp_path, format!("{}\n", contents))
+            .with_context(|| format!("failed to write temp refs {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &self.path)
+            .with_context(|| format!("failed to rename temp refs to {}", self.path.display()))
     }
 
     pub fn upsert(&self, reference: RepoRef) -> Result<()> {
