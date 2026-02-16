@@ -3,6 +3,9 @@ name = "fl-cli"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "CLI for Flock, a next-generation version control system designed for AI agents"
 
 [[bin]]
 name = "fl"

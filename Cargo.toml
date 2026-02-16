@@ -13,6 +13,9 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/Chris-Cullins/flock"
+homepage = "https://github.com/Chris-Cullins/flock"
+description = "A next-generation version control system designed for AI agents"
 
 [workspace.dependencies]
 aes-gcm = "0.10"
@@ -47,3 +50,8 @@ tungstenite = { version = "0.24", features = ["native-tls"] }
 ureq = { version = "2", features = ["json"] }
 uuid = { version = "1.15", features = ["v4", "serde"] }
 walkdir = "2.5"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
