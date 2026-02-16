@@ -49,7 +49,7 @@ Meanwhile, another agent made a bad change 47 commits ago. Good luck with `git r
 
 ```bash
 # Clone and install
-git clone https://github.com/anthropics/flock.git
+git clone https://github.com/Chris-Cullins/flock.git
 cd flock
 cargo install --path crates/fl-cli
 
@@ -70,8 +70,11 @@ cargo build --release
 # Initialize Flock in your project
 fl init
 
-# Make some changes, then checkpoint
-fl checkpoint -m "implement payment processor"
+# See what's tracked
+fl status
+
+# Make some changes, then commit
+fl commit -m "implement payment processor"
 
 # See what changed at the code level, not the line level
 fl diff --semantic
@@ -83,7 +86,7 @@ fl undo
 fl explore start --title "try-new-parser"
 
 # ... hack away ...
-fl checkpoint -m "parser v2"
+fl commit -m "parser v2"
 
 # It worked! Promote it.
 fl explore promote <id>
@@ -104,7 +107,16 @@ fl init --colocated
 fl diff --semantic          # See semantic changes
 fl git commit -m "feature"  # Commit through Flock (tracks lineage)
 fl git push                 # Push to remote
-fl git import               # Import git commits as Flock checkpoints
+fl git import               # Import git history into Flock
+```
+
+### Converting existing repos
+
+```bash
+fl convert from-git                # Import full git history into Flock
+fl convert from-git --shallow 100  # Just the last 100 commits
+fl convert from-jj                 # Import from Jujutsu
+fl convert to-git                  # Export back to a clean git repo
 ```
 
 ## Features
@@ -129,6 +141,7 @@ fl merge --dry-run --semantic base left right --json
 - Signature compatibility (compatible / potentially-breaking / breaking)
 - Change classifications: Added, Removed, Modified, Renamed, Moved, StyleOnly
 - Risk scoring: Low, Medium, High
+- Cross-file impact (signature change in file A breaks callers in file B)
 
 **Conflict classifications** (machine-readable, not just "<<<< HEAD"):
 - `divergent_edit` &mdash; both sides changed the same symbol differently
@@ -137,7 +150,10 @@ fl merge --dry-run --semantic base left right --json
 - `kind_mismatch` &mdash; symbol changed type (e.g., function to class)
 - `text_fallback` &mdash; unsupported language, fell back to text diff
 
-Currently supports: JavaScript, JSX, TypeScript, TSX. All other languages fall back to text-based analysis.
+**Language support:**
+- **Tree-sitter AST analyzers:** JavaScript, JSX, TypeScript, TSX, Python, Go, Rust, C#
+- **Structured format analyzers:** JSON/JSONL (by key), YAML/TOML (by key path), XML/HTML (by element), CSS/SCSS (by selector), Markdown (by section)
+- All other languages fall back to text-based analysis
 
 ### Instant Undo
 
@@ -199,6 +215,128 @@ fl quick-save --tag "before-refactor"
 fl quick-restore
 ```
 
+### Secret Detection
+
+Built-in scanning on every commit. No secrets leak by accident.
+
+```bash
+fl commit -m "add config"
+# ERROR: potential secret detected in config.yaml:12 (AWS access key)
+
+fl commit -m "add config" --allow-secrets   # Override (recorded in audit log)
+```
+
+- **Pattern library:** AWS (`AKIA...`), GCP, Azure, OpenAI (`sk-...`), GitHub (`ghp_...`), private keys, generic password/token assignments
+- **Hard block by default** &mdash; commit fails, no `--no-verify` escape hatch
+- **`--allow-secrets`** is the only bypass, and it's recorded in the audit trail
+- **`.flock/secrets.toml`** &mdash; custom patterns, allowed paths (test fixtures), toggle block vs warn
+
+### Declarative Hooks
+
+Version-controlled hooks that auto-apply to everyone who clones. No manual installation step.
+
+```toml
+# .flock/hooks.toml
+[[hooks]]
+point = "pre-commit"
+command = "cargo test"
+block_on_failure = true
+timeout = 60
+```
+
+- **Hook points:** `pre-commit`, `post-commit`, `pre-push`, `post-push`, `pre-merge`, `post-merge`, `pre-explore`, `post-explore-promote`
+- **Agent-aware:** hooks can check `$FL_ACTOR` to run different rules for agents vs humans
+- **Structured output:** hooks can emit JSON for richer error messages
+- **No `--no-verify`** &mdash; `--skip-hooks` is explicit and auditable
+
+### Remote Sync
+
+Push and pull to Flock remotes (Roost servers). Real-time streaming via WebSocket.
+
+```bash
+# Configure a remote
+fl roost add origin flock://my-server.example.com/repo
+
+# Authenticate
+fl remote login my-server.example.com --token <token>
+
+# Sync
+fl push
+fl pull
+
+# Stream live events
+fl watch --path "src/**" --agent claude --json
+```
+
+### Collaboration
+
+Multi-agent coordination with presence, locks, subscriptions, and quality gates.
+
+```bash
+# Presence — who's working where
+fl presence heartbeat --workspace agent-1 --file src/auth.rs --intent "refactoring"
+fl presence list
+
+# Advisory locks
+fl lock acquire src/payment.rs --ttl 300
+fl lock list
+fl lock release <id>
+
+# Subscriptions — get notified on changes
+fl subscribe --path "src/api/**" --symbol "processPayment"
+
+# Quality gates — human-in-the-loop approval
+fl gate create --condition high-risk --policy block
+fl gate check src/payment.rs
+fl gate approve <id>
+
+# Conflict resolution workflow
+fl conflict detect --workspace agent-1
+fl conflict suggest <id>
+fl conflict resolve <id> --resolution "kept left side"
+
+# Rebase
+fl rebase --workspace agent-1
+```
+
+### Intelligence Layer
+
+Natural language search over your event history. Optional AI-assisted features.
+
+```bash
+# Search history in plain English
+fl query "who changed the payment module last week"
+
+# With AI enhancement (requires FL_LLM_API_KEY)
+fl query "why was the auth flow refactored" --ai
+
+# Manage the search index
+fl intel rebuild
+fl intel stats
+
+# Confidence scoring for agent sessions
+fl confidence --verbose
+```
+
+### Security & Backup
+
+Encryption at rest, audit trails, and backup/restore for `.flock` data.
+
+```bash
+# Encrypt/decrypt the signing key
+fl key encrypt
+fl key decrypt
+fl key status
+
+# Audit the event log for anomalies
+fl audit --json
+
+# Backup and restore
+fl backup create ./my-backup.tar.gz
+fl backup restore ./my-backup.tar.gz
+fl backup verify ./my-backup.tar.gz
+```
+
 ### Code Review
 
 Review explorations at the semantic level, not the line-diff level.
@@ -240,7 +378,7 @@ fl fsck                    # Verify Merkle roots and event chain integrity
   ┌───────▼──────┐                  ┌───────▼──────┐
   │ fl-bridge-git│                  │  fl-collab   │
   │ Git colocated│                  │ Coordination │
-  │ import/export│                  │  (planned)   │
+  │ import/export│                  │  primitives  │
   └──────────────┘                  └──────────────┘
 ```
 
@@ -254,7 +392,7 @@ fl fsck                    # Verify Merkle roots and event chain integrity
 | **fl-semantic** | Tree-sitter analyzers, semantic diff/merge, plugin registry |
 | **fl-workflow** | Exploration lifecycle, undo timeline, event replay |
 | **fl-bridge-git** | Git colocated mode, import/export, shadow safety checks |
-| **fl-collab** | Agent coordination contracts (presence, locks, subscriptions) |
+| **fl-collab** | Agent coordination (presence, locks, subscriptions, gates) |
 
 ### Core design principles
 
@@ -272,31 +410,93 @@ fl fsck                    # Verify Merkle roots and event chain integrity
 ├── event-log/events.jsonl   # Append-only event history
 ├── refs/refs.json           # Branches, tags, workspaces
 ├── keys/ed25519.sk          # Optional event signing key
-└── snapshots/<uuid>/        # Checkpoint state snapshots
+├── secrets.toml             # Secret detection config
+├── hooks.toml               # Declarative hook definitions
+└── snapshots/<uuid>/        # Commit snapshots
 ```
 
 ## Commands
 
+### Core
+
 | Command | Description |
 |---------|-------------|
-| `fl init [--colocated]` | Initialize a Flock repository |
-| `fl checkpoint -m <msg>` | Create a checkpoint snapshot |
-| `fl diff [--semantic] [--intent] [--json]` | Show changes since last checkpoint |
-| `fl impact <path>` | Analyze blast radius of a change |
-| `fl merge --dry-run --semantic <base> <left> <right>` | Preview semantic merge |
+| `fl init [--colocated] [--native]` | Initialize a Flock repository |
+| `fl commit -m <msg> [--allow-secrets] [--skip-hooks]` | Create a commit snapshot |
+| `fl status [--json]` | Show working directory status |
 | `fl log` | Show event history |
 | `fl fsck` | Verify storage integrity |
+| `fl diff [--semantic] [--intent] [--json] [FROM] [TO]` | Show changes (working dir or between commits) |
+| `fl impact <path> [--json]` | Analyze blast radius of a change |
+| `fl merge --dry-run --semantic <base> <left> <right>` | Preview semantic merge |
 | `fl undo [--n N] [--to ID] [--since DUR] [--file PATH]` | Undo events |
-| `fl explore start\|list\|promote\|abandon\|compare\|prune` | Manage explorations |
+| `fl review <exploration-id> [--expand N] [--full]` | Review exploration semantically |
+
+### Explorations & Workspaces
+
+| Command | Description |
+|---------|-------------|
+| `fl explore start\|list\|promote\|abandon\|compare\|prune\|tree` | Manage explorations |
 | `fl workspace create\|list\|info\|limits` | Manage isolated workspaces |
+| `fl rebase --workspace <name>` | Rebase a workspace onto latest |
+| `fl auto-rebase` | Auto-rebase all enabled workspaces |
+
+### Agent Sessions & Tasks
+
+| Command | Description |
+|---------|-------------|
 | `fl session start\|list\|show\|complete\|fail\|replay\|...` | Track agent sessions |
-| `fl task create\|list\|claim\|done\|fail\|graph\|...` | Manage task graph |
-| `fl ready` | List dependency-unblocked tasks |
-| `fl review <exploration-id>` | Review exploration semantically |
-| `fl refs list\|set\|delete` | Manage branches, tags, workspaces |
-| `fl git status\|commit\|push\|pull\|import\|export` | Git bridge operations |
-| `fl quick-save [--tag TAG]` | Quick checkpoint for agents |
+| `fl task create\|list\|show\|claim\|done\|fail\|graph\|link\|compact` | Manage task graph |
+| `fl ready [--json] [--live]` | List dependency-unblocked tasks |
+| `fl quick-save [--tag TAG]` | Quick commit for agents |
 | `fl quick-restore` | Restore to before last event |
+
+### Collaboration
+
+| Command | Description |
+|---------|-------------|
+| `fl presence heartbeat\|depart\|list` | Multi-agent presence tracking |
+| `fl lock acquire\|list\|release` | Advisory resource locking |
+| `fl subscribe --path\|--symbol\|--module` | Subscribe to changes |
+| `fl unsubscribe <id>` | Cancel a subscription |
+| `fl subscriptions [--json]` | List active subscriptions |
+| `fl gate create\|list\|check\|approve\|reject\|delete` | Human-in-the-loop quality gates |
+| `fl conflict detect\|suggest\|resolve\|verify\|record\|list` | Conflict resolution workflow |
+
+### Remote Sync
+
+| Command | Description |
+|---------|-------------|
+| `fl roost add\|remove\|list\|set-url` | Manage Flock remotes |
+| `fl push [roost] [branch]` | Push events to a remote |
+| `fl pull [roost] [branch]` | Pull events from a remote |
+| `fl watch [--path] [--symbol] [--agent] [--kind] [--json]` | Stream live events via WebSocket |
+| `fl remote login\|logout\|status` | Manage remote authentication |
+
+### Intelligence & Security
+
+| Command | Description |
+|---------|-------------|
+| `fl query <text> [--ai] [--json]` | Search event history with natural language |
+| `fl intel rebuild\|stats` | Manage the search index |
+| `fl confidence [--verbose] [--json]` | Show session confidence score |
+| `fl key encrypt\|decrypt\|status` | Manage signing key encryption |
+| `fl audit [--json]` | Audit event log for anomalies |
+| `fl backup create\|restore\|verify` | Backup and restore `.flock` data |
+
+### Repository Management
+
+| Command | Description |
+|---------|-------------|
+| `fl refs list\|set\|delete` | Manage branches, tags, workspaces |
+| `fl convert from-git\|from-jj\|to-git` | Convert repositories to/from Flock |
+| `fl git status\|commit\|push\|pull\|import\|export` | Git bridge operations |
+| `fl index [--clear]` | Rebuild or clear the semantic index |
+| `fl migrate --native` | Migrate to native block-level storage |
+| `fl compact [--older-than DUR]` | Archive old events |
+| `fl materialize` | Snapshot replay state for faster ops |
+| `fl completions <shell>` | Generate shell completions |
+| `fl editor-server` | Start editor plugin protocol server |
 
 ## Roadmap
 
@@ -305,18 +505,20 @@ Flock is being built in phases. Here's where things stand:
 | Phase | Status | Description |
 |-------|--------|-------------|
 | 0. Foundations | Done | Workspace, CLI, `.flock` layout, tree-sitter |
-| 1. Core Storage | Done | Event log, refs, checksums, undo |
-| 2. Git Compatibility | Done | Colocated mode, import/export bridge |
+| 1. Core Storage | Done | Event log, refs, checksums, undo, secret detection, hooks |
+| 2. Git Compatibility | Done | Colocated mode, import/export bridge, `fl convert` |
 | 3. Semantic Layer | Done | Symbol extraction, diff, merge, conflict classification |
-| 4. Developer Experience | Done | `diff --intent`, `impact`, `review` commands |
+| 4. Developer Experience | Done | `diff --intent`, `impact`, `review`, checkpoint-to-checkpoint diff |
 | 5. Explorations & Workspaces | Done | Lifecycle, TTL, limits, comparison |
 | 6. Agent Sessions | Done | Sessions, decisions, resource tracking, provenance |
 | 7. Work Queue | Done | Task graph, dependencies, ready selection |
-| 8. Collaboration | Planned | Real-time presence, advisory locks, auto-rebase |
-| 9. Native Storage | Planned | Block-level content store, sub-file undo |
-| 10. Scale & Server | Planned | Replication, tiered storage, real-time |
-| 11. Intelligence | Planned | NLP history queries, AI-assisted merge |
-| 12. Security | Planned | Encryption, threat model, audit trail |
+| 8. Collaboration | Done | Real-time presence, advisory locks, auto-rebase, conflict resolution |
+| 8.5. Semantic Improvements | Done | 8 language analyzers, structured formats, cross-file conflicts, AST cache |
+| 9. Native Storage | Done | Block-level content store, sub-file undo, segmented log, compaction |
+| 10. Remote Sync (Client) | Done | Push/pull, auth, WebSocket streaming, editor protocol |
+| 11. Intelligence | Done | NLP history queries, TF-IDF index, AI-assisted merge, confidence scoring |
+| 12. Security | Done | Encryption at rest, audit trail, backup/restore, disaster recovery |
+| 10-R. Remote Server (Roost) | Planned | Server-side sync, web UI, tiered storage (separate repo) |
 | 13. QA & Performance | Planned | Fuzzing, benchmarks, test matrix |
 | 14. Docs & Adoption | Planned | Migration guides, tutorials |
 

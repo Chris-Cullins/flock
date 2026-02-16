@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -153,6 +153,9 @@ enum Command {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Stream live updates via WebSocket
+        #[arg(long)]
+        live: bool,
     },
     /// Quick commit for agents
     QuickSave {
@@ -262,11 +265,123 @@ enum Command {
         /// Branch to pull
         branch: Option<String>,
     },
+    /// Stream live events from a remote via WebSocket
+    Watch {
+        /// Roost name (defaults to "origin")
+        #[arg(long)]
+        remote: Option<String>,
+        /// Filter by file path glob
+        #[arg(long)]
+        path: Vec<String>,
+        /// Filter by symbol name
+        #[arg(long)]
+        symbol: Vec<String>,
+        /// Filter by agent name
+        #[arg(long)]
+        agent: Vec<String>,
+        /// Filter by event kind (e.g. Task, Checkpoint, Presence)
+        #[arg(long)]
+        kind: Vec<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start editor plugin protocol server (JSON-lines over stdin/stdout)
+    EditorServer {
+        /// Roost name for WebSocket connection (defaults to "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Search event history using natural language
+    Query {
+        /// Search text
+        text: String,
+        /// Maximum number of results
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        /// Use AI to enhance search results (requires FL_LLM_API_KEY)
+        #[arg(long)]
+        ai: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage the intelligence search index
+    #[command(name = "intel")]
+    Intel {
+        #[command(subcommand)]
+        command: IntelCommand,
+    },
+    /// Show session confidence score
+    Confidence {
+        /// Show detailed factor breakdown
+        #[arg(long)]
+        verbose: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Backup and restore .flock data
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+    /// Manage signing key encryption
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+    /// Audit the event log for security anomalies
+    Audit {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate shell completions for bash, zsh, fish, or powershell
     Completions {
         /// Shell to generate completions for
         shell: Shell,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    /// Create a backup of the .flock directory
+    Create {
+        /// Output path for the backup archive
+        path: String,
+    },
+    /// Restore a backup archive
+    Restore {
+        /// Path to the backup archive
+        archive: String,
+        /// Target directory (defaults to current directory)
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Verify a backup archive contains all required data
+    Verify {
+        /// Path to the backup archive
+        archive: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    /// Encrypt the signing key with a passphrase
+    Encrypt {
+        /// Passphrase (or set FL_KEY_PASSPHRASE env var)
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+    /// Decrypt the signing key
+    Decrypt {
+        /// Passphrase (or set FL_KEY_PASSPHRASE env var)
+        #[arg(long)]
+        passphrase: Option<String>,
+    },
+    /// Show signing key status (plaintext, encrypted, or absent)
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -511,6 +626,9 @@ enum TaskCommand {
         all: bool,
         #[arg(long)]
         json: bool,
+        /// Stream live task updates via WebSocket
+        #[arg(long)]
+        live: bool,
     },
     /// Show task details
     Show {
@@ -619,6 +737,18 @@ enum GateCommand {
     },
     Delete {
         id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IntelCommand {
+    /// Rebuild the intelligence search index from all events
+    Rebuild,
+    /// Show search index statistics
+    Stats {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -865,6 +995,13 @@ fn main() -> Result<()> {
                         event.timestamp, rs.action, rs.roost_name, rs.event_count,
                         rs.block_count, rs.success
                     ),
+                    EventKind::Intelligence(intel) => println!(
+                        "{}  intel:{:?}  model={}  confidence={}",
+                        event.timestamp,
+                        intel.action,
+                        intel.model.as_deref().unwrap_or("-"),
+                        intel.confidence.map(|c| format!("{:.0}", c)).unwrap_or_else(|| "-".to_string()),
+                    ),
                 }
             }
         }
@@ -872,11 +1009,12 @@ fn main() -> Result<()> {
             let repo = Repo::discover(cwd)?;
             let report = repo.fsck()?;
             println!(
-                "fsck ok: events={} commits={} snapshots={} refs={}",
+                "fsck ok: events={} commits={} snapshots={} refs={} hash_chain={}",
                 report.event_count,
                 report.checkpoint_count,
                 report.snapshot_count,
-                report.ref_count
+                report.ref_count,
+                if report.hash_chain_verified { "verified" } else { "unverified" }
             );
         }
         Command::Status { json } => {
@@ -1871,7 +2009,7 @@ fn main() -> Result<()> {
                     let task = repo.create_task(title, description, deps, discovered)?;
                     println!("task {} created: {}", task.id, task.title);
                 }
-                TaskCommand::List { all, json } => {
+                TaskCommand::List { all, json, live } => {
                     let mut tasks = repo.list_tasks()?;
                     if !all {
                         tasks.retain(|t| {
@@ -1918,6 +2056,10 @@ fn main() -> Result<()> {
                             assignee_str,
                             deps_str,
                         );
+                    }
+
+                    if live {
+                        stream_live_task_updates(&repo, "origin", json)?;
                     }
                 }
                 TaskCommand::Show { id, json } => {
@@ -2058,7 +2200,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Ready { json } => {
+        Command::Ready { json, live } => {
             let repo = Repo::discover(cwd)?;
             let ready = repo.ready_tasks()?;
 
@@ -2068,16 +2210,16 @@ fn main() -> Result<()> {
                     .map(|t| task_to_json(t))
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&json_tasks)?);
-                return Ok(());
-            }
-
-            if ready.is_empty() {
+            } else if ready.is_empty() {
                 println!("No ready tasks.");
-                return Ok(());
+            } else {
+                for task in &ready {
+                    println!("{}  {}", &task.id.to_string()[..8], task.title);
+                }
             }
 
-            for task in &ready {
-                println!("{}  {}", &task.id.to_string()[..8], task.title);
+            if live {
+                stream_live_task_updates(&repo, "origin", json)?;
             }
         }
         Command::QuickSave { tag } => {
@@ -2705,6 +2847,220 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Watch {
+            remote,
+            path,
+            symbol,
+            agent,
+            kind,
+            json,
+        } => {
+            let repo = Repo::discover(cwd)?;
+            let roost = remote.as_deref().unwrap_or("origin");
+            let ws = repo.ws_connect(roost)?;
+
+            // Subscribe with filters
+            let filter = fl_core::SubscriptionFilter {
+                paths: path,
+                symbols: symbol,
+                modules: vec![],
+            };
+            let sub = fl_core::WsSubscribeRequest {
+                filter,
+                agents: agent,
+                event_kinds: kind,
+            };
+            ws.send(fl_core::WsClientMessage::Subscribe(sub))?;
+
+            // Set up Ctrl+C handler
+            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let r = running.clone();
+            ctrlc_flag(&r);
+
+            println!("watching for events (Ctrl+C to stop)...");
+            while running.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(msg) = ws.recv_timeout(std::time::Duration::from_millis(500)) {
+                    if json {
+                        println!("{}", serde_json::to_string(&msg)?);
+                    } else {
+                        print_ws_message(&msg);
+                    }
+                }
+            }
+            ws.disconnect();
+        }
+        Command::EditorServer { remote } => {
+            let repo = Repo::discover(cwd)?;
+            run_editor_server(&repo, remote.as_deref().unwrap_or("origin"))?;
+        }
+        Command::Query { text, limit, ai, json } => {
+            let repo = Repo::discover(cwd)?;
+            let results = repo.query(&text, ai, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else if results.is_empty() {
+                println!("no matching events found");
+            } else {
+                for (i, r) in results.iter().enumerate() {
+                    println!(
+                        "{}. [score {:.2}] {} – {}",
+                        i + 1,
+                        r.relevance,
+                        &r.event_id.to_string()[..8],
+                        r.snippet.chars().take(80).collect::<String>(),
+                    );
+                    if let Some(ref explanation) = r.ai_explanation {
+                        println!("   AI: {}", explanation);
+                    }
+                }
+            }
+        }
+        Command::Intel { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                IntelCommand::Rebuild => {
+                    let report = repo.rebuild_intelligence_index()?;
+                    println!(
+                        "indexed {} events, {} unique terms",
+                        report.events_indexed, report.terms_indexed
+                    );
+                }
+                IntelCommand::Stats { json } => {
+                    let stats = repo.intelligence_index_stats()?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&stats)?);
+                    } else {
+                        println!("documents: {}", stats.document_count);
+                        println!("terms:     {}", stats.term_count);
+                        println!("size:      {} bytes", stats.index_size_bytes);
+                    }
+                }
+            }
+        }
+        Command::Confidence { verbose, json } => {
+            let repo = Repo::discover(cwd)?;
+            let score = repo.calculate_session_confidence()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&score)?);
+            } else {
+                println!("confidence: {}/100 ({})", score.score, score.recommendation);
+                if verbose {
+                    println!();
+                    for f in &score.factors {
+                        println!(
+                            "  {:<25} {:>3}/100  (weight {:.0}%)  {}",
+                            f.name,
+                            f.score,
+                            f.weight * 100.0,
+                            f.detail
+                        );
+                    }
+                }
+            }
+        }
+        Command::Backup { command } => {
+            match command {
+                BackupCommand::Create { path } => {
+                    let repo = Repo::discover(&cwd)?;
+                    fl_core::backup::create_backup(repo.root(), Path::new(&path))?;
+                    println!("Backup created: {}", path);
+                }
+                BackupCommand::Restore { archive, target } => {
+                    let target_dir = target.map(PathBuf::from).unwrap_or_else(|| cwd.clone());
+                    fl_core::backup::restore_backup(Path::new(&archive), &target_dir)?;
+                    println!("Backup restored to {}", target_dir.display());
+                }
+                BackupCommand::Verify { archive } => {
+                    let verification = fl_core::backup::verify_backup(Path::new(&archive))?;
+                    println!("Backup verification:");
+                    println!("  files: {}", verification.file_count);
+                    println!("  total size: {} bytes", verification.total_size);
+                    println!("  event log: {}", if verification.has_event_log { "present" } else { "MISSING" });
+                    println!("  refs: {}", if verification.has_refs { "present" } else { "MISSING" });
+                    println!("  config: {}", if verification.has_config { "present" } else { "MISSING" });
+                    if verification.is_complete() {
+                        println!("  status: complete");
+                    } else {
+                        println!("  status: INCOMPLETE");
+                    }
+                }
+            }
+        }
+        Command::Key { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                KeyCommand::Encrypt { passphrase } => {
+                    let pass = passphrase
+                        .or_else(|| env::var("FL_KEY_PASSPHRASE").ok())
+                        .ok_or_else(|| anyhow::anyhow!("passphrase required (--passphrase or FL_KEY_PASSPHRASE)"))?;
+                    repo.encrypt_signing_key(&pass)?;
+                    println!("Signing key encrypted.");
+                }
+                KeyCommand::Decrypt { passphrase } => {
+                    let pass = passphrase
+                        .or_else(|| env::var("FL_KEY_PASSPHRASE").ok())
+                        .ok_or_else(|| anyhow::anyhow!("passphrase required (--passphrase or FL_KEY_PASSPHRASE)"))?;
+                    repo.decrypt_signing_key(&pass)?;
+                    println!("Signing key decrypted.");
+                }
+                KeyCommand::Status => {
+                    let status = repo.key_status();
+                    match status {
+                        fl_core::key_crypto::KeyStatus::None => println!("No signing key found."),
+                        fl_core::key_crypto::KeyStatus::Plaintext => println!("Signing key: plaintext"),
+                        fl_core::key_crypto::KeyStatus::Encrypted => println!("Signing key: encrypted"),
+                    }
+                }
+            }
+        }
+        Command::Audit { json } => {
+            let repo = Repo::discover(cwd)?;
+            let report = repo.audit()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Audit Report ({} events)", report.total_events);
+                println!();
+                println!("Signing Identities:");
+                if report.signing_identities.is_empty() {
+                    println!("  (none)");
+                }
+                for id in &report.signing_identities {
+                    println!(
+                        "  {}...{}: {} events (first: {}, last: {})",
+                        &id.public_key[..8.min(id.public_key.len())],
+                        &id.public_key[id.public_key.len().saturating_sub(8)..],
+                        id.event_count,
+                        id.first_seen,
+                        id.last_seen
+                    );
+                }
+                if !report.timeline_gaps.is_empty() {
+                    println!();
+                    println!("Timeline Gaps (>24h):");
+                    for gap in &report.timeline_gaps {
+                        println!(
+                            "  {:.1}h gap between {} and {}",
+                            gap.gap_hours, gap.from_event_id, gap.to_event_id
+                        );
+                    }
+                }
+                if !report.anomalies.is_empty() {
+                    println!();
+                    println!("Anomalies:");
+                    for anomaly in &report.anomalies {
+                        println!(
+                            "  [{}] {}: {}",
+                            anomaly.kind, anomaly.event_id, anomaly.detail
+                        );
+                    }
+                }
+                if report.anomalies.is_empty() && report.timeline_gaps.is_empty() {
+                    println!();
+                    println!("No anomalies detected.");
+                }
+            }
+        }
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "fl", &mut io::stdout());
@@ -3252,4 +3608,206 @@ fn task_to_json(task: &fl_core::TaskSummary) -> serde_json::Value {
         "linked_events": task.linked_events.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "discovered_from": task.discovered_from.map(|id| id.to_string()),
     })
+}
+
+fn print_ws_message(msg: &fl_core::WsServerMessage) {
+    use fl_core::WsServerMessage;
+    match msg {
+        WsServerMessage::AuthResult { success, identity, error } => {
+            if *success {
+                println!("authenticated as {}", identity.as_deref().unwrap_or("unknown"));
+            } else {
+                eprintln!("auth failed: {}", error.as_deref().unwrap_or("unknown"));
+            }
+        }
+        WsServerMessage::Pong { .. } => {}
+        WsServerMessage::Subscribed { subscription_id, .. } => {
+            println!("subscribed (id: {})", subscription_id);
+        }
+        WsServerMessage::EventNotification { event, .. } => {
+            println!("[{}] {} {}", event.timestamp, event.actor, event.kind_name());
+        }
+        WsServerMessage::PresenceUpdate { actor, workspace, files, intent, departed, .. } => {
+            if *departed {
+                println!("presence: {} departed from {}", actor, workspace);
+            } else {
+                let intent_str = intent.as_deref().unwrap_or("");
+                println!("presence: {} in {} editing {} {}", actor, workspace, files.join(", "), intent_str);
+            }
+        }
+        WsServerMessage::HeadsUpWarning { actor, symbol, path, action } => {
+            println!("heads-up: {} is {} {} in {}", actor, action, symbol, path);
+        }
+        WsServerMessage::ConflictForecast { symbol, path, local_change, remote_change, remote_actor } => {
+            println!(
+                "conflict forecast: {} in {} — local:{} vs {}:{}",
+                symbol, path, local_change, remote_actor, remote_change
+            );
+        }
+        WsServerMessage::TaskUpdate { task_id, title, status, assignee } => {
+            let assignee_str = assignee.as_deref().map(|a| format!(" @{}", a)).unwrap_or_default();
+            println!("task: {} [{}] {}{}", &task_id[..8.min(task_id.len())], status, title, assignee_str);
+        }
+        WsServerMessage::Error { code, message } => {
+            eprintln!("error [{}]: {}", code, message);
+        }
+    }
+}
+
+fn stream_live_task_updates(repo: &Repo, roost: &str, json: bool) -> Result<()> {
+    let ws = repo.ws_connect(roost)?;
+    let sub = fl_core::WsSubscribeRequest {
+        filter: fl_core::SubscriptionFilter {
+            paths: vec![],
+            symbols: vec![],
+            modules: vec![],
+        },
+        agents: vec![],
+        event_kinds: vec!["Task".to_string()],
+    };
+    ws.send(fl_core::WsClientMessage::Subscribe(sub))?;
+
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc_flag(&r);
+
+    println!("streaming task updates (Ctrl+C to stop)...");
+    while running.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(msg) = ws.recv_timeout(std::time::Duration::from_millis(500)) {
+            if json {
+                println!("{}", serde_json::to_string(&msg).unwrap_or_default());
+            } else {
+                print_ws_message(&msg);
+            }
+        }
+    }
+    ws.disconnect();
+    Ok(())
+}
+
+fn ctrlc_flag(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let f = flag.clone();
+    let _ = ctrlc::set_handler(move || {
+        f.store(false, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+fn run_editor_server(repo: &Repo, roost: &str) -> Result<()> {
+    use fl_core::editor_protocol::{EditorRequest, EditorSession, EditorNotification};
+    use std::io::BufRead;
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut session = EditorSession::new();
+
+    // Try to connect WebSocket (non-fatal if it fails — editor still works locally)
+    let ws = repo.ws_connect(roost).ok();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+
+        let request: EditorRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = EditorNotification::Error {
+                    message: format!("parse error: {}", e),
+                };
+                writeln!(stdout, "{}", serde_json::to_string(&err)?)?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+
+        let is_shutdown = matches!(&request, EditorRequest::Shutdown);
+
+        if let Some(response) = session.handle_request(&request) {
+            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+            stdout.flush()?;
+        }
+
+        // Forward presence/warnings from WebSocket if connected
+        if let Some(ref ws) = ws {
+            while let Some(msg) = ws.try_recv() {
+                if let Some(notification) = ws_message_to_editor_notification(&msg, &session) {
+                    writeln!(stdout, "{}", serde_json::to_string(&notification)?)?;
+                }
+            }
+            stdout.flush()?;
+        }
+
+        if is_shutdown {
+            if let Some(ref ws) = ws {
+                ws.disconnect();
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn ws_message_to_editor_notification(
+    msg: &fl_core::WsServerMessage,
+    session: &fl_core::editor_protocol::EditorSession,
+) -> Option<fl_core::editor_protocol::EditorNotification> {
+    use fl_core::editor_protocol::{EditorNotification, PresenceEntry};
+    use fl_core::WsServerMessage;
+
+    match msg {
+        WsServerMessage::PresenceUpdate { actor, files, symbols, intent, departed, .. } => {
+            if *departed {
+                return None;
+            }
+            // Only notify for files the editor has open
+            let relevant_files: Vec<_> = files
+                .iter()
+                .filter(|f| session.should_notify_for_path(f))
+                .collect();
+            if relevant_files.is_empty() {
+                return None;
+            }
+            let entries = relevant_files
+                .into_iter()
+                .map(|f| PresenceEntry {
+                    actor: actor.clone(),
+                    file: f.clone(),
+                    symbol: symbols.first().cloned(),
+                    intent: intent.clone(),
+                })
+                .collect();
+            Some(EditorNotification::PresenceOverlay { entries })
+        }
+        WsServerMessage::HeadsUpWarning { actor, symbol, path, action } => {
+            if !session.should_notify_for_path(path) {
+                return None;
+            }
+            Some(EditorNotification::HeadsUpWarning {
+                actor: actor.clone(),
+                symbol: symbol.clone(),
+                path: path.clone(),
+                action: action.clone(),
+            })
+        }
+        WsServerMessage::ConflictForecast { symbol, path, local_change, remote_change, remote_actor } => {
+            if !session.should_notify_for_path(path) {
+                return None;
+            }
+            Some(EditorNotification::ConflictForecastWarning {
+                symbol: symbol.clone(),
+                path: path.clone(),
+                local_change: local_change.clone(),
+                remote_change: remote_change.clone(),
+                remote_actor: remote_actor.clone(),
+            })
+        }
+        WsServerMessage::TaskUpdate { task_id, title, .. } => {
+            Some(EditorNotification::TaskReady {
+                task_id: task_id.clone(),
+                title: title.clone(),
+            })
+        }
+        _ => None,
+    }
 }

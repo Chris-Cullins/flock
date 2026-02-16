@@ -3,7 +3,7 @@ pub mod structured;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
@@ -1644,15 +1644,53 @@ fn ast_cache() -> &'static Mutex<HashMap<String, Vec<SymbolInfo>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn persistent_cache() -> &'static Mutex<Option<ast_cache::PersistentASTCache>> {
+    static PCACHE: OnceLock<Mutex<Option<ast_cache::PersistentASTCache>>> = OnceLock::new();
+    PCACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Initialize the persistent AST cache rooted at the given repo root.
+/// Must be called before `parse_symbols` will use disk caching.
+pub fn set_cache_root(root: &Path) {
+    if let Ok(mut guard) = persistent_cache().lock() {
+        *guard = Some(ast_cache::PersistentASTCache::new(root));
+    }
+}
+
+/// Clear the persistent AST cache on disk.
+pub fn clear_cache(root: &Path) -> Result<()> {
+    ast_cache::PersistentASTCache::new(root).clear()
+}
+
+/// Return the path used for the persistent cache directory.
+pub fn cache_root_for(root: &Path) -> PathBuf {
+    root.join(".flock/semantic-cache")
+}
+
 fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolInfo>> {
     if source.is_empty() {
         return Ok(Vec::new());
     }
 
     let cache_key = blake3::hash(source).to_hex().to_string();
+
+    // 1. Check in-memory cache
     if let Ok(cache) = ast_cache().lock() {
         if let Some(cached) = cache.get(&cache_key) {
             return Ok(cached.clone());
+        }
+    }
+
+    // 2. Check persistent disk cache
+    if let Ok(guard) = persistent_cache().lock() {
+        if let Some(ref pcache) = *guard {
+            if let Some(entry) = pcache.get(&cache_key) {
+                // Populate in-memory cache for future lookups
+                if let Ok(mut mem) = ast_cache().lock() {
+                    mem.insert(cache_key, entry.symbols.clone());
+                }
+                return Ok(entry.symbols);
+            }
         }
     }
 
@@ -1705,8 +1743,20 @@ fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolIn
         SourceLanguage::CSharp => extract_symbols_csharp(root, source, None, &mut symbols)?,
     }
 
+    // Store in in-memory cache
     if let Ok(mut cache) = ast_cache().lock() {
-        cache.insert(cache_key, symbols.clone());
+        cache.insert(cache_key.clone(), symbols.clone());
+    }
+
+    // Store in persistent disk cache
+    if let Ok(guard) = persistent_cache().lock() {
+        if let Some(ref pcache) = *guard {
+            let _ = pcache.put(&ast_cache::CachedSymbols {
+                content_hash: cache_key,
+                language: language.name().to_string(),
+                symbols: symbols.clone(),
+            });
+        }
     }
 
     Ok(symbols)

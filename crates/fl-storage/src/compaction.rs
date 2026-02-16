@@ -137,6 +137,7 @@ mod tests {
             parent_id,
             signer_public_key: None,
             signature: None,
+            prev_event_hash: None,
             kind,
         }
     }
@@ -162,6 +163,8 @@ mod tests {
             snapshot_id: Uuid::from_u128(100),
             parent_checkpoint_event: None,
             snapshot_merkle_root: None,
+            ai_intent: None,
+            intent_confidence: None,
         }));
         let session = make_event(2, Some(cp.id), "1000000000000000001", EventKind::Session(SessionEvent {
             session_id: Uuid::from_u128(200),
@@ -199,6 +202,8 @@ mod tests {
             snapshot_id: Uuid::from_u128(100),
             parent_checkpoint_event: None,
             snapshot_merkle_root: None,
+            ai_intent: None,
+            intent_confidence: None,
         }));
 
         write_events_to_log(dir.path(), &[old_cp]);

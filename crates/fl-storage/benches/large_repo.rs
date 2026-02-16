@@ -26,12 +26,15 @@ fn make_checkpoint_event(seq: u128, parent: Option<Uuid>) -> Event {
         parent_id: parent,
         signer_public_key: None,
         signature: None,
+        prev_event_hash: None,
         kind: EventKind::Checkpoint(CheckpointEvent {
             label: format!("cp-{}", seq),
             message: None,
             snapshot_id: Uuid::from_u128(seq + 1_000_000),
             parent_checkpoint_event: None,
             snapshot_merkle_root: Some("0".repeat(64)),
+            ai_intent: None,
+            intent_confidence: None,
         }),
     };
     sign_event(&mut event);

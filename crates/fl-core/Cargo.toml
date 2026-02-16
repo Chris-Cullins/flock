@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
 anyhow.workspace = true
+argon2.workspace = true
 blake3.workspace = true
+flate2.workspace = true
 ed25519-dalek.workspace = true
 fl-bridge-git = { path = "../fl-bridge-git" }
 fl-collab = { path = "../fl-collab" }
@@ -18,8 +21,12 @@ glob.workspace = true
 regex.workspace = true
 hex.workspace = true
 ignore.workspace = true
+rand.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tar.workspace = true
 tempfile.workspace = true
+tungstenite.workspace = true
+ureq.workspace = true
 uuid.workspace = true
 walkdir.workspace = true

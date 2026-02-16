@@ -338,6 +338,8 @@ impl ReplayAccumulator {
             }
             EventKind::GitBridge(_) => {}
             EventKind::Hook(_) => {}
+            EventKind::RemoteSync(_) => {}
+            EventKind::Intelligence(_) => {}
             EventKind::Session(session) => match session.action {
                 SessionAction::Start => {
                     self.sessions.insert(
@@ -929,6 +931,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(10),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let exploration_start = make_event(
@@ -976,6 +980,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(11),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let cp2 = make_event(
@@ -987,6 +993,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(12),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let restored = make_event(
@@ -998,6 +1006,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(13),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let undo = make_event(
@@ -1030,6 +1040,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(11),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let cp2 = make_event(
@@ -1041,6 +1053,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(12),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
 
@@ -1061,6 +1075,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(11),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let cp2 = make_event(
@@ -1072,6 +1088,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(12),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let exploration_start = make_event(
@@ -1093,6 +1111,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(13),
                 parent_checkpoint_event: Some(cp2.id),
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let undo = make_event(
@@ -1918,6 +1938,8 @@ mod tests {
                 snapshot_id: Uuid::from_u128(10),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         );
         let exploration_start = make_event(
@@ -1967,6 +1989,7 @@ mod tests {
             parent_id,
             signer_public_key: None,
             signature: None,
+            prev_event_hash: None,
             kind,
         }
     }

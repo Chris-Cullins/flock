@@ -73,6 +73,22 @@ impl RemoteUrl {
         }
     }
 
+    /// WebSocket URL for the flock:// scheme.
+    ///
+    /// `flock://host:port/path` → `wss://host:port/path/ws` (port 443)
+    /// `flock://host:8080/path` → `ws://host:8080/path/ws` (non-443 ports)
+    pub fn ws_url(&self) -> Result<String> {
+        match self.scheme {
+            RemoteScheme::Flock => {
+                let host = self.host.as_deref().unwrap_or("localhost");
+                let port = self.port.unwrap_or(443);
+                let scheme = if port == 443 { "wss" } else { "ws" };
+                Ok(format!("{scheme}://{host}:{port}{}/ws", self.path))
+            }
+            RemoteScheme::File => bail!("file:// URLs do not have a WebSocket URL"),
+        }
+    }
+
     /// Base HTTP URL for the flock:// scheme.
     pub fn http_base_url(&self) -> Result<String> {
         match self.scheme {

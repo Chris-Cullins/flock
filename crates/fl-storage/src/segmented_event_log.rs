@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::event::{Event, EventRecord};
+use crate::event::{Event, EventRecord, compute_event_hash};
 use crate::layout;
 
 /// Number of events per segment file.
@@ -37,6 +37,9 @@ pub struct EventLogIndex {
     pub entries: BTreeMap<String, IndexEntry>,
     /// ID of the last event (for parent chain validation).
     pub last_event_id: Option<String>,
+    /// BLAKE3 hash of the last event (for hash chain).
+    #[serde(default)]
+    pub last_event_hash: Option<String>,
 }
 
 const INDEX_SCHEMA_VERSION: u32 = 1;
@@ -49,6 +52,7 @@ impl EventLogIndex {
             segment_count: 0,
             entries: BTreeMap::new(),
             last_event_id: None,
+            last_event_hash: None,
         }
     }
 }
@@ -178,6 +182,10 @@ impl SegmentedEventLog {
             index.segment_count = segment_num + 1;
         }
 
+        // Set hash chain link
+        let mut event = event.clone();
+        event.prev_event_hash = index.last_event_hash.clone();
+
         // Write event to segment file
         let seg_path = self.segment_path(segment_num);
         let mut file = OpenOptions::new()
@@ -186,7 +194,7 @@ impl SegmentedEventLog {
             .open(&seg_path)
             .with_context(|| format!("failed to open segment {} for append", seg_path.display()))?;
 
-        let record = EventRecord::from_event(event);
+        let record = EventRecord::from_event(&event);
         let line = serde_json::to_string(&record).context("failed to serialize event")?;
         writeln!(file, "{}", line).context("failed to append event to segment")?;
 
@@ -200,6 +208,7 @@ impl SegmentedEventLog {
         );
         index.event_count += 1;
         index.last_event_id = Some(event.id.to_string());
+        index.last_event_hash = Some(compute_event_hash(&event));
 
         self.write_index(&index)?;
 
@@ -282,12 +291,15 @@ mod tests {
             parent_id,
             signer_public_key: None,
             signature: None,
+            prev_event_hash: None,
             kind: EventKind::Checkpoint(CheckpointEvent {
                 label: format!("cp-{}", id),
                 message: None,
                 snapshot_id: Uuid::from_u128(id + 1000),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         }
     }

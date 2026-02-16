@@ -27,7 +27,7 @@ fl-storage      Append-only event log (JSONL), refs store (JSON), .flock layout
 fl-semantic     Language analyzers, semantic diff/merge engine, plugin registry
 fl-workflow     Exploration lifecycle, undo timeline, event replay
 fl-bridge-git   Git colocated mode, import/export bridge
-fl-collab       Collaboration contracts (stub for future phases)
+fl-collab       Collaboration contracts (presence, locks, subscriptions, gates)
 ```
 
 **Dependency flow**: `fl-cli` → `fl-core` → `fl-storage`, `fl-semantic`, `fl-workflow`, `fl-bridge-git`, `fl-collab`
@@ -75,7 +75,7 @@ Known bugs are tracked in the `## Bugs` section at the bottom of `TODO.md`. Add 
 
 - Rust edition 2024, synchronous (no async/tokio)
 - No external database — all state in JSONL/JSON files under `.flock/`
-- Tree-sitter bindings for JS, JSX, TS, TSX, Python, Go, Rust, C#; other languages use text fallback
+- Tree-sitter bindings for JS, JSX, TS, TSX, Python, Go, Rust, C#; structured format analyzers for JSON, YAML/TOML, XML/HTML, CSS/SCSS, Markdown; other languages use text fallback
 - Unit tests are inline (`#[cfg(test)]` modules); integration tests in `crates/*/tests/`
 - `fl-semantic/src/lib.rs` contains ~2,400 lines including ~2,100 lines of tests covering symbol extraction, conflict classification, and signature compatibility
 - Events are signed with ed25519 (optional), include Merkle snapshot roots for integrity

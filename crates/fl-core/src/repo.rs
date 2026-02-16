@@ -56,6 +56,7 @@ pub struct FsckReport {
     pub checkpoint_count: usize,
     pub snapshot_count: usize,
     pub ref_count: usize,
+    pub hash_chain_verified: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -725,6 +726,7 @@ impl Repo {
                 EventKind::ConflictResolution(_) => {}
                 EventKind::Hook(_) => {}
                 EventKind::RemoteSync(_) => {}
+                EventKind::Intelligence(_) => {}
             }
         }
 
@@ -791,12 +793,38 @@ impl Repo {
             }
         }
 
+        // Hash chain is verified as part of read_all() validation.
+        // If we got here, it passed.
         Ok(FsckReport {
             event_count,
             checkpoint_count: seen_checkpoints.len(),
             snapshot_count,
             ref_count: refs.len(),
+            hash_chain_verified: true,
         })
+    }
+
+    pub fn audit(&self) -> Result<crate::audit::AuditReport> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        Ok(crate::audit::analyze_audit_trail(&events))
+    }
+
+    pub fn key_status(&self) -> crate::key_crypto::KeyStatus {
+        let key_path = self.root.join(SIGNING_KEY_FILE);
+        crate::key_crypto::key_status(&key_path)
+    }
+
+    pub fn encrypt_signing_key(&self, passphrase: &str) -> Result<()> {
+        self.assert_initialized()?;
+        let key_path = self.root.join(SIGNING_KEY_FILE);
+        crate::key_crypto::encrypt_signing_key(&key_path, passphrase)
+    }
+
+    pub fn decrypt_signing_key(&self, passphrase: &str) -> Result<()> {
+        self.assert_initialized()?;
+        let key_path = self.root.join(SIGNING_KEY_FILE);
+        crate::key_crypto::decrypt_signing_key(&key_path, passphrase)
     }
 
     pub fn status(&self) -> Result<StatusReport> {
@@ -3476,6 +3504,8 @@ impl Repo {
             snapshot_id,
             parent_checkpoint_event,
             snapshot_merkle_root: Some(snapshot_merkle_root),
+            ai_intent: None,
+            intent_confidence: None,
         }))?;
 
         if let Some(git_commit_sha) = git_commit_mapping {
@@ -3672,6 +3702,8 @@ impl Repo {
             snapshot_id,
             parent_checkpoint_event,
             snapshot_merkle_root: Some(snapshot_merkle_root),
+            ai_intent: None,
+            intent_confidence: None,
         }))?;
 
         if let Some(git_commit_sha) = git_commit_mapping {
@@ -4014,6 +4046,7 @@ impl Repo {
             parent_id: self.latest_event_id()?,
             signer_public_key: None,
             signature: None,
+            prev_event_hash: None,
             kind,
         };
         self.sign_event(&mut event)?;
@@ -6051,6 +6084,172 @@ impl Repo {
             blocks_downloaded,
             refs_updated,
         })
+    }
+
+    /// Connect to a roost via WebSocket for real-time event streaming.
+    pub fn ws_connect(
+        &self,
+        roost_name: &str,
+    ) -> Result<crate::ws_client::WsClient> {
+        self.assert_initialized()?;
+        let config = fl_storage::load_roosts(self.root())?;
+        let entry = fl_storage::find_roost(&config, roost_name)
+            .ok_or_else(|| anyhow!("roost '{}' not found", roost_name))?;
+
+        let url = fl_storage::RemoteUrl::parse(&entry.url)?;
+        let ws_url = url.ws_url()?;
+        let resolved_token =
+            fl_storage::resolve_token(entry.token.as_deref(), url.host.as_deref())?;
+        let token = resolved_token.unwrap_or_default();
+
+        let ws_config = crate::ws_client::WsClientConfig::new(ws_url, token);
+        crate::ws_client::WsClient::connect(ws_config)
+    }
+
+    // -----------------------------------------------------------------------
+    // Intelligence layer
+    // -----------------------------------------------------------------------
+
+    /// Load intelligence configuration from `.flock/config.toml` with env overrides.
+    pub fn load_intelligence_config(&self) -> crate::intelligence::IntelligenceConfig {
+        crate::intelligence::IntelligenceConfig::load(self.root())
+    }
+
+    /// Search history using TF-IDF, optionally enhanced with AI.
+    pub fn query(&self, query: &str, use_ai: bool, limit: usize) -> Result<Vec<crate::intelligence::QueryResult>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let config = self.load_intelligence_config();
+
+        let llm_client = if use_ai && config.ai_available() {
+            crate::intelligence::LlmClient::new(&config).ok()
+        } else {
+            None
+        };
+
+        crate::intelligence::query_history(&events, query, limit, llm_client.as_ref(), self.root())
+    }
+
+    /// Rebuild the intelligence search index from all events.
+    pub fn rebuild_intelligence_index(&self) -> Result<crate::intelligence::IntelligenceIndexReport> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let index = crate::intelligence::SearchIndex::rebuild(&events);
+        let report = crate::intelligence::IntelligenceIndexReport {
+            events_indexed: index.doc_count,
+            terms_indexed: index.term_count(),
+        };
+        index.save(self.root())?;
+        Ok(report)
+    }
+
+    /// Get statistics about the intelligence search index.
+    pub fn intelligence_index_stats(&self) -> Result<crate::intelligence::IndexStats> {
+        self.assert_initialized()?;
+        let index = crate::intelligence::SearchIndex::load_or_create(self.root());
+        let index_path = self.root().join(fl_storage::FLOCK_DIR).join("intelligence").join("index.json");
+        let size = fs::metadata(&index_path).map(|m| m.len()).unwrap_or(0);
+        Ok(crate::intelligence::IndexStats {
+            document_count: index.doc_count,
+            term_count: index.term_count(),
+            index_size_bytes: size,
+        })
+    }
+
+    /// Extract intent from the current diff using AI or heuristics.
+    pub fn extract_intent_for_diff(&self, message: Option<&str>) -> Result<crate::intelligence::IntentExtractionResult> {
+        self.assert_initialized()?;
+        let config = self.load_intelligence_config();
+
+        let llm_client = if config.ai_available() {
+            crate::intelligence::LlmClient::new(&config).ok()
+        } else {
+            None
+        };
+
+        // Get changed files from status
+        let status = self.status()?;
+        let changed_files: Vec<String> = status
+            .new_files
+            .into_iter()
+            .chain(status.modified_files)
+            .chain(status.deleted_files)
+            .collect();
+
+        Ok(crate::intelligence::extract_intent(&changed_files, message, llm_client.as_ref()))
+    }
+
+    /// AI-enhanced conflict resolution suggestion.
+    pub fn suggest_resolution_ai(&self, conflict_id: Uuid) -> Result<crate::intelligence::ConflictSuggestionResult> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+
+        let conflict = state
+            .conflicts
+            .get(&conflict_id)
+            .ok_or_else(|| anyhow!("conflict `{}` not found", conflict_id))?;
+
+        let config = self.load_intelligence_config();
+        let llm_client = if config.ai_available() {
+            crate::intelligence::LlmClient::new(&config).ok()
+        } else {
+            None
+        };
+
+        Ok(crate::intelligence::suggest_conflict_resolution(
+            conflict.classification.as_deref(),
+            Some(&conflict.path),
+            conflict.symbol.as_deref(),
+            llm_client.as_ref(),
+        ))
+    }
+
+    /// Calculate a confidence score for the current session state.
+    pub fn calculate_session_confidence(&self) -> Result<crate::intelligence::ConfidenceScore> {
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let config = self.load_intelligence_config();
+
+        let checkpoint_count = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Checkpoint(_)))
+            .count();
+
+        // Check if any test files exist in the working directory
+        let has_tests = collect_source_files(self.root(), true)
+            .map(|files| files.iter().any(|f| {
+                let s = f.to_string_lossy().to_lowercase();
+                s.contains("test") || s.contains("spec")
+            }))
+            .unwrap_or(false);
+
+        let conflict_count = state
+            .conflicts
+            .values()
+            .filter(|c| c.status != fl_collab::ConflictStatus::Recorded)
+            .count();
+
+        let gate_pending_count = state
+            .gates
+            .values()
+            .filter(|g| g.status == fl_collab::GateStatus::Active)
+            .count();
+
+        // Count high-risk changes (from recent checkpoints' semantic diffs)
+        let high_risk_changes = 0; // Would require diffing, keep simple for now
+
+        Ok(crate::intelligence::calculate_confidence(
+            checkpoint_count,
+            has_tests,
+            conflict_count,
+            gate_pending_count,
+            high_risk_changes,
+            config.confidence_threshold,
+        ))
     }
 }
 

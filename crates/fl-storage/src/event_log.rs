@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use uuid::Uuid;
 
-use crate::event::{CURRENT_EVENT_SCHEMA_VERSION, Event, EventRecord, event_signing_payload};
+use crate::event::{CURRENT_EVENT_SCHEMA_VERSION, Event, EventRecord, compute_event_hash, event_signing_payload};
 use crate::layout::EVENT_LOG_FILE;
 
 #[derive(Debug, Clone)]
@@ -57,6 +57,7 @@ impl EventLog {
         validate_causal_chain(&parsed_events)?;
         validate_signatures(&parsed_events)?;
         validate_checkpoint_metadata(&parsed_events)?;
+        validate_hash_chain(&parsed_events)?;
 
         let events = parsed_events
             .into_iter()
@@ -67,10 +68,15 @@ impl EventLog {
 
     pub fn append(&self, event: &Event) -> Result<()> {
         self.ensure_exists()?;
-        let expected_parent = self.read_all()?.last().map(|entry| entry.id);
+        let existing = self.read_all()?;
+        let expected_parent = existing.last().map(|entry| entry.id);
         validate_next_parent(event, expected_parent)?;
         verify_event_signature(event, true)?;
         verify_checkpoint_merkle_root(event, true)?;
+
+        // Compute hash chain link
+        let mut event = event.clone();
+        event.prev_event_hash = existing.last().map(|prev| compute_event_hash(prev));
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -78,9 +84,48 @@ impl EventLog {
             .open(&self.path)
             .with_context(|| format!("failed to open {} for append", self.path.display()))?;
 
-        let record = EventRecord::from_event(event);
+        let record = EventRecord::from_event(&event);
         let line = serde_json::to_string(&record).context("failed to serialize event")?;
         writeln!(file, "{}", line).context("failed to append event to log")?;
+        Ok(())
+    }
+
+    /// Append a batch of events from a remote. Validates causal chain and
+    /// signatures for the entire batch before writing any events.
+    pub fn append_batch(&self, events: &[Event]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.ensure_exists()?;
+
+        let existing = self.read_all()?;
+        let mut expected_parent = existing.last().map(|e| e.id);
+
+        // Pre-validate the full batch before writing anything.
+        for event in events {
+            validate_next_parent(event, expected_parent)?;
+            verify_event_signature(event, true)?;
+            verify_checkpoint_merkle_root(event, true)?;
+            expected_parent = Some(event.id);
+        }
+
+        // All validated — append with hash chain links.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {} for batch append", self.path.display()))?;
+
+        let mut prev_hash: Option<String> = existing.last().map(|e| compute_event_hash(e));
+        for event in events {
+            let mut event = event.clone();
+            event.prev_event_hash = prev_hash;
+            prev_hash = Some(compute_event_hash(&event));
+            let record = EventRecord::from_event(&event);
+            let line = serde_json::to_string(&record).context("failed to serialize event")?;
+            writeln!(file, "{}", line).context("failed to append event to log")?;
+        }
+
         Ok(())
     }
 }
@@ -188,6 +233,40 @@ fn validate_checkpoint_metadata(events: &[ParsedEvent]) -> Result<()> {
     for parsed in events {
         let require_merkle_root = parsed.schema_version.unwrap_or(1) >= 5;
         verify_checkpoint_merkle_root(&parsed.event, require_merkle_root)?;
+    }
+    Ok(())
+}
+
+fn validate_hash_chain(events: &[ParsedEvent]) -> Result<()> {
+    let mut prev_hash: Option<String> = None;
+    for parsed in events {
+        let require_hash = parsed.schema_version.unwrap_or(1) >= 13;
+        match (&prev_hash, &parsed.event.prev_event_hash) {
+            (None, None) => {}
+            (None, Some(h)) if !h.is_empty() => {
+                bail!(
+                    "hash chain error: first event {} has prev_event_hash but no predecessor",
+                    parsed.event.id
+                );
+            }
+            (Some(expected), Some(actual)) if actual == expected => {}
+            (Some(expected), Some(actual)) => {
+                bail!(
+                    "hash chain error: event {} prev_event_hash mismatch (expected {}, got {})",
+                    parsed.event.id,
+                    expected,
+                    actual
+                );
+            }
+            (Some(_), None) if require_hash => {
+                bail!(
+                    "hash chain error: event {} is missing prev_event_hash (schema >= 13)",
+                    parsed.event.id
+                );
+            }
+            _ => {}
+        }
+        prev_hash = Some(compute_event_hash(&parsed.event));
     }
     Ok(())
 }
@@ -495,12 +574,15 @@ mod tests {
             parent_id,
             signer_public_key: None,
             signature: None,
+            prev_event_hash: None,
             kind: EventKind::Checkpoint(CheckpointEvent {
                 label: "checkpoint".to_string(),
                 message: Some("baseline".to_string()),
                 snapshot_id: Uuid::new_v4(),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         }
     }
@@ -520,5 +602,61 @@ mod tests {
         let signature = key.sign(&payload);
         event.signer_public_key = Some(hex::encode(key.verifying_key().to_bytes()));
         event.signature = Some(hex::encode(signature.to_bytes()));
+    }
+
+    #[test]
+    fn append_sets_hash_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let event_log = EventLog::for_root(dir.path());
+        event_log.ensure_exists().expect("ensure event log");
+
+        let first = signed_checkpoint_event(None);
+        event_log.append(&first).expect("append first");
+
+        let second = signed_checkpoint_event(Some(first.id));
+        event_log.append(&second).expect("append second");
+
+        // Read back and verify hash chain is set
+        let events = event_log.read_all().expect("read all");
+        assert_eq!(events.len(), 2);
+        assert!(events[0].prev_event_hash.is_none());
+        assert!(events[1].prev_event_hash.is_some());
+
+        // Verify the hash matches
+        let expected_hash = crate::event::compute_event_hash(&events[0]);
+        assert_eq!(events[1].prev_event_hash.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[test]
+    fn read_all_detects_tampered_hash_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let event_log = EventLog::for_root(dir.path());
+        event_log.ensure_exists().expect("ensure event log");
+
+        let first = signed_checkpoint_event(None);
+        event_log.append(&first).expect("append first");
+        let second = signed_checkpoint_event(Some(first.id));
+        event_log.append(&second).expect("append second");
+
+        // Tamper with the hash chain by writing a bad prev_event_hash
+        let events = event_log.read_all().expect("read all");
+        let mut tampered = events[1].clone();
+        tampered.prev_event_hash = Some("bad_hash".to_string());
+        let first_record = EventRecord::from_event(&events[0]);
+        let tampered_record = EventRecord::from_event(&tampered);
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first_record).unwrap(),
+            serde_json::to_string(&tampered_record).unwrap()
+        );
+        fs::write(dir.path().join(EVENT_LOG_FILE), content).expect("write tampered log");
+
+        let err = event_log
+            .read_all()
+            .expect_err("should detect hash chain tamper");
+        assert!(
+            format!("{:#}", err).contains("hash chain error"),
+            "unexpected error: {err}"
+        );
     }
 }

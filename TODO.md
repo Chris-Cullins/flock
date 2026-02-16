@@ -233,12 +233,12 @@ Client-side commands and protocol for syncing with a Flock remote (server lives 
 - [x] Store credentials securely (keychain/credential-helper pattern)
 
 ### 10c. Real-Time Client (Websocket)
-- [ ] Websocket connection lifecycle — connect to remote, authenticate, maintain heartbeat
-- [ ] Subscribe to event streams with filters (by file, symbol, module, agent)
-- [ ] `fl task list` / `fl ready` reflect remote state in real time (no poll/pull needed)
-- [ ] Receive "heads up" warnings when another agent/dev starts working on a symbol you're editing
-- [ ] Receive conflict forecast warnings based on active explorations' semantic change sets
-- [ ] Editor plugin protocol — define LSP-like protocol for editors to consume ghost text, presence, and heads-up warnings
+- [x] Websocket connection lifecycle — connect to remote, authenticate, maintain heartbeat
+- [x] Subscribe to event streams with filters (by file, symbol, module, agent)
+- [x] `fl task list` / `fl ready` reflect remote state in real time (no poll/pull needed)
+- [x] Receive "heads up" warnings when another agent/dev starts working on a symbol you're editing
+- [x] Receive conflict forecast warnings based on active explorations' semantic change sets
+- [x] Editor plugin protocol — define LSP-like protocol for editors to consume ghost text, presence, and heads-up warnings
 
 ## 10-R. Remote Server (Roost — `../roost`)
 
@@ -287,20 +287,20 @@ Server-side features live in the Roost repo. Tracked here for cross-reference on
 
 ## 11. Intelligence Layer
 
-- [ ] Implement natural-language history queries (`fl query`)
-- [ ] Build vector index for intents and semantic changes
-- [ ] Add AI-assisted intent extraction for commits/events
-- [ ] Add AI-assisted conflict resolution suggestions
-- [ ] Add confidence scoring and gate integration
+- [x] Implement natural-language history queries (`fl query`)
+- [x] Build TF-IDF search index for events (`fl intel rebuild/stats`)
+- [x] Add AI-assisted intent extraction for commits/events
+- [x] Add AI-assisted conflict resolution suggestions
+- [x] Add confidence scoring and gate integration (`fl confidence`)
 
 ## 12. Security, Reliability, and Compliance
 
-- [ ] Threat model for agent and human actors
-- [ ] Encrypt sensitive metadata at rest (configurable)
-- [ ] Audit trail hardening and tamper-evidence checks
-- [ ] Offline mode behavior and reconnect reconciliation
-- [ ] Backup and restore strategy for `.flock` data
-- [ ] Disaster recovery playbooks
+- [x] Threat model for agent and human actors (`docs/threat-model.md`)
+- [x] Encrypt sensitive metadata at rest — AES-256-GCM + Argon2 key encryption (`fl key encrypt/decrypt/status`)
+- [x] Audit trail hardening and tamper-evidence checks — BLAKE3 hash chain (schema v13), `fl audit` command
+- [x] Offline mode behavior and reconnect reconciliation (`fl_core::reconcile` — divergence detection, auto-merge)
+- [x] Backup and restore strategy for `.flock` data (`fl backup create/restore/verify`)
+- [x] Disaster recovery playbooks (`docs/disaster-recovery.md`)
 
 ## 13. QA and Performance
 

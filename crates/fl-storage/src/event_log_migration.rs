@@ -106,12 +106,15 @@ mod tests {
             parent_id: None,
             signer_public_key: None,
             signature: None,
+            prev_event_hash: None,
             kind: EventKind::Checkpoint(CheckpointEvent {
                 label: "cp1".to_string(),
                 message: None,
                 snapshot_id: Uuid::from_u128(100),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         };
         let e2 = Event {
@@ -121,12 +124,15 @@ mod tests {
             parent_id: Some(e1.id),
             signer_public_key: None,
             signature: None,
+            prev_event_hash: None,
             kind: EventKind::Checkpoint(CheckpointEvent {
                 label: "cp2".to_string(),
                 message: None,
                 snapshot_id: Uuid::from_u128(101),
                 parent_checkpoint_event: None,
                 snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
             }),
         };
 

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -15,6 +15,9 @@ pub struct Event {
     pub signer_public_key: Option<String>,
     #[serde(default)]
     pub signature: Option<String>,
+    /// BLAKE3 hex hash of the previous event's serialized JSON (hash chain).
+    #[serde(default)]
+    pub prev_event_hash: Option<String>,
     pub kind: EventKind,
 }
 
@@ -36,6 +39,15 @@ pub enum EventKind {
     Rebase(RebaseEvent),
     ConflictResolution(ConflictResolutionEvent),
     Hook(HookEvent),
+    RemoteSync(RemoteSyncEvent),
+    Intelligence(IntelligenceEvent),
+}
+
+impl Event {
+    /// Human-readable name of this event's kind.
+    pub fn kind_name(&self) -> &'static str {
+        crate::ws_protocol::event_kind_name(&self.kind)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +59,10 @@ pub struct CheckpointEvent {
     pub parent_checkpoint_event: Option<Uuid>,
     #[serde(default)]
     pub snapshot_merkle_root: Option<String>,
+    #[serde(default)]
+    pub ai_intent: Option<String>,
+    #[serde(default)]
+    pub intent_confidence: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -346,6 +362,47 @@ pub struct HookEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteSyncEvent {
+    pub action: RemoteSyncAction,
+    pub roost_name: String,
+    pub roost_url: String,
+    pub success: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub event_count: usize,
+    #[serde(default)]
+    pub block_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RemoteSyncAction {
+    Push,
+    Pull,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntelligenceEvent {
+    pub action: IntelligenceAction,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+}
+
+impl Eq for IntelligenceEvent {}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IntelligenceAction {
+    Query,
+    IntentExtraction,
+    ConflictSuggestion,
+    ConfidenceCalculation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventRecord {
     pub schema_version: u32,
     pub event: Event,
@@ -367,6 +424,13 @@ struct EventSigningPayload<'a> {
     actor: &'a str,
     parent_id: Option<Uuid>,
     kind: &'a EventKind,
+}
+
+/// Compute a BLAKE3 hash of the event's serialized JSON (for hash chain).
+pub fn compute_event_hash(event: &Event) -> String {
+    let record = EventRecord::from_event(event);
+    let json = serde_json::to_string(&record).expect("event serialization should not fail");
+    blake3::hash(json.as_bytes()).to_hex().to_string()
 }
 
 pub fn event_signing_payload(event: &Event) -> Result<Vec<u8>> {
