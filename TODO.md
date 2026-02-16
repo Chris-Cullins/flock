@@ -71,8 +71,8 @@ This file tracks the full build-out from current scaffold to the complete archit
   - [x] `fl review <exploration>` summary mode
   - [x] `fl review --expand <n>` drill-down mode
   - [x] `fl review --full` line diff fallback
-- [ ] Add TUI views for exploration trees and task graph
-- [ ] Add shell completion and command help polish
+- [x] Add TUI views for exploration trees and task graph
+- [x] Add shell completion and command help polish
 
 ## 5. Explorations and Workspaces
 

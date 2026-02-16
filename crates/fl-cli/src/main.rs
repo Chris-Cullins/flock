@@ -1,13 +1,16 @@
+use std::collections::HashMap;
 use std::env;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{self, Shell};
 use fl_core::repo::parse_duration_spec;
 use fl_core::{
-    ApiCallRecord, DecisionAction, EventKind, GateCondition, GatePolicy, RefKind, Repo,
-    SemanticChangeKind, SemanticCompatibilityStatus, SemanticConflictClassification, SemanticRisk,
-    UndoRequest,
+    ApiCallRecord, DecisionAction, EventKind, ExplorationStatus, GateCondition, GatePolicy,
+    RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
+    SemanticConflictClassification, SemanticRisk, TaskRelation, TaskStatus, UndoRequest,
 };
 use uuid::Uuid;
 
@@ -20,31 +23,44 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Initialize a new Flock repository
     Init {
+        /// Use git-colocated mode (.git + .flock sidecar)
         #[arg(long)]
         colocated: bool,
+        /// Use native block-level storage
         #[arg(long)]
         native: bool,
     },
+    /// Create a checkpoint (commit equivalent)
     Checkpoint {
         #[arg(short = 'm', long = "message")]
         message: Option<String>,
     },
+    /// Show the event log
     Log,
+    /// Verify repository integrity
     Fsck,
+    /// Show semantic diff since last checkpoint
     Diff {
+        /// Enable semantic diff output
         #[arg(long)]
         semantic: bool,
+        /// Group changes by intent
         #[arg(long)]
         intent: bool,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
+    /// Analyze impact of changes to a path or symbol
     Impact {
         path: String,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
+    /// Preview semantic merge of three files
     Merge {
         #[arg(long)]
         dry_run: bool,
@@ -53,67 +69,89 @@ enum Command {
         base: String,
         left: String,
         right: String,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
+    /// Review an exploration's changes
     Review {
         id: String,
+        /// Expand detail for change #n
         #[arg(long)]
         expand: Option<usize>,
+        /// Show full line-level diff
         #[arg(long)]
         full: bool,
     },
+    /// Manage explorations (branching workflows)
     Explore {
         #[command(subcommand)]
         command: ExploreCommand,
     },
+    /// Undo events on the timeline
     Undo {
+        /// Undo last N events
         #[arg(long)]
         n: Option<usize>,
+        /// Undo to a specific event ID
         #[arg(long)]
         to: Option<String>,
+        /// Undo events newer than duration (e.g. 1h, 2d)
         #[arg(long)]
         since: Option<String>,
+        /// Scope undo to a single file
         #[arg(long = "file")]
         file: Option<String>,
     },
+    /// Git bridge operations (colocated mode)
     Git {
         #[command(subcommand)]
         command: GitCommand,
     },
+    /// Manage refs (branches, tags, workspaces)
     Refs {
         #[command(subcommand)]
         command: RefsCommand,
     },
+    /// Manage workspaces
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Agent session tracking and provenance
     Session {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Task graph management
     Task {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Show tasks ready to be claimed
     Ready {
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
+    /// Quick checkpoint for agents
     QuickSave {
         #[arg(long)]
         tag: Option<String>,
     },
+    /// Restore to last quick-save
     QuickRestore,
+    /// Multi-agent presence tracking
     Presence {
         #[command(subcommand)]
         command: PresenceCommand,
     },
+    /// Advisory resource locking
     Lock {
         #[command(subcommand)]
         command: LockCommand,
     },
+    /// Subscribe to changes on paths, symbols, or modules
     Subscribe {
         #[arg(long)]
         path: Vec<String>,
@@ -121,72 +159,90 @@ enum Command {
         symbol: Vec<String>,
         #[arg(long)]
         module: Vec<String>,
+        /// Notification method (log, webhook URL)
         #[arg(long)]
         notify: Option<String>,
     },
+    /// Cancel a subscription
     Unsubscribe {
         id: String,
     },
+    /// List active subscriptions
     Subscriptions {
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
+    /// Human-in-the-loop quality gates
     Gate {
         #[command(subcommand)]
         command: GateCommand,
     },
+    /// Migrate repository storage backend
     Migrate {
+        /// Migrate to native block-level storage
         #[arg(long)]
         native: bool,
+    },
+    /// Generate shell completions for bash, zsh, fish, or powershell
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum ExploreCommand {
+    /// Start a new exploration
     Start {
         #[arg(long)]
         title: String,
     },
+    /// List all explorations
     List,
-    Promote {
-        id: String,
-    },
-    Abandon {
-        id: String,
-    },
+    /// Promote an exploration to mainline
+    Promote { id: String },
+    /// Abandon an exploration
+    Abandon { id: String },
+    /// Compare two explorations (or one against mainline)
     Compare {
         left: String,
         right: Option<String>,
         #[arg(long)]
         json: bool,
     },
+    /// Prune old abandoned explorations
     Prune {
         #[arg(long, default_value = "7d")]
         older_than: String,
     },
+    /// Show visual exploration tree grouped by base checkpoint
+    Tree,
 }
 
 #[derive(Debug, Subcommand)]
 enum GitCommand {
+    /// Show shadow mode status and safety checks
     Status,
+    /// Create a git commit from current state
     Commit {
         #[arg(short = 'm', long = "message")]
         message: String,
     },
+    /// Push to a git remote
     Push {
         remote: Option<String>,
         branch: Option<String>,
     },
+    /// Pull from a git remote
     Pull {
         remote: Option<String>,
         branch: Option<String>,
     },
-    Import {
-        git_ref: Option<String>,
-    },
-    Export {
-        branch: Option<String>,
-    },
+    /// Import git history into Flock events
+    Import { git_ref: Option<String> },
+    /// Export Flock checkpoints to a git branch
+    Export { branch: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]
@@ -293,6 +349,7 @@ enum SessionCommand {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
+    /// Create a new task
     Create {
         title: String,
         #[arg(long)]
@@ -302,40 +359,49 @@ enum TaskCommand {
         #[arg(long = "discovered-from")]
         discovered_from: Option<String>,
     },
+    /// List tasks (open and claimed by default)
     List {
+        /// Include completed and failed tasks
         #[arg(long)]
         all: bool,
         #[arg(long)]
         json: bool,
     },
+    /// Show task details
     Show {
         id: String,
         #[arg(long)]
         json: bool,
     },
+    /// Claim a task for work
     Claim {
         id: String,
         #[arg(long)]
         assignee: Option<String>,
     },
+    /// Mark a task as completed
     Done {
         id: String,
         #[arg(long)]
         result: Option<String>,
     },
+    /// Mark a task as failed
     Fail {
         id: String,
         #[arg(long)]
         reason: String,
     },
+    /// Show task dependency graph as ASCII tree
     Graph {
         #[arg(long)]
         json: bool,
     },
+    /// Link events to a task
     Link {
         task_id: String,
         event_ids: Vec<String>,
     },
+    /// Compact old completed tasks
     Compact {
         #[arg(long, default_value = "7d")]
         older_than: String,
@@ -969,6 +1035,14 @@ fn main() -> Result<()> {
                         pruned,
                         if pruned == 1 { "" } else { "s" }
                     );
+                }
+                ExploreCommand::Tree => {
+                    let explorations = repo.list_explorations()?;
+                    if explorations.is_empty() {
+                        println!("No explorations.");
+                        return Ok(());
+                    }
+                    print_exploration_tree(&explorations);
                 }
             }
         }
@@ -1664,37 +1738,7 @@ fn main() -> Result<()> {
                         return Ok(());
                     }
 
-                    println!("Tasks ({}):", graph.tasks.len());
-                    for task in &graph.tasks {
-                        let marker = match task.status {
-                            fl_core::TaskStatus::Open => " ",
-                            fl_core::TaskStatus::Claimed => ">",
-                            fl_core::TaskStatus::Completed => "x",
-                            fl_core::TaskStatus::Failed => "!",
-                        };
-                        println!(
-                            "  [{}] {}  {}",
-                            marker,
-                            &task.id.to_string()[..8],
-                            task.title,
-                        );
-                    }
-
-                    if !graph.edges.is_empty() {
-                        println!("\nEdges:");
-                        for edge in &graph.edges {
-                            let relation = match edge.relation {
-                                fl_core::TaskRelation::DependsOn => "depends-on",
-                                fl_core::TaskRelation::DiscoveredFrom => "discovered-from",
-                            };
-                            println!(
-                                "  {} --{}--> {}",
-                                &edge.from_task.to_string()[..8],
-                                relation,
-                                &edge.to_task.to_string()[..8],
-                            );
-                        }
-                    }
+                    print_task_graph(&graph);
                 }
                 TaskCommand::Link { task_id, event_ids } => {
                     let tid = parse_uuid(&task_id)?;
@@ -2053,6 +2097,11 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "fl", &mut io::stdout());
+            io::stdout().flush()?;
+        }
     }
 
     Ok(())
@@ -2170,6 +2219,289 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn print_exploration_tree(explorations: &[fl_core::ExplorationSummary]) {
+    // Group by status
+    let mut active = Vec::new();
+    let mut promoted = Vec::new();
+    let mut abandoned = Vec::new();
+
+    for exp in explorations {
+        match exp.status {
+            ExplorationStatus::Active => active.push(exp),
+            ExplorationStatus::Promoted => promoted.push(exp),
+            ExplorationStatus::Abandoned => abandoned.push(exp),
+        }
+    }
+
+    println!(
+        "Explorations ({} total: {} active, {} promoted, {} abandoned)",
+        explorations.len(),
+        active.len(),
+        promoted.len(),
+        abandoned.len()
+    );
+    println!();
+
+    // Group explorations by base checkpoint to show tree structure
+    let mut by_base: HashMap<Option<Uuid>, Vec<&fl_core::ExplorationSummary>> = HashMap::new();
+    for exp in explorations {
+        by_base
+            .entry(exp.base_checkpoint_event)
+            .or_default()
+            .push(exp);
+    }
+
+    // Print tree rooted at each base checkpoint
+    let mut bases: Vec<_> = by_base.keys().copied().collect();
+    bases.sort_by_key(|b| b.map(|id| id.to_string()).unwrap_or_default());
+
+    for (base_idx, base) in bases.iter().enumerate() {
+        let base_label = base
+            .map(|id| format!("checkpoint {}", &id.to_string()[..8]))
+            .unwrap_or_else(|| "no base".to_string());
+        let is_last_base = base_idx == bases.len() - 1;
+        let base_prefix = if is_last_base { "└── " } else { "├── " };
+        let child_prefix = if is_last_base { "    " } else { "│   " };
+
+        println!("{}{}", base_prefix, base_label);
+
+        let children = &by_base[base];
+        for (i, exp) in children.iter().enumerate() {
+            let is_last = i == children.len() - 1;
+            let connector = if is_last { "└── " } else { "├── " };
+            let status_icon = match exp.status {
+                ExplorationStatus::Active => "*",
+                ExplorationStatus::Promoted => "^",
+                ExplorationStatus::Abandoned => "x",
+            };
+            println!(
+                "{}{}[{}] {} ({})",
+                child_prefix,
+                connector,
+                status_icon,
+                exp.title,
+                &exp.id.to_string()[..8]
+            );
+        }
+    }
+
+    println!();
+    println!("Legend: [*] active  [^] promoted  [x] abandoned");
+}
+
+fn print_task_graph(graph: &fl_core::TaskGraph) {
+    // Build adjacency: for each task, find what it depends on and what depends on it
+    let task_map: HashMap<Uuid, &fl_core::TaskSummary> =
+        graph.tasks.iter().map(|t| (t.id, t)).collect();
+
+    // Find root tasks (no dependencies)
+    let roots: Vec<&fl_core::TaskSummary> = graph
+        .tasks
+        .iter()
+        .filter(|t| t.dependencies.is_empty() && t.discovered_from.is_none())
+        .collect();
+
+    // Build children map from edges
+    let mut children_map: HashMap<Uuid, Vec<(Uuid, &TaskRelation)>> = HashMap::new();
+    for edge in &graph.edges {
+        children_map
+            .entry(edge.to_task)
+            .or_default()
+            .push((edge.from_task, &edge.relation));
+    }
+
+    let status_counts = graph.tasks.iter().fold([0u32; 4], |mut acc, t| {
+        match t.status {
+            TaskStatus::Open => acc[0] += 1,
+            TaskStatus::Claimed => acc[1] += 1,
+            TaskStatus::Completed => acc[2] += 1,
+            TaskStatus::Failed => acc[3] += 1,
+        }
+        acc
+    });
+    println!(
+        "Task Graph ({} total: {} open, {} claimed, {} completed, {} failed)",
+        graph.tasks.len(),
+        status_counts[0],
+        status_counts[1],
+        status_counts[2],
+        status_counts[3]
+    );
+    println!();
+
+    if roots.is_empty() {
+        // No clear roots, just list all tasks with markers
+        for task in &graph.tasks {
+            print_task_node(task, "", true, &children_map, &task_map, &mut Vec::new());
+        }
+    } else {
+        for (i, root) in roots.iter().enumerate() {
+            let is_last = i == roots.len() - 1;
+            print_task_node(root, "", is_last, &children_map, &task_map, &mut Vec::new());
+        }
+
+        // Print orphans (tasks that aren't reachable from roots but aren't roots themselves)
+        let mut printed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        collect_reachable(&roots, &children_map, &mut printed);
+        let orphans: Vec<_> = graph
+            .tasks
+            .iter()
+            .filter(|t| !printed.contains(&t.id))
+            .collect();
+        if !orphans.is_empty() {
+            println!();
+            println!("Unlinked tasks:");
+            for (i, task) in orphans.iter().enumerate() {
+                let is_last = i == orphans.len() - 1;
+                print_task_node(task, "", is_last, &children_map, &task_map, &mut Vec::new());
+            }
+        }
+    }
+
+    println!();
+    println!("Legend: [ ] open  [>] claimed  [x] completed  [!] failed");
+    println!("Edges:  ── depends-on  ~~ discovered-from");
+}
+
+fn collect_reachable(
+    roots: &[&fl_core::TaskSummary],
+    children_map: &HashMap<Uuid, Vec<(Uuid, &TaskRelation)>>,
+    visited: &mut std::collections::HashSet<Uuid>,
+) {
+    for root in roots {
+        if visited.insert(root.id) {
+            if let Some(children) = children_map.get(&root.id) {
+                // We don't have the task objects for children, just mark IDs
+                for (child_id, _) in children {
+                    visited.insert(*child_id);
+                }
+            }
+        }
+    }
+}
+
+fn print_task_node(
+    task: &fl_core::TaskSummary,
+    prefix: &str,
+    is_last: bool,
+    children_map: &HashMap<Uuid, Vec<(Uuid, &TaskRelation)>>,
+    task_map: &HashMap<Uuid, &fl_core::TaskSummary>,
+    visited: &mut Vec<Uuid>,
+) {
+    // Prevent cycles
+    if visited.contains(&task.id) {
+        return;
+    }
+    visited.push(task.id);
+
+    let connector = if prefix.is_empty() && is_last && visited.len() <= 1 {
+        ""
+    } else if is_last {
+        "└── "
+    } else {
+        "├── "
+    };
+
+    let marker = match task.status {
+        TaskStatus::Open => " ",
+        TaskStatus::Claimed => ">",
+        TaskStatus::Completed => "x",
+        TaskStatus::Failed => "!",
+    };
+
+    let assignee_str = task
+        .assignee
+        .as_deref()
+        .map(|a| format!(" @{}", a))
+        .unwrap_or_default();
+
+    println!(
+        "{}{}[{}] {} ({}){}",
+        prefix,
+        connector,
+        marker,
+        task.title,
+        &task.id.to_string()[..8],
+        assignee_str
+    );
+
+    // Print children
+    if let Some(children) = children_map.get(&task.id) {
+        let child_prefix = if prefix.is_empty() && connector.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{}{}",
+                prefix,
+                if is_last { "    " } else { "│   " }
+            )
+        };
+
+        for (i, (child_id, relation)) in children.iter().enumerate() {
+            let is_last_child = i == children.len() - 1;
+            let edge_symbol = match relation {
+                TaskRelation::DependsOn => "──",
+                TaskRelation::DiscoveredFrom => "~~",
+            };
+
+            if let Some(child_task) = task_map.get(child_id) {
+                let child_connector = if is_last_child {
+                    format!("└{} ", edge_symbol)
+                } else {
+                    format!("├{} ", edge_symbol)
+                };
+
+                let child_marker = match child_task.status {
+                    TaskStatus::Open => " ",
+                    TaskStatus::Claimed => ">",
+                    TaskStatus::Completed => "x",
+                    TaskStatus::Failed => "!",
+                };
+
+                let child_assignee = child_task
+                    .assignee
+                    .as_deref()
+                    .map(|a| format!(" @{}", a))
+                    .unwrap_or_default();
+
+                println!(
+                    "{}{}[{}] {} ({}){}",
+                    child_prefix,
+                    child_connector,
+                    child_marker,
+                    child_task.title,
+                    &child_task.id.to_string()[..8],
+                    child_assignee
+                );
+
+                // Recurse into grandchildren
+                if children_map.contains_key(child_id) {
+                    let grandchild_prefix = format!(
+                        "{}{}",
+                        child_prefix,
+                        if is_last_child { "    " } else { "│   " }
+                    );
+                    if let Some(grandchildren) = children_map.get(child_id) {
+                        for (j, (gc_id, _gc_rel)) in grandchildren.iter().enumerate() {
+                            let is_last_gc = j == grandchildren.len() - 1;
+                            if let Some(gc_task) = task_map.get(gc_id) {
+                                print_task_node(
+                                    gc_task,
+                                    &grandchild_prefix,
+                                    is_last_gc,
+                                    children_map,
+                                    task_map,
+                                    visited,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
