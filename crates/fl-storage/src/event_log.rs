@@ -66,6 +66,12 @@ impl EventLog {
         Ok(events)
     }
 
+    /// Return the ID of the last event in the log, or `None` if empty.
+    /// Used by `AutoEventLog` to resolve `parent_id` under the lock.
+    pub fn latest_event_id(&self) -> Result<Option<Uuid>> {
+        Ok(self.read_all()?.last().map(|e| e.id))
+    }
+
     pub fn append(&self, event: &Event) -> Result<()> {
         self.ensure_exists()?;
         let existing = self.read_all()?;

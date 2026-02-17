@@ -65,14 +65,32 @@ impl AutoEventLog {
         }
     }
 
-    /// Append a single event. If using monolithic format, checks size threshold
-    /// after append and migrates to segmented if exceeded.
+    /// Append a single event. Resolves `parent_id` atomically under the lock
+    /// to prevent concurrent writers from creating broken causal chains.
+    ///
+    /// The `finalize` callback is invoked after `parent_id` is set but before
+    /// the event is written, allowing the caller to re-sign the event with
+    /// the correct parent.
     ///
     /// Acquires an exclusive filesystem lock to prevent corruption from
     /// concurrent writers.
-    pub fn append(&self, event: &Event) -> Result<()> {
+    pub fn append(
+        &self,
+        event: &mut Event,
+        finalize: impl FnOnce(&mut Event) -> Result<()>,
+    ) -> Result<()> {
         let _lock = FileLock::acquire(&LockPaths::event_log(&self.root))
             .context("failed to acquire event log lock")?;
+
+        // Resolve parent_id under the lock so concurrent writers always see
+        // the true latest event, not a stale snapshot from before the lock.
+        let latest_id = if self.use_segmented() {
+            self.segmented().latest_event_id()?
+        } else {
+            self.monolithic().latest_event_id()?
+        };
+        event.parent_id = latest_id;
+        finalize(event)?;
 
         if self.use_segmented() {
             return self.segmented().append(event);

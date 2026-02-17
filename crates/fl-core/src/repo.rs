@@ -5570,19 +5570,27 @@ impl Repo {
 
     fn append_event(&self, kind: EventKind) -> Result<Event> {
         self.ensure_signing_key()?;
+        let signing_key = self.load_signing_key()?;
 
         let mut event = Event {
             id: Uuid::new_v4(),
             timestamp: unix_timestamp_nanos()?,
             actor: current_actor(),
-            parent_id: self.latest_event_id()?,
+            parent_id: None, // resolved atomically under lock by AutoEventLog::append
             signer_public_key: None,
             signature: None,
             prev_event_hash: None,
             kind,
         };
-        self.sign_event(&mut event)?;
-        AutoEventLog::for_root(self.root()).append(&event)?;
+        // Signing happens inside the lock (via finalize callback) because
+        // parent_id is part of the signing payload and is set under the lock.
+        AutoEventLog::for_root(self.root()).append(&mut event, |ev| {
+            let payload = fl_storage::event_signing_payload(ev)?;
+            let signature = signing_key.sign(&payload);
+            ev.signer_public_key = Some(hex::encode(signing_key.verifying_key().to_bytes()));
+            ev.signature = Some(hex::encode(signature.to_bytes()));
+            Ok(())
+        })?;
 
         // Auto-materialize state at regular intervals for faster future replay
         self.maybe_auto_materialize();
@@ -5627,10 +5635,6 @@ impl Repo {
         };
 
         let _ = store.save(count, &json);
-    }
-
-    fn latest_event_id(&self) -> Result<Option<Uuid>> {
-        Ok(self.list_events()?.last().map(|event| event.id))
     }
 
     fn latest_checkpoint(&self) -> Option<Event> {

@@ -110,6 +110,48 @@ impl SegmentedEventLog {
             }
         }
 
+        // Validate causal chain: each event's parent_id must match the
+        // previous event's id.
+        let mut prev_id: Option<Uuid> = None;
+        for event in &events {
+            match (prev_id, event.parent_id) {
+                (None, None) => {}
+                (None, Some(parent)) => bail!(
+                    "invalid causal chain: first event {} points to parent {}",
+                    event.id, parent
+                ),
+                (Some(expected), Some(parent)) if parent == expected => {}
+                (Some(expected), Some(parent)) => bail!(
+                    "invalid causal chain: event {} points to {}, expected {}",
+                    event.id, parent, expected
+                ),
+                (Some(expected), None) => bail!(
+                    "invalid causal chain: event {} is missing parent pointer (expected {})",
+                    event.id, expected
+                ),
+            }
+            prev_id = Some(event.id);
+        }
+
+        // Validate hash chain integrity.
+        let mut prev_hash: Option<String> = None;
+        for event in &events {
+            if let Some(ref expected_hash) = event.prev_event_hash {
+                match &prev_hash {
+                    Some(actual) if actual == expected_hash => {}
+                    Some(actual) => bail!(
+                        "hash chain broken at event {}: expected {}, got {}",
+                        event.id, expected_hash, actual
+                    ),
+                    None => bail!(
+                        "hash chain broken at event {}: has prev_event_hash but is the first event",
+                        event.id
+                    ),
+                }
+            }
+            prev_hash = Some(compute_event_hash(event));
+        }
+
         Ok(events)
     }
 
@@ -149,6 +191,15 @@ impl SegmentedEventLog {
         }
 
         Ok(events)
+    }
+
+    /// Return the ID of the last event via the index (O(1)), or `None` if empty.
+    pub fn latest_event_id(&self) -> Result<Option<Uuid>> {
+        let index = self.read_index()?;
+        match index.last_event_id {
+            Some(id_str) => Ok(Some(id_str.parse().context("invalid UUID in segmented index")?)),
+            None => Ok(None),
+        }
     }
 
     /// Append an event. Validates parent chain via index (O(1)).
@@ -381,6 +432,32 @@ mod tests {
         let events = log.read_from(1).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].id, e2.id);
+    }
+
+    #[test]
+    fn read_all_detects_broken_causal_chain() {
+        let dir = tempdir().unwrap();
+        let log = SegmentedEventLog::for_root(dir.path());
+        log.ensure_exists().unwrap();
+
+        // Write two valid events
+        let e1 = make_event(1, None);
+        let e2 = make_event(2, Some(e1.id));
+        log.append(&e1).unwrap();
+        log.append(&e2).unwrap();
+
+        // Manually append a broken event (wrong parent) directly to the
+        // segment file, bypassing validation in append().
+        let e3_broken = make_event(3, Some(Uuid::from_u128(999)));
+        let seg_path = log.segment_path(0);
+        let record = EventRecord::from_event(&e3_broken);
+        let line = serde_json::to_string(&record).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&seg_path).unwrap();
+        writeln!(file, "{}", line).unwrap();
+
+        let err = log.read_all().expect_err("should detect broken chain");
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid causal chain"), "unexpected error: {}", msg);
     }
 
     #[test]
