@@ -169,6 +169,7 @@ mod tests {
             category: None,
             scope_label: None,
             structured_description: None,
+            git_commit_sha: None,
         }));
         let session = make_event(2, Some(cp.id), "1000000000000000001", EventKind::Session(SessionEvent {
             session_id: Uuid::from_u128(200),
@@ -212,6 +213,7 @@ mod tests {
             category: None,
             scope_label: None,
             structured_description: None,
+            git_commit_sha: None,
         }));
 
         write_events_to_log(dir.path(), &[old_cp]);

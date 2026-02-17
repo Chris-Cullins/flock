@@ -104,6 +104,11 @@ pub struct CheckpointEvent {
     pub scope_label: Option<String>,
     #[serde(default)]
     pub structured_description: Option<String>,
+    /// Git commit SHA for this checkpoint (colocated mode).
+    /// When present, the snapshot can be lazily extracted from git
+    /// instead of requiring a physical `.flock/snapshots/<uuid>/` directory.
+    #[serde(default)]
+    pub git_commit_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

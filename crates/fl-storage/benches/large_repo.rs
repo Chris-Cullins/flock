@@ -35,6 +35,11 @@ fn make_checkpoint_event(seq: u128, parent: Option<Uuid>) -> Event {
             snapshot_merkle_root: Some("0".repeat(64)),
             ai_intent: None,
             intent_confidence: None,
+            files_changed: None,
+            category: None,
+            scope_label: None,
+            structured_description: None,
+            git_commit_sha: None,
         }),
     };
     sign_event(&mut event);

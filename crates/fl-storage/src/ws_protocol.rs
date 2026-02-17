@@ -218,6 +218,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         }
     }

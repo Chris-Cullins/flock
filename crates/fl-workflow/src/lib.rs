@@ -1117,6 +1117,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let exploration_start = make_event(
@@ -1170,6 +1171,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let cp2 = make_event(
@@ -1187,6 +1189,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let restored = make_event(
@@ -1204,6 +1207,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let undo = make_event(
@@ -1242,6 +1246,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let cp2 = make_event(
@@ -1259,6 +1264,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
 
@@ -1285,6 +1291,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let cp2 = make_event(
@@ -1302,6 +1309,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let exploration_start = make_event(
@@ -1329,6 +1337,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let undo = make_event(
@@ -2163,6 +2172,7 @@ mod tests {
                 category: None,
                 scope_label: None,
                 structured_description: None,
+                git_commit_sha: None,
             }),
         );
         let exploration_start = make_event(
