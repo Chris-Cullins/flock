@@ -8067,6 +8067,21 @@ impl Repo {
             }
         }
 
+        // Re-parent the first pulled event if our local log has diverged due
+        // to local-only events (e.g. RemoteSync from a previous pull/push).
+        // The first event's parent_id points to the remote's chain, but our
+        // local tail may be a RemoteSync event. Re-parent and re-sign so the
+        // causal chain stays valid locally.
+        let local_tail = AutoEventLog::for_root(self.root()).latest_event_id()?;
+        if let (Some(first_event), Some(local_tail_id)) =
+            (events_to_append.first_mut(), local_tail)
+        {
+            if first_event.parent_id != Some(local_tail_id) {
+                first_event.parent_id = Some(local_tail_id);
+                self.sign_event(first_event)?;
+            }
+        }
+
         // Append pulled events.
         AutoEventLog::for_root(self.root()).append_batch(&events_to_append)?;
 

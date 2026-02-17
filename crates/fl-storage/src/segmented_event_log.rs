@@ -193,6 +193,85 @@ impl SegmentedEventLog {
         Ok(events)
     }
 
+    /// Append a batch of events from a remote pull.
+    ///
+    /// The first event's `parent_id` may not match the local log's tail because
+    /// local-only events (e.g. RemoteSync) may have been appended after the
+    /// last synced event. The internal chain of pulled events is still validated.
+    pub fn append_batch_for_pull(&self, events: &[Event]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Validate internal chain of pulled events (skip first event's parent check).
+        let mut prev_id: Option<Uuid> = None;
+        for (i, event) in events.iter().enumerate() {
+            if i > 0 {
+                match (prev_id, event.parent_id) {
+                    (Some(expected), Some(parent)) if parent == expected => {}
+                    (Some(expected), Some(parent)) => bail!(
+                        "invalid causal chain in pulled events: event {} points to {}, expected {}",
+                        event.id, parent, expected
+                    ),
+                    (Some(expected), None) => bail!(
+                        "invalid causal chain in pulled events: event {} is missing parent (expected {})",
+                        event.id, expected
+                    ),
+                    _ => {}
+                }
+            }
+            prev_id = Some(event.id);
+        }
+
+        // Append each event, skipping parent_id validation against local tail.
+        for event in events {
+            self.append_relaxed(event)?;
+        }
+        Ok(())
+    }
+
+    /// Append a single event without validating parent_id against the local
+    /// log's last event. Used during pull when local-only events create a gap.
+    fn append_relaxed(&self, event: &Event) -> Result<()> {
+        let mut index = self.read_index()?;
+
+        // Determine which segment to write to
+        let segment_num = (index.event_count / SEGMENT_SIZE) as u32;
+        let line_num = (index.event_count % SEGMENT_SIZE) as u32;
+
+        // Create new segment if needed
+        if segment_num >= index.segment_count {
+            index.segment_count = segment_num + 1;
+        }
+
+        // Set hash chain link
+        let mut event = event.clone();
+        event.prev_event_hash = index.last_event_hash.clone();
+
+        // Write event to segment file
+        let seg_path = self.segment_path(segment_num);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&seg_path)
+            .with_context(|| format!("failed to open segment {} for append", seg_path.display()))?;
+
+        let record = EventRecord::from_event(&event);
+        let line = serde_json::to_string(&record).context("failed to serialize event")?;
+        writeln!(file, "{}", line).context("failed to append event to segment")?;
+
+        // Update index
+        index.event_count += 1;
+        index.last_event_id = Some(event.id.to_string());
+        index.last_event_hash = Some(compute_event_hash(&event));
+        if line_num == 0 && segment_num > 0 {
+            // New segment boundary
+        }
+        self.write_index(&index)?;
+
+        Ok(())
+    }
+
     /// Return the ID of the last event via the index (O(1)), or `None` if empty.
     pub fn latest_event_id(&self) -> Result<Option<Uuid>> {
         let index = self.read_index()?;

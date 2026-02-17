@@ -135,8 +135,12 @@ impl EventLog {
         Ok(())
     }
 
-    /// Append a batch of events from a remote pull. Signatures are not
-    /// required — graft events from shallow clones may have their signature
+    /// Append a batch of events from a remote pull.
+    ///
+    /// Relaxed validation: the first event's `parent_id` may not match the
+    /// local log's tail because local-only events (e.g. RemoteSync) may exist.
+    /// The internal chain of pulled events is still validated. Signatures are
+    /// not required — graft events from shallow clones may have their signature
     /// stripped when the parent_id is cleared.
     pub fn append_batch_from_pull(&self, events: &[Event]) -> Result<()> {
         if events.is_empty() {
@@ -145,11 +149,14 @@ impl EventLog {
         self.ensure_exists()?;
 
         let existing = self.read_all()?;
-        let mut expected_parent = existing.last().map(|e| e.id);
 
-        // Pre-validate with relaxed signature checking.
-        for event in events {
-            validate_next_parent(event, expected_parent)?;
+        // Validate internal chain of pulled events (skip first event's parent
+        // check against local tail — it may diverge due to local-only events).
+        let mut expected_parent: Option<Uuid> = None;
+        for (i, event) in events.iter().enumerate() {
+            if i > 0 {
+                validate_next_parent(event, expected_parent)?;
+            }
             verify_event_signature(event, false)?; // signatures optional
             verify_checkpoint_merkle_root(event, true)?;
             expected_parent = Some(event.id);

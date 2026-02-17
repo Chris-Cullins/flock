@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use uuid::Uuid;
+
 use crate::event::Event;
 use crate::event_log::EventLog;
 use crate::event_log_migration::migrate_to_segmented;
@@ -53,6 +55,15 @@ impl AutoEventLog {
             self.segmented().ensure_exists()
         } else {
             self.monolithic().ensure_exists()
+        }
+    }
+
+    /// Return the ID of the last event, or `None` if the log is empty.
+    pub fn latest_event_id(&self) -> Result<Option<Uuid>> {
+        if self.use_segmented() {
+            self.segmented().latest_event_id()
+        } else {
+            self.monolithic().latest_event_id()
         }
     }
 
@@ -118,6 +129,24 @@ impl AutoEventLog {
         }
 
         self.monolithic().append_batch(events)?;
+        self.maybe_migrate_event_log()?;
+        Ok(())
+    }
+
+    /// Append a batch of events from a remote pull.
+    ///
+    /// The first event's `parent_id` may not match the local log's tail because
+    /// local-only events (e.g. RemoteSync) may have been appended since the
+    /// last synced event. Internal chain of pulled events is still validated.
+    pub fn append_batch_for_pull(&self, events: &[Event]) -> Result<()> {
+        let _lock = FileLock::acquire(&LockPaths::event_log(&self.root))
+            .context("failed to acquire event log lock")?;
+
+        if self.use_segmented() {
+            return self.segmented().append_batch_for_pull(events);
+        }
+
+        self.monolithic().append_batch_from_pull(events)?;
         self.maybe_migrate_event_log()?;
         Ok(())
     }
