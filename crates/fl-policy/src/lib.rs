@@ -31,6 +31,7 @@ pub enum PolicyCategory {
     TestRequirement,
     ArchitectureRule,
     AntiPattern,
+    DuplicationReuse,
 }
 
 /// The operation being checked.
@@ -1259,6 +1260,284 @@ pub fn check_anti_patterns(
 }
 
 // ---------------------------------------------------------------------------
+// DRY / Duplication prevention types (12.5e)
+// ---------------------------------------------------------------------------
+
+/// Enforcement level for reuse / duplication prevention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReuseEnforce {
+    Block,
+    Gate,
+    Warn,
+}
+
+impl Default for ReuseEnforce {
+    fn default() -> Self {
+        Self::Gate
+    }
+}
+
+/// Which duplication detection layer matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DuplicationLayer {
+    /// Layer 1: Parameter types, return type, name similarity.
+    Signature,
+    /// Layer 2: AST structural comparison of method bodies.
+    Body,
+    /// Layer 3: New code should implement existing interfaces/patterns.
+    Pattern,
+}
+
+/// A protected domain with stricter enforcement thresholds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProtectedDomain {
+    /// Glob pattern for files in this domain.
+    pub file_pattern: String,
+    /// Override similarity threshold for this domain (lower = stricter).
+    pub similarity_threshold: f64,
+}
+
+/// Top-level reuse / duplication prevention config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReusePolicy {
+    pub enabled: bool,
+    pub enforce: ReuseEnforce,
+    /// Similarity threshold (0.0--1.0). Matches above this are flagged.
+    pub similarity_threshold: f64,
+    /// Enable Layer 1: signature matching.
+    pub check_signatures: bool,
+    /// Enable Layer 2: body structural comparison.
+    pub check_bodies: bool,
+    /// Enable Layer 3: pattern/interface conformance.
+    pub check_patterns: bool,
+    /// Domains where stricter thresholds apply.
+    pub protected_domains: Vec<ProtectedDomain>,
+}
+
+impl Default for ReusePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            enforce: ReuseEnforce::default(),
+            similarity_threshold: 0.8,
+            check_signatures: true,
+            check_bodies: true,
+            check_patterns: true,
+            protected_domains: Vec::new(),
+        }
+    }
+}
+
+/// A detected duplication match between a new symbol and an existing one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicationMatch {
+    /// Fully-qualified name of the new symbol (e.g. "function:processPayment").
+    pub new_symbol: String,
+    /// File containing the new symbol.
+    pub new_file: String,
+    /// Fully-qualified name of the existing symbol it duplicates.
+    pub existing_symbol: String,
+    /// File containing the existing symbol.
+    pub existing_file: String,
+    /// How similar the two symbols are (0.0--1.0).
+    pub similarity: f64,
+    /// Which detection layer found this match.
+    pub layer: DuplicationLayer,
+    /// Human-readable suggestion for reusing the existing code.
+    pub reuse_suggestion: String,
+}
+
+/// Check new symbols against existing symbols for duplication.
+///
+/// `matches` should be pre-computed by the caller using signature matching,
+/// body hash comparison, and pattern conformance checks.
+pub fn check_reuse_policy(
+    config: &ReusePolicy,
+    matches: &[DuplicationMatch],
+) -> PolicyDecision {
+    if !config.enabled {
+        return PolicyDecision {
+            policy_name: "reuse".to_string(),
+            category: PolicyCategory::DuplicationReuse,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::Checkpoint,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    if matches.is_empty() {
+        return PolicyDecision {
+            policy_name: "reuse".to_string(),
+            category: PolicyCategory::DuplicationReuse,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::Checkpoint,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut affected: Vec<String> = Vec::new();
+    let mut suggestions: Vec<String> = Vec::new();
+
+    for m in matches {
+        let layer_label = match m.layer {
+            DuplicationLayer::Signature => "signature",
+            DuplicationLayer::Body => "body",
+            DuplicationLayer::Pattern => "pattern",
+        };
+        violations.push(format!(
+            "{}: {} is {:.0}% similar to {} in {} ({} match)",
+            m.new_file,
+            m.new_symbol,
+            m.similarity * 100.0,
+            m.existing_symbol,
+            m.existing_file,
+            layer_label,
+        ));
+        if !affected.contains(&m.new_file) {
+            affected.push(m.new_file.clone());
+        }
+        if !m.reuse_suggestion.is_empty() {
+            suggestions.push(format!(
+                "[{}] {}",
+                m.new_symbol, m.reuse_suggestion
+            ));
+        }
+    }
+
+    let reason = format!(
+        "{} potential duplication(s) detected:\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+
+    let fix = if suggestions.is_empty() {
+        "Consider reusing existing code instead of duplicating functionality".to_string()
+    } else {
+        suggestions.join("\n")
+    };
+
+    let verdict = match config.enforce {
+        ReuseEnforce::Block => PolicyVerdict::Block {
+            reason,
+            fix_suggestion: Some(fix),
+        },
+        ReuseEnforce::Gate => PolicyVerdict::Gate {
+            reason,
+            justification_required: true,
+        },
+        ReuseEnforce::Warn => PolicyVerdict::Allow,
+    };
+
+    PolicyDecision {
+        policy_name: "reuse".to_string(),
+        category: PolicyCategory::DuplicationReuse,
+        verdict,
+        operation: PolicyOperation::Checkpoint,
+        actor: String::new(),
+        task_id: None,
+        exploration_id: None,
+        affected_files: affected,
+        escalation_context: None,
+    }
+}
+
+/// Compute name similarity using normalized Levenshtein distance.
+pub fn name_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let max_len = a.len().max(b.len());
+    let distance = levenshtein_distance(a, b);
+    1.0 - (distance as f64 / max_len as f64)
+}
+
+/// Compute signature similarity between two callable signatures.
+///
+/// Compares parameter count, parameter types, and return types.
+/// Returns a similarity score from 0.0 to 1.0.
+pub fn signature_similarity(
+    a: &(Vec<(Option<String>, bool)>, Option<String>), // (params: [(type, optional)], return_type)
+    b: &(Vec<(Option<String>, bool)>, Option<String>),
+) -> f64 {
+    let mut score = 0.0;
+    let mut total = 0.0;
+
+    // Parameter count similarity.
+    let max_params = a.0.len().max(b.0.len());
+    if max_params == 0 {
+        score += 1.0;
+    } else {
+        let min_params = a.0.len().min(b.0.len());
+        score += min_params as f64 / max_params as f64;
+    }
+    total += 1.0;
+
+    // Parameter type matching (positional).
+    let pairs = a.0.len().min(b.0.len());
+    if pairs > 0 {
+        let mut type_matches = 0.0;
+        for i in 0..pairs {
+            match (&a.0[i].0, &b.0[i].0) {
+                (Some(ta), Some(tb)) if ta == tb => type_matches += 1.0,
+                (Some(ta), Some(tb)) => type_matches += name_similarity(ta, tb) * 0.5,
+                (None, None) => type_matches += 0.5, // both untyped
+                _ => {}
+            }
+        }
+        score += type_matches / max_params as f64;
+    } else if max_params == 0 {
+        score += 1.0; // both have zero params — fully matching
+    }
+    total += 1.0;
+
+    // Return type matching.
+    match (&a.1, &b.1) {
+        (Some(ra), Some(rb)) if ra == rb => score += 1.0,
+        (Some(ra), Some(rb)) => score += name_similarity(ra, rb) * 0.5,
+        (None, None) => score += 0.5,
+        _ => {}
+    }
+    total += 1.0;
+
+    score / total
+}
+
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let m = a_chars.len();
+    let n = b_chars.len();
+
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0; n + 1];
+
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[n]
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2064,5 +2343,148 @@ mod tests {
         )];
         let decision = check_anti_patterns(&config, &files);
         assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    // --- Reuse / duplication prevention tests ---
+
+    #[test]
+    fn reuse_disabled_allows() {
+        let config = ReusePolicy::default(); // enabled: false
+        let matches = vec![DuplicationMatch {
+            new_symbol: "function:foo".to_string(),
+            new_file: "src/a.rs".to_string(),
+            existing_symbol: "function:foo".to_string(),
+            existing_file: "src/b.rs".to_string(),
+            similarity: 0.95,
+            layer: DuplicationLayer::Body,
+            reuse_suggestion: "Import foo from src/b.rs".to_string(),
+        }];
+        let decision = check_reuse_policy(&config, &matches);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn reuse_no_matches_allows() {
+        let config = ReusePolicy {
+            enabled: true,
+            ..ReusePolicy::default()
+        };
+        let decision = check_reuse_policy(&config, &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn reuse_match_blocks() {
+        let config = ReusePolicy {
+            enabled: true,
+            enforce: ReuseEnforce::Block,
+            ..ReusePolicy::default()
+        };
+        let matches = vec![DuplicationMatch {
+            new_symbol: "function:processPayment".to_string(),
+            new_file: "src/checkout.rs".to_string(),
+            existing_symbol: "function:handlePayment".to_string(),
+            existing_file: "src/billing.rs".to_string(),
+            similarity: 0.85,
+            layer: DuplicationLayer::Signature,
+            reuse_suggestion: "Reuse handlePayment from src/billing.rs".to_string(),
+        }];
+        let decision = check_reuse_policy(&config, &matches);
+        assert!(decision.is_blocked());
+        assert_eq!(decision.affected_files, vec!["src/checkout.rs"]);
+    }
+
+    #[test]
+    fn reuse_match_gates() {
+        let config = ReusePolicy {
+            enabled: true,
+            enforce: ReuseEnforce::Gate,
+            ..ReusePolicy::default()
+        };
+        let matches = vec![DuplicationMatch {
+            new_symbol: "function:calc".to_string(),
+            new_file: "src/new.rs".to_string(),
+            existing_symbol: "function:calculate".to_string(),
+            existing_file: "src/old.rs".to_string(),
+            similarity: 0.90,
+            layer: DuplicationLayer::Body,
+            reuse_suggestion: String::new(),
+        }];
+        let decision = check_reuse_policy(&config, &matches);
+        assert!(decision.is_gated());
+    }
+
+    #[test]
+    fn reuse_match_warns_allows() {
+        let config = ReusePolicy {
+            enabled: true,
+            enforce: ReuseEnforce::Warn,
+            ..ReusePolicy::default()
+        };
+        let matches = vec![DuplicationMatch {
+            new_symbol: "function:foo".to_string(),
+            new_file: "src/a.rs".to_string(),
+            existing_symbol: "function:bar".to_string(),
+            existing_file: "src/b.rs".to_string(),
+            similarity: 0.95,
+            layer: DuplicationLayer::Pattern,
+            reuse_suggestion: "Use trait Bar".to_string(),
+        }];
+        let decision = check_reuse_policy(&config, &matches);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn name_similarity_identical() {
+        assert_eq!(name_similarity("processPayment", "processPayment"), 1.0);
+    }
+
+    #[test]
+    fn name_similarity_similar() {
+        let sim = name_similarity("processPayment", "handlePayment");
+        assert!(sim >= 0.4 && sim < 1.0, "similarity was {}", sim);
+    }
+
+    #[test]
+    fn name_similarity_different() {
+        let sim = name_similarity("processPayment", "renderDashboard");
+        assert!(sim < 0.5, "similarity was {}", sim);
+    }
+
+    #[test]
+    fn name_similarity_empty() {
+        assert_eq!(name_similarity("", "anything"), 0.0);
+        assert_eq!(name_similarity("anything", ""), 0.0);
+    }
+
+    #[test]
+    fn signature_similarity_identical() {
+        let sig_a = (
+            vec![(Some("String".to_string()), false), (Some("i32".to_string()), false)],
+            Some("bool".to_string()),
+        );
+        let sig_b = sig_a.clone();
+        assert!((signature_similarity(&sig_a, &sig_b) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn signature_similarity_different_types() {
+        let sig_a = (
+            vec![(Some("String".to_string()), false)],
+            Some("bool".to_string()),
+        );
+        let sig_b = (
+            vec![(Some("i32".to_string()), false)],
+            Some("Result".to_string()),
+        );
+        let sim = signature_similarity(&sig_a, &sig_b);
+        assert!(sim < 0.8, "similarity was {}", sim);
+    }
+
+    #[test]
+    fn signature_similarity_no_params() {
+        let sig_a: (Vec<(Option<String>, bool)>, Option<String>) = (vec![], Some("String".to_string()));
+        let sig_b: (Vec<(Option<String>, bool)>, Option<String>) = (vec![], Some("String".to_string()));
+        assert!((signature_similarity(&sig_a, &sig_b) - 1.0).abs() < 0.01);
     }
 }

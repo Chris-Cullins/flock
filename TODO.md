@@ -352,11 +352,11 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 - [x] Configuration: `[commit_hygiene] require_category`, `require_scope`, `require_confidence`, `max_time_between_checkpoints`
 
 ### 12.5e. DRY / Duplication Prevention
-- [ ] Layer 1: Signature matching — compare new methods against existing symbol table by return type, parameter types, name similarity
-- [ ] Layer 2: Body analysis — AST structural comparison of method bodies
-- [ ] Layer 3: Pattern conformance — detect when new code should implement existing interfaces/patterns
-- [ ] Proactive reuse suggestions — surface relevant existing code when agent claims a task
-- [ ] Protected domains — stricter enforcement for sensitive areas (financial calculations, compliance)
+- [x] Layer 1: Signature matching — compare new methods against existing symbol table by return type, parameter types, name similarity
+- [x] Layer 2: Body analysis — AST structural comparison of method bodies
+- [x] Layer 3: Pattern conformance — detect when new code should implement existing interfaces/patterns
+- [x] Proactive reuse suggestions — surface relevant existing code when agent claims a task
+- [x] Protected domains — stricter enforcement for sensitive areas (financial calculations, compliance)
 - [ ] Configuration: `[reuse] enforce`, `similarity_threshold`, `check_signatures`, `check_bodies`, `check_patterns`
 
 ### 12.5f. Architecture Rules

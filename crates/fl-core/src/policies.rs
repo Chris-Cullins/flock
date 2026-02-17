@@ -4,8 +4,8 @@ use std::path::Path;
 use fl_policy::{
     AntiPatternConfig, AntiPatternEnforce, AntiPatternRule, ArchRuleEnforce, ArchitectureRules,
     BudgetExceedAction, BudgetLimits, DependencyDirectionRule, LayerBoundaryRule,
-    RateLimitExceedAction, RateLimits, ScopeEnforceMode, ScopeMode, ScopePolicy,
-    TestFailureAction, TestRequirements,
+    RateLimitExceedAction, RateLimits, ReuseEnforce, ReusePolicy, ScopeEnforceMode, ScopeMode,
+    ScopePolicy, TestFailureAction, TestRequirements,
 };
 
 /// Configuration for commit hygiene enforcement.
@@ -41,6 +41,7 @@ pub struct PoliciesConfig {
     pub test_requirements: TestRequirements,
     pub architecture: ArchitectureRules,
     pub anti_patterns: AntiPatternConfig,
+    pub reuse: ReusePolicy,
 }
 
 impl Default for PoliciesConfig {
@@ -53,6 +54,7 @@ impl Default for PoliciesConfig {
             test_requirements: TestRequirements::default(),
             architecture: ArchitectureRules::default(),
             anti_patterns: AntiPatternConfig::default(),
+            reuse: ReusePolicy::default(),
         }
     }
 }
@@ -124,6 +126,16 @@ enabled = false
 [anti_patterns]
 enabled = false
 # enforce = "block_with_explanation"  # "block_with_explanation", "gate", or "warn"
+
+# --- DRY / Duplication prevention ---
+# Detect duplicate code by comparing new symbols against existing ones.
+[reuse]
+enabled = false
+# enforce = "gate"  # "block", "gate", or "warn"
+# similarity_threshold = 0.8
+# check_signatures = true
+# check_bodies = true
+# check_patterns = true
 "#;
 
 /// Parse a `policies.toml` file into a `PoliciesConfig`.
@@ -158,6 +170,7 @@ pub fn parse_policies_config(content: &str) -> PoliciesConfig {
             "test_requirements" => parse_test_requirements_field(&mut config.test_requirements, key, value),
             "architecture" => parse_architecture_field(&mut config.architecture, key, value),
             "anti_patterns" => parse_anti_patterns_field(&mut config.anti_patterns, key, value),
+            "reuse" => parse_reuse_field(&mut config.reuse, key, value),
             _ => {}
         }
     }
@@ -289,6 +302,28 @@ fn parse_anti_patterns_field(config: &mut AntiPatternConfig, key: &str, value: &
                 _ => AntiPatternEnforce::BlockWithExplanation,
             };
         }
+        _ => {}
+    }
+}
+
+fn parse_reuse_field(config: &mut ReusePolicy, key: &str, value: &str) {
+    match key {
+        "enabled" => config.enabled = value == "true",
+        "enforce" => {
+            config.enforce = match parse_toml_string(value).as_str() {
+                "block" => ReuseEnforce::Block,
+                "warn" => ReuseEnforce::Warn,
+                _ => ReuseEnforce::Gate,
+            };
+        }
+        "similarity_threshold" => {
+            if let Ok(v) = value.parse::<f64>() {
+                config.similarity_threshold = v.clamp(0.0, 1.0);
+            }
+        }
+        "check_signatures" => config.check_signatures = value == "true",
+        "check_bodies" => config.check_bodies = value == "true",
+        "check_patterns" => config.check_patterns = value == "true",
         _ => {}
     }
 }
@@ -784,5 +819,36 @@ fix_suggestion = "Use a rate service or config"
         assert!(!config.anti_patterns.enabled);
         assert_eq!(config.anti_patterns.enforce, AntiPatternEnforce::BlockWithExplanation);
         assert!(config.anti_patterns.rules.is_empty());
+    }
+
+    #[test]
+    fn test_parse_reuse_config() {
+        let toml = r#"
+[reuse]
+enabled = true
+enforce = "block"
+similarity_threshold = 0.75
+check_signatures = true
+check_bodies = true
+check_patterns = false
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.reuse.enabled);
+        assert_eq!(config.reuse.enforce, ReuseEnforce::Block);
+        assert!((config.reuse.similarity_threshold - 0.75).abs() < 0.001);
+        assert!(config.reuse.check_signatures);
+        assert!(config.reuse.check_bodies);
+        assert!(!config.reuse.check_patterns);
+    }
+
+    #[test]
+    fn test_default_reuse_config() {
+        let config = PoliciesConfig::default();
+        assert!(!config.reuse.enabled);
+        assert_eq!(config.reuse.enforce, ReuseEnforce::Gate);
+        assert!((config.reuse.similarity_threshold - 0.8).abs() < 0.001);
+        assert!(config.reuse.check_signatures);
+        assert!(config.reuse.check_bodies);
+        assert!(config.reuse.check_patterns);
     }
 }

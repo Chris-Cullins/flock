@@ -930,6 +930,19 @@ pub fn diff(
     default_analyzer_registry().diff(path, old_source, new_source)
 }
 
+/// Extract symbols from a source file's content.
+///
+/// Returns `None` if the language is not supported by tree-sitter.
+/// This is useful for duplication detection — callers can compare
+/// `SymbolInfo` records (body_hash, match_hash, signature) across files.
+pub fn extract_symbols_from_source(path: &Path, source: &[u8]) -> Result<Option<Vec<SymbolInfo>>> {
+    let Some(language) = SourceLanguage::from_path(path) else {
+        return Ok(None);
+    };
+    let symbols = parse_symbols(language, source)?;
+    Ok(Some(symbols))
+}
+
 pub fn merge(
     path: &Path,
     base_source: Option<&[u8]>,

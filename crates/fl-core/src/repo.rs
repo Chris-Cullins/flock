@@ -437,6 +437,7 @@ impl Repo {
         let changed_files = self.working_dir_changed_files();
         self.enforce_architecture_rules(&changed_files)?;
         self.enforce_anti_patterns(&changed_files)?;
+        self.enforce_reuse_policy(&changed_files)?;
 
         // Enforce commit hygiene.
         self.enforce_commit_hygiene(&intent)?;
@@ -3353,6 +3354,7 @@ impl Repo {
             fl_policy::PolicyCategory::TestRequirement => "TestRequirement",
             fl_policy::PolicyCategory::ArchitectureRule => "ArchitectureRule",
             fl_policy::PolicyCategory::AntiPattern => "AntiPattern",
+            fl_policy::PolicyCategory::DuplicationReuse => "DuplicationReuse",
         };
         let operation = match decision.operation {
             fl_policy::PolicyOperation::Checkpoint => "Checkpoint",
@@ -3825,6 +3827,246 @@ impl Repo {
             }
         }
         Ok(())
+    }
+
+    /// Enforce DRY / duplication prevention policy. Called before checkpoints.
+    fn enforce_reuse_policy(&self, files_changed: &[String]) -> Result<()> {
+        let config = self.policies_config();
+        if !config.reuse.enabled {
+            return Ok(());
+        }
+
+        // Collect symbols from changed files using semantic extraction.
+        let mut new_symbols: Vec<(String, fl_semantic::SymbolInfo)> = Vec::new();
+
+        for path in files_changed {
+            let full_path = self.root().join(path);
+            let rel_path = std::path::Path::new(path);
+            if !fl_semantic::supported_source(rel_path) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read(&full_path) {
+                if let Ok(Some(symbols)) =
+                    fl_semantic::extract_symbols_from_source(rel_path, &content)
+                {
+                    for sym in symbols {
+                        new_symbols.push((path.clone(), sym));
+                    }
+                }
+            }
+        }
+
+        if new_symbols.is_empty() {
+            return Ok(());
+        }
+
+        // Gather existing symbols from non-changed source files in the working tree.
+        let root = self.root();
+        let mut existing_symbols: Vec<(String, fl_semantic::SymbolInfo)> = Vec::new();
+        self.collect_existing_symbols(&root, &root, files_changed, &mut existing_symbols);
+
+        if existing_symbols.is_empty() {
+            return Ok(());
+        }
+
+        // Compare new symbols against existing ones.
+        let mut matches: Vec<fl_policy::DuplicationMatch> = Vec::new();
+        let threshold = config.reuse.similarity_threshold;
+
+        for (new_file, new_sym) in &new_symbols {
+            // Determine effective threshold — check protected domains.
+            let effective_threshold = config
+                .reuse
+                .protected_domains
+                .iter()
+                .find(|d| {
+                    glob::Pattern::new(&d.file_pattern)
+                        .map(|g| g.matches(new_file.as_str()))
+                        .unwrap_or(false)
+                })
+                .map(|d| d.similarity_threshold)
+                .unwrap_or(threshold);
+
+            for (existing_file, existing_sym) in &existing_symbols {
+                // Skip self-comparison (same file).
+                if new_file == existing_file {
+                    continue;
+                }
+
+                // Layer 2: Body hash match (exact structural duplication).
+                if config.reuse.check_bodies
+                    && !new_sym.match_hash.is_empty()
+                    && new_sym.match_hash == existing_sym.match_hash
+                {
+                    matches.push(fl_policy::DuplicationMatch {
+                        new_symbol: new_sym.name.clone(),
+                        new_file: new_file.clone(),
+                        existing_symbol: existing_sym.name.clone(),
+                        existing_file: existing_file.clone(),
+                        similarity: 1.0,
+                        layer: fl_policy::DuplicationLayer::Body,
+                        reuse_suggestion: format!(
+                            "Exact structural match — consider importing {} from {}",
+                            existing_sym.name, existing_file
+                        ),
+                    });
+                    continue; // No need for further checks if body matches.
+                }
+
+                // Layer 1: Signature matching.
+                if config.reuse.check_signatures {
+                    if let (Some(new_sig), Some(existing_sig)) =
+                        (&new_sym.signature, &existing_sym.signature)
+                    {
+                        let new_params: Vec<(Option<String>, bool)> = new_sig
+                            .parameters
+                            .iter()
+                            .map(|p| (p.type_hint.clone(), p.optional))
+                            .collect();
+                        let existing_params: Vec<(Option<String>, bool)> = existing_sig
+                            .parameters
+                            .iter()
+                            .map(|p| (p.type_hint.clone(), p.optional))
+                            .collect();
+                        let sig_sim = fl_policy::signature_similarity(
+                            &(new_params, new_sig.return_type.clone()),
+                            &(existing_params, existing_sig.return_type.clone()),
+                        );
+                        let name_sim =
+                            fl_policy::name_similarity(&new_sym.name, &existing_sym.name);
+
+                        // Combined score: 60% signature, 40% name.
+                        let combined = sig_sim * 0.6 + name_sim * 0.4;
+
+                        if combined >= effective_threshold {
+                            matches.push(fl_policy::DuplicationMatch {
+                                new_symbol: new_sym.name.clone(),
+                                new_file: new_file.clone(),
+                                existing_symbol: existing_sym.name.clone(),
+                                existing_file: existing_file.clone(),
+                                similarity: combined,
+                                layer: fl_policy::DuplicationLayer::Signature,
+                                reuse_suggestion: format!(
+                                    "Similar signature — consider reusing {} from {}",
+                                    existing_sym.name, existing_file
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                // Layer 3: Pattern conformance — detect when new code should
+                // implement an existing interface/trait.
+                if config.reuse.check_patterns
+                    && matches!(existing_sym.kind, fl_semantic::SymbolKind::Interface)
+                {
+                    let iface_name = &existing_sym.name;
+                    if !iface_name.is_empty()
+                        && fl_policy::name_similarity(&new_sym.name, iface_name)
+                            >= effective_threshold
+                    {
+                        matches.push(fl_policy::DuplicationMatch {
+                            new_symbol: new_sym.name.clone(),
+                            new_file: new_file.clone(),
+                            existing_symbol: existing_sym.name.clone(),
+                            existing_file: existing_file.clone(),
+                            similarity: fl_policy::name_similarity(
+                                &new_sym.name,
+                                iface_name,
+                            ),
+                            layer: fl_policy::DuplicationLayer::Pattern,
+                            reuse_suggestion: format!(
+                                "Consider implementing interface {} from {}",
+                                iface_name, existing_file
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let decision = fl_policy::check_reuse_policy(&config.reuse, &matches);
+
+        if decision.is_blocked() || decision.is_gated() {
+            self.record_policy_decision(&decision)?;
+        }
+        if decision.is_blocked() {
+            if let fl_policy::PolicyVerdict::Block {
+                reason,
+                fix_suggestion,
+            } = &decision.verdict
+            {
+                let msg = if let Some(fix) = fix_suggestion {
+                    format!("Policy blocked: {}\nSuggestion: {}", reason, fix)
+                } else {
+                    format!("Policy blocked: {}", reason)
+                };
+                bail!("{}", msg);
+            }
+        }
+        if decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
+                eprintln!(
+                    "warning: duplication/reuse gate triggered — {}",
+                    reason
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively collect symbols from source files that are NOT in the changed set.
+    fn collect_existing_symbols(
+        &self,
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        changed_files: &[String],
+        symbols: &mut Vec<(String, fl_semantic::SymbolInfo)>,
+    ) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Skip hidden directories and common non-source dirs.
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.')
+                    || name == "target"
+                    || name == "node_modules"
+                    || name == "vendor"
+                    || name == "dist"
+                    || name == "build"
+                {
+                    continue;
+                }
+            }
+            if path.is_dir() {
+                self.collect_existing_symbols(&path, root, changed_files, symbols);
+            } else if path.is_file() {
+                let rel_path = match path.strip_prefix(root) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let rel_str = rel_path.to_string_lossy().to_string();
+                // Skip files that are in the changed set.
+                if changed_files.contains(&rel_str) {
+                    continue;
+                }
+                if !fl_semantic::supported_source(rel_path) {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read(&path) {
+                    if let Ok(Some(file_symbols)) =
+                        fl_semantic::extract_symbols_from_source(rel_path, &content)
+                    {
+                        for sym in file_symbols {
+                            symbols.push((rel_str.clone(), sym));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Create discovery tasks for out-of-scope files (Split mode).
