@@ -15,6 +15,10 @@ use fl_core::{
 };
 use uuid::Uuid;
 
+const SKILL_MD: &str = include_str!("../../../.claude/skills/flock/SKILL.md");
+const WORKFLOWS_MD: &str = include_str!("../../../.claude/skills/flock/WORKFLOWS.md");
+const COLLABORATION_MD: &str = include_str!("../../../.claude/skills/flock/COLLABORATION.md");
+
 #[derive(Debug, Parser)]
 #[command(name = "fl", about = "Flock CLI (MVP)")]
 struct Cli {
@@ -433,6 +437,18 @@ enum Command {
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
+    },
+    /// Install the Flock skill for Claude Code
+    InstallSkill {
+        /// Install to ~/.claude/skills/ (default)
+        #[arg(long)]
+        claude: bool,
+        /// Install to <cwd>/.claude/skills/ (project-local)
+        #[arg(long)]
+        project: bool,
+        /// Install to a custom directory
+        #[arg(long)]
+        dir: Option<String>,
     },
     /// Generate shell completions for bash, zsh, fish, or powershell
     Completions {
@@ -3745,6 +3761,36 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Command::InstallSkill { claude: _, project, dir } => {
+            let target = if let Some(d) = dir {
+                PathBuf::from(d).join("flock")
+            } else if project {
+                env::current_dir()?.join(".claude").join("skills").join("flock")
+            } else {
+                let home = env::var("HOME").context("HOME not set")?;
+                PathBuf::from(home).join(".claude").join("skills").join("flock")
+            };
+
+            std::fs::create_dir_all(&target)
+                .with_context(|| format!("failed to create {}", target.display()))?;
+
+            let files: &[(&str, &str)] = &[
+                ("SKILL.md", SKILL_MD),
+                ("WORKFLOWS.md", WORKFLOWS_MD),
+                ("COLLABORATION.md", COLLABORATION_MD),
+            ];
+
+            for (name, content) in files {
+                let path = target.join(name);
+                std::fs::write(&path, content)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+            }
+
+            println!("Installed flock skill to {}", target.display());
+            for (name, _) in files {
+                println!("  {}", target.join(name).display());
+            }
+        }
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "fl", &mut io::stdout());
