@@ -469,3 +469,9 @@ Make the optimized storage paths the defaults so large repos and teams work out 
 - [x] `fl task show/claim/done/fail` require full UUIDs — short prefixes (e.g. first 8 chars) should work like `fl diff <checkpoint>` does with prefix matching
 - [x] `fl diff` (non-semantic) shows "No changes" for unsupported file types — `file_summary_*` functions used `collect_source_files` which filtered by `supported_source()`, excluding files like `.razor`, `.txt` (GitHub #40)
 - [x] `fl explore promote` creates checkpoint with potentially inaccessible snapshot — added `ensure_snapshot_available` after promote checkpoint creation to guarantee materialization (GitHub #39)
+- [x] `fl push` in native mode pushes 0 blocks — `self.root.join("store/blocks")` should be `self.flock_dir().join("store/blocks")` (wrong path, blocks never found)
+- [x] `fl push` block hash construction prepends fanout prefix to full hash — `format!("{prefix}{name}")` produced `3e3e82791e...` instead of `3e82791e...` (blocks uploaded with wrong hashes)
+- [x] `fl push` block file read path splits hash incorrectly — used `h[..2]/h[2..]` but files are stored as `h[..2]/h` (full hash as filename)
+- [x] `fl push` in native mode doesn't upload snapshot index — added fallback to upload JSON index when snapshot directory doesn't exist
+- [x] `fl pull`/`fl clone` doesn't handle native mode snapshots — added JSON index detection and block download on pull side
+- [x] `fl clone` always initializes as git-compatible — added Init event mode detection to switch cloned repo to native mode

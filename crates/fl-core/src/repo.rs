@@ -7787,7 +7787,7 @@ impl Repo {
             for snap_id in &need_resp.needed_ids {
                 let snap_dir = self.root.join(SNAPSHOT_DIR).join(snap_id.to_string());
                 if snap_dir.is_dir() {
-                    // Pack as tar and upload.
+                    // Git-compatible mode: pack snapshot directory as tar and upload.
                     let mut buf = Vec::new();
                     {
                         let mut builder = tar::Builder::new(&mut buf);
@@ -7796,20 +7796,28 @@ impl Repo {
                     }
                     transport.upload_snapshot(*snap_id, &buf)?;
                     blocks_uploaded += 1;
+                } else {
+                    // Native mode: upload the snapshot index JSON as the snapshot data.
+                    let file_index = fl_storage::FileIndex::for_root(self.root());
+                    if file_index.has(*snap_id) {
+                        let index = file_index.read(*snap_id)?;
+                        let json = serde_json::to_vec(&index)?;
+                        transport.upload_snapshot(*snap_id, &json)?;
+                        blocks_uploaded += 1;
+                    }
                 }
             }
         }
 
         // Upload missing content blocks (native storage).
-        let store_dir = self.root.join("store/blocks");
+        let store_dir = self.flock_dir().join("store/blocks");
         if store_dir.is_dir() {
             let mut block_hashes = Vec::new();
             for entry_res in walkdir::WalkDir::new(&store_dir).into_iter().filter_map(|e| e.ok()) {
                 if entry_res.file_type().is_file() {
                     if let Some(name) = entry_res.file_name().to_str() {
-                        if let Some(prefix) = entry_res.path().parent().and_then(|p| p.file_name()).and_then(|p| p.to_str()) {
-                            block_hashes.push(format!("{prefix}{name}"));
-                        }
+                        // The filename IS the full hash; the parent dir is just a 2-char fanout prefix.
+                        block_hashes.push(name.to_string());
                     }
                 }
             }
@@ -7823,8 +7831,7 @@ impl Repo {
                         .iter()
                         .filter_map(|h| {
                             let prefix = &h[..2];
-                            let rest = &h[2..];
-                            let path = store_dir.join(prefix).join(rest);
+                            let path = store_dir.join(prefix).join(h);
                             let data = fs::read(&path).ok()?;
                             Some(fl_storage::BlockPayload {
                                 hash: h.clone(),
@@ -7928,6 +7935,8 @@ impl Repo {
             .with_context(|| format!("failed to create clone directory {}", dir.display()))?;
 
         let repo = Repo::at(dir);
+        // Initialize with git-compatible layout first; we'll switch to native
+        // after pulling if the remote's Init event says mode=native.
         repo.init_layout(RepoMode::GitCompatible)?;
         repo.roost_add("origin", url)?;
 
@@ -7957,6 +7966,23 @@ impl Repo {
 
         // Pull with options.
         let pull_report = repo.pull_with_options("origin", None, depth, &final_sparse, lazy)?;
+
+        // Detect native mode from the pulled Init event and switch layout.
+        let events = repo.list_events()?;
+        let is_native = events.iter().any(|e| {
+            matches!(&e.kind, EventKind::Init(init) if init.mode == "native")
+        });
+        if is_native {
+            // Update config to native mode and create block store directories.
+            let config_path = repo.root.join(CONFIG_FILE);
+            if config_path.exists() {
+                let contents = fs::read_to_string(&config_path)?;
+                let updated = contents.replace("mode = \"git-compatible\"", "mode = \"native\"");
+                fs::write(&config_path, updated)?;
+            }
+            ContentStore::for_root(repo.root()).ensure_exists()?;
+            FileIndex::for_root(repo.root()).ensure_exists()?;
+        }
 
         // Checkout working directory from the HEAD snapshot.
         if !lazy {
@@ -8035,22 +8061,49 @@ impl Repo {
         if !lazy {
             for snap_id in &snapshot_ids {
                 let snap_dir = self.root.join(SNAPSHOT_DIR).join(snap_id.to_string());
-                if !snap_dir.exists() {
+                let file_index = fl_storage::FileIndex::for_root(self.root());
+                let snap_exists = snap_dir.exists() || file_index.has(*snap_id);
+                if !snap_exists {
                     match transport.download_snapshot(*snap_id) {
                         Ok(data) => {
-                            fs::create_dir_all(&snap_dir)?;
-                            let cursor = Cursor::new(data);
-                            let mut archive = tar::Archive::new(cursor);
-                            archive.unpack(&snap_dir)?;
-                            blocks_downloaded += 1;
+                            // Try to parse as native snapshot index (JSON).
+                            if let Ok(index) = serde_json::from_slice::<fl_storage::SnapshotIndex>(&data) {
+                                // Native mode: save the index and download blocks.
+                                file_index.ensure_exists()?;
+                                file_index.write(&index)?;
 
-                            // If sparse, remove files not matching patterns.
-                            if !sparse_patterns.is_empty() {
-                                self.apply_sparse_filter(&snap_dir, sparse_patterns)?;
+                                // Download content blocks referenced by this index.
+                                let block_hashes: Vec<String> = index
+                                    .files
+                                    .values()
+                                    .flat_map(|entry| entry.blocks.iter().map(|b| b.hash.clone()))
+                                    .collect();
+                                let store = fl_storage::ContentStore::for_root(self.root());
+                                store.ensure_exists()?;
+                                for hash in &block_hashes {
+                                    if !store.has(hash) {
+                                        if let Ok(block_data) = transport.download_block(hash) {
+                                            store.put(&block_data)?;
+                                            blocks_downloaded += 1;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Git-compatible mode: unpack tar archive.
+                                fs::create_dir_all(&snap_dir)?;
+                                let cursor = Cursor::new(data);
+                                let mut archive = tar::Archive::new(cursor);
+                                archive.unpack(&snap_dir)?;
+                                blocks_downloaded += 1;
+
+                                // If sparse, remove files not matching patterns.
+                                if !sparse_patterns.is_empty() {
+                                    self.apply_sparse_filter(&snap_dir, sparse_patterns)?;
+                                }
                             }
                         }
                         Err(_) => {
-                            // Snapshot may not exist on remote (native mode).
+                            // Snapshot may not exist on remote yet.
                         }
                     }
                 }
