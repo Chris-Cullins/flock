@@ -304,6 +304,7 @@ enum Command {
         branch: Option<String>,
     },
     /// Clone a remote repository
+    #[command(alias = "hatch")]
     Clone {
         /// Remote URL (flock:// or file://)
         url: String,
