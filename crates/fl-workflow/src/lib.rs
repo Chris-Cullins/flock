@@ -236,6 +236,8 @@ pub struct ReplayedState {
     pub conflicts: BTreeMap<Uuid, ConflictSummary>,
     pub applied_event_ids: Vec<Uuid>,
     #[serde(default)]
+    pub directives: Vec<fl_collab::DirectiveSummary>,
+    #[serde(default)]
     pub policy_budgets: BTreeMap<Uuid, PolicyBudgetTracker>,
     #[serde(default)]
     pub policy_rate_limits: BTreeMap<Uuid, PolicyRateLimitTracker>,
@@ -257,6 +259,7 @@ struct ReplayAccumulator {
     rebases: Vec<RebaseSummary>,
     conflicts: BTreeMap<Uuid, ConflictSummary>,
     applied_event_ids: Vec<Uuid>,
+    directives: Vec<fl_collab::DirectiveSummary>,
     policy_budgets: BTreeMap<Uuid, PolicyBudgetTracker>,
     policy_rate_limits: BTreeMap<Uuid, PolicyRateLimitTracker>,
     policy_decisions: Vec<PolicyDecisionRecord>,
@@ -277,6 +280,7 @@ impl From<ReplayedState> for ReplayAccumulator {
             rebases: state.rebases,
             conflicts: state.conflicts,
             applied_event_ids: state.applied_event_ids,
+            directives: state.directives,
             policy_budgets: state.policy_budgets,
             policy_rate_limits: state.policy_rate_limits,
             policy_decisions: state.policy_decisions,
@@ -313,6 +317,7 @@ impl ReplayAccumulator {
             rebases: self.rebases,
             conflicts: self.conflicts,
             applied_event_ids: self.applied_event_ids,
+            directives: self.directives,
             policy_budgets: self.policy_budgets,
             policy_rate_limits: self.policy_rate_limits,
             policy_decisions: self.policy_decisions,
@@ -482,6 +487,24 @@ impl ReplayAccumulator {
                     timestamp: event.timestamp.clone(),
                 });
             }
+            EventKind::Directive(directive) => {
+                let (kind_str, detail) = match &directive.directive {
+                    fl_storage::DirectiveKind::Pause => ("pause".to_string(), None),
+                    fl_storage::DirectiveKind::Resume => ("resume".to_string(), None),
+                    fl_storage::DirectiveKind::Redirect { new_task } => ("redirect".to_string(), Some(new_task.clone())),
+                    fl_storage::DirectiveKind::Abort { reason } => ("abort".to_string(), Some(reason.clone())),
+                };
+                self.directives.push(fl_collab::DirectiveSummary {
+                    id: event.id,
+                    target_actor: directive.target_actor.clone(),
+                    directive_kind: kind_str,
+                    directive_detail: detail,
+                    reason: directive.reason.clone(),
+                    issued_by: directive.issued_by.clone(),
+                    issued_at: event.timestamp.clone(),
+                    acknowledged: false,
+                });
+            }
             EventKind::Session(session) => match session.action {
                 SessionAction::Start => {
                     self.sessions.insert(
@@ -565,6 +588,7 @@ impl ReplayAccumulator {
                             actor: presence.actor.clone(),
                             workspace: presence.workspace.clone(),
                             active_files: presence.active_files.clone(),
+                            active_symbols: presence.active_symbols.clone(),
                             intent: presence.intent.clone(),
                             ttl: Duration::from_secs(presence.ttl_secs),
                             last_heartbeat: event.timestamp.clone(),
@@ -1702,6 +1726,7 @@ mod tests {
                 workspace: "ws1".to_string(),
                 action: fl_storage::PresenceAction::Heartbeat,
                 active_files: vec!["src/main.rs".to_string()],
+                active_symbols: vec![],
                 intent: Some("refactoring".to_string()),
                 ttl_secs: 300,
             }),
@@ -1723,6 +1748,7 @@ mod tests {
                 workspace: "ws1".to_string(),
                 action: fl_storage::PresenceAction::Depart,
                 active_files: Vec::new(),
+                active_symbols: Vec::new(),
                 intent: None,
                 ttl_secs: 0,
             }),

@@ -85,6 +85,25 @@ pub struct CheckpointIntentMetadata {
     pub structured_description: Option<String>,
 }
 
+/// Report from `fl who` combining presence, sessions, and tasks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhoReport {
+    pub actors: Vec<ActorSummary>,
+}
+
+/// Summary of an active actor's state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActorSummary {
+    pub actor: String,
+    pub workspace: String,
+    pub active_files: Vec<String>,
+    pub active_symbols: Vec<String>,
+    pub intent: Option<String>,
+    pub current_task: Option<String>,
+    pub session_id: Option<Uuid>,
+    pub last_seen: String,
+}
+
 /// Persisted dependency graph for incremental semantic indexing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DependencyIndex {
@@ -335,6 +354,10 @@ impl Repo {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn flock_dir(&self) -> PathBuf {
+        self.root.join(FLOCK_DIR)
     }
 
     pub fn init(&self) -> Result<()> {
@@ -759,6 +782,7 @@ impl Repo {
                 EventKind::RemoteSync(_) => {}
                 EventKind::Intelligence(_) => {}
                 EventKind::Policy(_) => {}
+                EventKind::Directive(_) => {}
             }
         }
 
@@ -5982,6 +6006,17 @@ impl Repo {
         intent: Option<String>,
         ttl_secs: Option<u64>,
     ) -> Result<PresenceSummary> {
+        self.heartbeat_with_symbols(workspace, active_files, Vec::new(), intent, ttl_secs)
+    }
+
+    pub fn heartbeat_with_symbols(
+        &self,
+        workspace: String,
+        active_files: Vec<String>,
+        active_symbols: Vec<String>,
+        intent: Option<String>,
+        ttl_secs: Option<u64>,
+    ) -> Result<PresenceSummary> {
         self.assert_initialized()?;
         let actor = self.current_actor();
         let ttl = ttl_secs.unwrap_or(300);
@@ -5990,6 +6025,7 @@ impl Repo {
             workspace: workspace.clone(),
             action: PresenceAction::Heartbeat,
             active_files: active_files.clone(),
+            active_symbols: active_symbols.clone(),
             intent: intent.clone(),
             ttl_secs: ttl,
         }))?;
@@ -5997,6 +6033,7 @@ impl Repo {
             actor,
             workspace,
             active_files,
+            active_symbols,
             intent,
             ttl: std::time::Duration::from_secs(ttl),
             last_heartbeat: self.now_nanos_str(),
@@ -6011,6 +6048,7 @@ impl Repo {
             workspace,
             action: PresenceAction::Depart,
             active_files: Vec::new(),
+            active_symbols: Vec::new(),
             intent: None,
             ttl_secs: 0,
         }))?;
@@ -6027,6 +6065,152 @@ impl Repo {
             .into_values()
             .filter(|p| !p.is_expired_at(now_nanos))
             .collect())
+    }
+
+    // --- Who report (combines presence + sessions + tasks) ---
+
+    pub fn who(&self) -> Result<WhoReport> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        let now_nanos = self.now_nanos();
+
+        let active_presences: Vec<_> = state
+            .presence
+            .values()
+            .filter(|p| !p.is_expired_at(now_nanos))
+            .collect();
+
+        let active_sessions: std::collections::HashMap<String, &SessionSummary> = state
+            .sessions
+            .values()
+            .filter(|s| s.status == SessionStatus::Active)
+            .map(|s| (s.agent.clone(), s))
+            .collect();
+
+        let claimed_tasks: std::collections::HashMap<String, &TaskSummary> = state
+            .tasks
+            .values()
+            .filter(|t| t.status == TaskStatus::Claimed)
+            .filter_map(|t| t.assignee.as_ref().map(|a| (a.clone(), t)))
+            .collect();
+
+        let mut actors = Vec::new();
+        for presence in &active_presences {
+            let session = active_sessions.get(&presence.actor);
+            let task = claimed_tasks.get(&presence.actor);
+            actors.push(ActorSummary {
+                actor: presence.actor.clone(),
+                workspace: presence.workspace.clone(),
+                active_files: presence.active_files.clone(),
+                active_symbols: presence.active_symbols.clone(),
+                intent: presence.intent.clone(),
+                current_task: task.map(|t| format!("{} — {}", &t.id.to_string()[..8], t.title.clone())),
+                session_id: session.map(|s| s.id),
+                last_seen: presence.last_heartbeat.clone(),
+            });
+        }
+
+        // Include active sessions without presence entries
+        for (agent, session) in &active_sessions {
+            if !actors.iter().any(|a| &a.actor == agent) {
+                let task = claimed_tasks.get(agent.as_str());
+                actors.push(ActorSummary {
+                    actor: agent.clone(),
+                    workspace: String::new(),
+                    active_files: Vec::new(),
+                    active_symbols: Vec::new(),
+                    intent: session.task_description.clone(),
+                    current_task: task.map(|t| format!("{} — {}", &t.id.to_string()[..8], t.title.clone())),
+                    session_id: Some(session.id),
+                    last_seen: session.created_at.clone(),
+                });
+            }
+        }
+
+        Ok(WhoReport { actors })
+    }
+
+    // --- Collaboration: Directives ---
+
+    pub fn send_directive(
+        &self,
+        target_actor: String,
+        directive: fl_storage::DirectiveKind,
+        reason: Option<String>,
+    ) -> Result<fl_collab::DirectiveSummary> {
+        self.assert_initialized()?;
+        let issued_by = self.current_actor();
+        let (kind_str, detail) = match &directive {
+            fl_storage::DirectiveKind::Pause => ("pause".to_string(), None),
+            fl_storage::DirectiveKind::Resume => ("resume".to_string(), None),
+            fl_storage::DirectiveKind::Redirect { new_task } => ("redirect".to_string(), Some(new_task.clone())),
+            fl_storage::DirectiveKind::Abort { reason } => ("abort".to_string(), Some(reason.clone())),
+        };
+        let event = self.append_event(EventKind::Directive(fl_storage::DirectiveEvent {
+            target_actor: target_actor.clone(),
+            directive,
+            reason: reason.clone(),
+            issued_by: issued_by.clone(),
+        }))?;
+        Ok(fl_collab::DirectiveSummary {
+            id: event.id,
+            target_actor,
+            directive_kind: kind_str,
+            directive_detail: detail,
+            reason,
+            issued_by,
+            issued_at: event.timestamp,
+            acknowledged: false,
+        })
+    }
+
+    pub fn list_directives(&self) -> Result<Vec<fl_collab::DirectiveSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        Ok(state.directives)
+    }
+
+    pub fn list_directives_for_actor(&self, actor: &str) -> Result<Vec<fl_collab::DirectiveSummary>> {
+        let all = self.list_directives()?;
+        Ok(all
+            .into_iter()
+            .filter(|d| d.target_actor == actor)
+            .collect())
+    }
+
+    // --- Workspace Preview ---
+
+    pub fn workspace_preview_diffs(&self) -> Result<Vec<fl_storage::PreviewDiff>> {
+        self.assert_initialized()?;
+        let status = self.status()?;
+        let mut diffs = Vec::new();
+        for path in &status.new_files {
+            diffs.push(fl_storage::PreviewDiff {
+                path: path.clone(),
+                symbols_changed: Vec::new(),
+                lines_added: 0,
+                lines_removed: 0,
+            });
+        }
+        for path in &status.modified_files {
+            diffs.push(fl_storage::PreviewDiff {
+                path: path.clone(),
+                symbols_changed: Vec::new(),
+                lines_added: 0,
+                lines_removed: 0,
+            });
+        }
+        for path in &status.deleted_files {
+            diffs.push(fl_storage::PreviewDiff {
+                path: path.clone(),
+                symbols_changed: Vec::new(),
+                lines_added: 0,
+                lines_removed: 0,
+            });
+        }
+        Ok(diffs)
     }
 
     // --- Collaboration: Advisory Locks ---
@@ -6816,6 +7000,10 @@ impl Repo {
     }
 
     // --- Helper methods for collaboration ---
+
+    pub fn current_actor_name(&self) -> String {
+        self.current_actor()
+    }
 
     fn current_actor(&self) -> String {
         env::var("FL_ACTOR")

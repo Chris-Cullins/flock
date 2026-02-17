@@ -13,6 +13,8 @@ pub struct PresenceSummary {
     pub actor: String,
     pub workspace: String,
     pub active_files: Vec<String>,
+    #[serde(default)]
+    pub active_symbols: Vec<String>,
     pub intent: Option<String>,
     pub ttl: Duration,
     pub last_heartbeat: String,
@@ -316,4 +318,18 @@ pub fn check_gates_for_path(
         })
         .cloned()
         .collect()
+}
+
+// --- Directives ---
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectiveSummary {
+    pub id: Uuid,
+    pub target_actor: String,
+    pub directive_kind: String,
+    pub directive_detail: Option<String>,
+    pub reason: Option<String>,
+    pub issued_by: String,
+    pub issued_at: String,
+    pub acknowledged: bool,
 }

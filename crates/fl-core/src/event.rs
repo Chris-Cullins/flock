@@ -6,4 +6,5 @@ pub use fl_storage::{
     NotifyConfig, PresenceAction, PresenceEvent, RebaseEvent, RemoteSyncAction, RemoteSyncEvent,
     ResourceUsageEvent, SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent,
     SubscriptionFilter, TaskAction, TaskEvent, UndoEvent, UndoMode, PolicyEvent, PolicyVerdictKind,
+    DirectiveEvent, DirectiveKind,
 };

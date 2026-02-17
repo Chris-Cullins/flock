@@ -31,6 +31,7 @@ pub use event::{
     PresenceEvent, RebaseEvent, RemoteSyncAction, RemoteSyncEvent, ResourceUsageEvent,
     SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent, SubscriptionFilter,
     TaskAction, TaskEvent, UndoEvent, UndoMode, PolicyEvent, PolicyVerdictKind, EscalationContextEvent,
+    DirectiveEvent, DirectiveKind,
     compute_event_hash, event_signing_payload,
 };
 pub use event_log::EventLog;
@@ -64,7 +65,7 @@ pub use segmented_event_log::SegmentedEventLog;
 pub use segmented_refs::SegmentedRefStore;
 pub use snapshot_store::{IncrementalSnapshotReport, build_incremental_index, store_snapshot_incremental};
 pub use ws_protocol::{
-    WsClientMessage, WsServerMessage, WsSubscribeRequest,
+    PreviewDiff, WsClientMessage, WsServerMessage, WsSubscribeRequest,
 };
 pub use credential_store::{
     AuthMethod, CredentialEntry, CredentialStore, credentials_path, resolve_token,

@@ -1,4 +1,4 @@
-use crate::event::{Event, EventKind, SubscriptionFilter};
+use crate::event::{DirectiveKind, Event, EventKind, SubscriptionFilter};
 use serde::{Deserialize, Serialize};
 
 /// Client-to-server WebSocket messages
@@ -26,6 +26,16 @@ pub enum WsClientMessage {
         symbols: Vec<String>,
         change_kinds: Vec<String>,
     },
+    SendDirective {
+        target_actor: String,
+        directive: DirectiveKind,
+        reason: Option<String>,
+    },
+    StartPreview {
+        workspace: String,
+        interval_ms: u64,
+    },
+    StopPreview,
 }
 
 /// Server-to-client WebSocket messages
@@ -79,6 +89,25 @@ pub enum WsServerMessage {
         code: String,
         message: String,
     },
+    Directive {
+        from_actor: String,
+        directive: DirectiveKind,
+        reason: Option<String>,
+    },
+    WorkspacePreview {
+        actor: String,
+        workspace: String,
+        diffs: Vec<PreviewDiff>,
+        timestamp: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviewDiff {
+    pub path: String,
+    pub symbols_changed: Vec<String>,
+    pub lines_added: u32,
+    pub lines_removed: u32,
 }
 
 /// Subscription request with filtering criteria
@@ -155,6 +184,7 @@ pub fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::RemoteSync(_) => "RemoteSync",
         EventKind::Intelligence(_) => "Intelligence",
         EventKind::Policy(_) => "Policy",
+        EventKind::Directive(_) => "Directive",
     }
 }
 

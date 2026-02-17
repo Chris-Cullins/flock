@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -42,6 +42,7 @@ pub enum EventKind {
     RemoteSync(RemoteSyncEvent),
     Intelligence(IntelligenceEvent),
     Policy(PolicyEvent),
+    Directive(DirectiveEvent),
 }
 
 impl Event {
@@ -245,6 +246,8 @@ pub struct PresenceEvent {
     pub action: PresenceAction,
     #[serde(default)]
     pub active_files: Vec<String>,
+    #[serde(default)]
+    pub active_symbols: Vec<String>,
     #[serde(default)]
     pub intent: Option<String>,
     /// TTL in seconds
@@ -483,6 +486,23 @@ pub enum PolicyVerdictKind {
     Allow,
     Gate,
     Block,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectiveEvent {
+    pub target_actor: String,
+    pub directive: DirectiveKind,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub issued_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DirectiveKind {
+    Pause,
+    Resume,
+    Redirect { new_task: String },
+    Abort { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

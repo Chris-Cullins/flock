@@ -21,11 +21,12 @@ pub use event::{
     LockEvent, NotifyConfig, PresenceAction, PresenceEvent, IntelligenceAction, IntelligenceEvent,
     RemoteSyncAction, RemoteSyncEvent, ResourceUsageEvent, SessionAction, SessionEvent,
     SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
-    UndoMode, PolicyEvent, PolicyVerdictKind,
+    UndoMode, PolicyEvent, PolicyVerdictKind, DirectiveEvent, DirectiveKind,
 };
 pub use fl_storage::ApiCallRecord;
 pub use fl_storage::{CloneReport, PullReport, PushReport, RefKind, RemoteUrl, RepoRef, RoostEntry, WorkspaceRefConfig};
-pub use fl_storage::{WsClientMessage, WsServerMessage, WsSubscribeRequest};
+pub use fl_storage::{PreviewDiff, WsClientMessage, WsServerMessage, WsSubscribeRequest};
+pub use fl_collab::DirectiveSummary;
 pub use repo::{
     CheckpointIntentMetadata, ConflictDetail, ConflictStatus, ConflictSummary, ConvertReport,
     DecisionSummary, ExplorationStatus, FileSummary, ExplorationSummary, FsckReport,
@@ -34,7 +35,8 @@ pub use repo::{
     RemoteLoginResult, StatusReport, RebaseSummary, ReplayedState, Repo, ResourceUsageTotals,
     ReviewStats, ReviewSummary, SessionReplay, SessionStatus, SessionSummary, ShadowSafetyCheck,
     ShadowSafetyReport, SubscriptionNotify, SubscriptionStatus, SubscriptionSummary, TaskEdge,
-    TaskGraph, TaskRelation, TaskStatus, TaskSummary, UndoRequest, UndoResult, WorkspaceInfo,
+    TaskGraph, TaskRelation, TaskStatus, TaskSummary, UndoRequest, UndoResult, WhoReport,
+    ActorSummary, WorkspaceInfo,
 };
 pub use intelligence::{
     ConfidenceRecommendation, ConfidenceScore, ConflictSuggestionResult, IndexStats,

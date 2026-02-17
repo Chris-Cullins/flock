@@ -8,8 +8,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{self, Shell};
 use fl_core::repo::parse_duration_spec;
 use fl_core::{
-    ApiCallRecord, ConflictStatus, DecisionAction, EventKind, ExplorationStatus, GateCondition,
-    GatePolicy, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
+    ApiCallRecord, ConflictStatus, DecisionAction, DirectiveKind, EventKind, ExplorationStatus,
+    GateCondition, GatePolicy, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
     SemanticConflictClassification, SemanticRisk, TaskRelation, TaskStatus,
     UndoRequest,
 };
@@ -168,6 +168,32 @@ enum Command {
         /// Stream live updates via WebSocket
         #[arg(long)]
         live: bool,
+    },
+    /// Show active actors and what they're working on
+    Who {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Agent directive management (pause, resume, redirect, abort)
+    Directive {
+        #[command(subcommand)]
+        command: DirectiveCommand,
+    },
+    /// Stream workspace diffs for ghost text preview
+    Preview {
+        /// Workspace name
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Preview interval in milliseconds
+        #[arg(long, default_value = "2000")]
+        interval: u64,
+        /// Roost name for WebSocket (defaults to "origin")
+        #[arg(long)]
+        remote: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Quick commit for agents
     QuickSave {
@@ -780,6 +806,9 @@ enum PresenceCommand {
         workspace: String,
         #[arg(long)]
         file: Vec<String>,
+        /// Active symbols (method/function names)
+        #[arg(long)]
+        symbol: Vec<String>,
         #[arg(long)]
         intent: Option<String>,
         #[arg(long)]
@@ -790,6 +819,35 @@ enum PresenceCommand {
         workspace: String,
     },
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum DirectiveCommand {
+    /// Send a directive to an agent
+    Send {
+        /// Target actor name
+        target: String,
+        /// Directive type: pause, resume, redirect, abort
+        #[arg(long)]
+        kind: String,
+        /// Reason for the directive
+        #[arg(long)]
+        reason: Option<String>,
+        /// New task (required for redirect)
+        #[arg(long)]
+        new_task: Option<String>,
+    },
+    /// List directives
+    List {
+        /// Filter by target actor
+        #[arg(long)]
+        actor: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Listen for directives targeting this actor
+    Listen,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1151,6 +1209,13 @@ fn main() -> Result<()> {
                         policy.verdict,
                         policy.operation,
                         policy.reason.as_deref().unwrap_or("-"),
+                    ),
+                    EventKind::Directive(d) => println!(
+                        "{}  directive:{:?}  target={}  by={}",
+                        event.timestamp,
+                        d.directive,
+                        d.target_actor,
+                        d.issued_by,
                     ),
                 }
             }
@@ -2373,6 +2438,189 @@ fn main() -> Result<()> {
                 stream_live_task_updates(&repo, "origin", json)?;
             }
         }
+        Command::Who { json } => {
+            let repo = Repo::discover(cwd)?;
+            let report = repo.who()?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if report.actors.is_empty() {
+                println!("No active actors.");
+            } else {
+                println!("{:<16} {:<12} {:<30} {:<20} {}", "ACTOR", "WORKSPACE", "FILES", "INTENT", "TASK");
+                for a in &report.actors {
+                    let files = if a.active_files.is_empty() {
+                        String::from("-")
+                    } else {
+                        a.active_files.join(", ")
+                    };
+                    let symbols_suffix = if a.active_symbols.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", a.active_symbols.join(", "))
+                    };
+                    let intent = a.intent.as_deref().unwrap_or("-");
+                    let task = a.current_task.as_deref().unwrap_or("-");
+                    println!(
+                        "{:<16} {:<12} {:<30} {:<20} {}",
+                        a.actor,
+                        a.workspace,
+                        format!("{}{}", files, symbols_suffix),
+                        intent,
+                        task
+                    );
+                }
+            }
+        }
+        Command::Directive { command } => {
+            let repo = Repo::discover(cwd)?;
+            match command {
+                DirectiveCommand::Send { target, kind, reason, new_task } => {
+                    let directive_kind = match kind.to_lowercase().as_str() {
+                        "pause" => DirectiveKind::Pause,
+                        "resume" => DirectiveKind::Resume,
+                        "redirect" => {
+                            let task = new_task.ok_or_else(|| anyhow::anyhow!("--new-task required for redirect directive"))?;
+                            DirectiveKind::Redirect { new_task: task }
+                        }
+                        "abort" => {
+                            let r = reason.clone().unwrap_or_else(|| "no reason given".to_string());
+                            DirectiveKind::Abort { reason: r }
+                        }
+                        other => bail!("unknown directive kind: {} (expected pause, resume, redirect, abort)", other),
+                    };
+                    let summary = repo.send_directive(target, directive_kind, reason)?;
+                    println!("directive {} sent to {}", &summary.id.to_string()[..8], summary.target_actor);
+                }
+                DirectiveCommand::List { actor, json } => {
+                    let directives = if let Some(actor) = actor {
+                        repo.list_directives_for_actor(&actor)?
+                    } else {
+                        repo.list_directives()?
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&directives)?);
+                    } else if directives.is_empty() {
+                        println!("No directives.");
+                    } else {
+                        for d in &directives {
+                            let detail_str = d.directive_detail.as_deref()
+                                .map(|det| format!(": {}", det))
+                                .unwrap_or_default();
+                            let reason_str = d.reason.as_deref()
+                                .map(|r| format!(" ({})", r))
+                                .unwrap_or_default();
+                            println!(
+                                "{}  {} → {}  {}{}{}",
+                                &d.id.to_string()[..8],
+                                d.issued_by,
+                                d.target_actor,
+                                d.directive_kind,
+                                detail_str,
+                                reason_str
+                            );
+                        }
+                    }
+                }
+                DirectiveCommand::Listen => {
+                    let actor = repo.current_actor_name();
+                    println!("listening for directives targeting {} (Ctrl+C to stop)...", actor);
+
+                    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                    let r = running.clone();
+                    ctrlc_flag(&r);
+
+                    let paused_path = repo.flock_dir().join("paused");
+                    let mut seen_count = 0usize;
+
+                    while running.load(std::sync::atomic::Ordering::Relaxed) {
+                        let directives = repo.list_directives_for_actor(&actor)?;
+                        for d in directives.iter().skip(seen_count) {
+                            match d.directive_kind.as_str() {
+                                "pause" => {
+                                    eprintln!("DIRECTIVE: paused by {}", d.issued_by);
+                                    let _ = std::fs::write(&paused_path, "paused");
+                                }
+                                "resume" => {
+                                    eprintln!("DIRECTIVE: resumed by {}", d.issued_by);
+                                    let _ = std::fs::remove_file(&paused_path);
+                                }
+                                "redirect" => {
+                                    let task = d.directive_detail.as_deref().unwrap_or("unknown");
+                                    eprintln!("DIRECTIVE: redirected to task '{}' by {}", task, d.issued_by);
+                                }
+                                "abort" => {
+                                    let reason = d.directive_detail.as_deref().unwrap_or("no reason");
+                                    eprintln!("DIRECTIVE: abort — {} (by {})", reason, d.issued_by);
+                                    return Ok(());
+                                }
+                                other => {
+                                    eprintln!("DIRECTIVE: unknown kind '{}' from {}", other, d.issued_by);
+                                }
+                            }
+                        }
+                        seen_count = directives.len();
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
+            }
+        }
+        Command::Preview { workspace, interval, remote, json } => {
+            let repo = Repo::discover(cwd)?;
+            let roost = remote.as_deref().unwrap_or("origin");
+            let ws = repo.ws_connect(roost).ok();
+            let ws_name = workspace.unwrap_or_else(|| "main".to_string());
+
+            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let r = running.clone();
+            ctrlc_flag(&r);
+
+            println!("streaming workspace preview every {}ms (Ctrl+C to stop)...", interval);
+
+            while running.load(std::sync::atomic::Ordering::Relaxed) {
+                let diffs = repo.workspace_preview_diffs()?;
+                if !diffs.is_empty() {
+                    if json {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                            .to_string();
+                        let preview = serde_json::json!({
+                            "workspace": ws_name,
+                            "diffs": diffs,
+                            "timestamp": ts,
+                        });
+                        println!("{}", serde_json::to_string(&preview)?);
+                    } else {
+                        for d in &diffs {
+                            let symbols = if d.symbols_changed.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [{}]", d.symbols_changed.join(", "))
+                            };
+                            println!("  {}  +{} -{}{}",
+                                d.path, d.lines_added, d.lines_removed, symbols);
+                        }
+                    }
+
+                    // Send via WebSocket if connected
+                    if let Some(ref ws) = ws {
+                        let msg = fl_core::WsClientMessage::StartPreview {
+                            workspace: ws_name.clone(),
+                            interval_ms: interval,
+                        };
+                        let _ = ws.send(msg);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval));
+            }
+
+            if let Some(ref ws) = ws {
+                let _ = ws.send(fl_core::WsClientMessage::StopPreview);
+                ws.disconnect();
+            }
+        }
         Command::QuickSave { tag } => {
             let repo = Repo::discover(cwd)?;
             let event = repo.quick_save(tag)?;
@@ -2395,10 +2643,11 @@ fn main() -> Result<()> {
                 PresenceCommand::Heartbeat {
                     workspace,
                     file,
+                    symbol,
                     intent,
                     ttl,
                 } => {
-                    let presence = repo.heartbeat(workspace, file, intent, ttl)?;
+                    let presence = repo.heartbeat_with_symbols(workspace, file, symbol, intent, ttl)?;
                     println!(
                         "heartbeat: {} in {} (ttl={}s)",
                         presence.actor,
@@ -2422,17 +2671,23 @@ fn main() -> Result<()> {
                         } else {
                             format!(" files=[{}]", p.active_files.join(", "))
                         };
+                        let symbols_str = if p.active_symbols.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" symbols=[{}]", p.active_symbols.join(", "))
+                        };
                         let intent_str = p
                             .intent
                             .as_deref()
                             .map(|i| format!(" intent=\"{}\"", i))
                             .unwrap_or_default();
                         println!(
-                            "{}  {}  ttl={}s{}{}",
+                            "{}  {}  ttl={}s{}{}{}",
                             p.actor,
                             p.workspace,
                             p.ttl.as_secs(),
                             files_str,
+                            symbols_str,
                             intent_str
                         );
                     }
@@ -4033,6 +4288,21 @@ fn print_ws_message(msg: &fl_core::WsServerMessage) {
         }
         WsServerMessage::Error { code, message } => {
             eprintln!("error [{}]: {}", code, message);
+        }
+        WsServerMessage::Directive { from_actor, directive, reason } => {
+            let kind_str = match directive {
+                DirectiveKind::Pause => "pause".to_string(),
+                DirectiveKind::Resume => "resume".to_string(),
+                DirectiveKind::Redirect { new_task } => format!("redirect → {}", new_task),
+                DirectiveKind::Abort { reason } => format!("abort: {}", reason),
+            };
+            let reason_str = reason.as_deref()
+                .map(|r| format!(" ({})", r))
+                .unwrap_or_default();
+            println!("directive from {}: {}{}", from_actor, kind_str, reason_str);
+        }
+        WsServerMessage::WorkspacePreview { actor, workspace, diffs, timestamp: _ } => {
+            println!("preview: {} in {} ({} files changed)", actor, workspace, diffs.len());
         }
     }
 }

@@ -409,10 +409,10 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 
 Features the Flock CLI needs to fully support the Roost server coordination model.
 
-- [ ] `fl who` command — show active actors and what they're working on (queries presence from server or local presence table)
-- [ ] Agent directive handling — background listener thread to receive and act on Pause/Resume/Redirect/Abort directives from server
-- [ ] Method-level presence — upgrade `PresenceUpdate` from file-level to symbol-level granularity (Phase 3 readiness)
-- [ ] `WorkspacePreview` streaming — optionally stream workspace diffs through WebSocket at configurable frequency for ghost text
+- [x] `fl who` command — show active actors and what they're working on (queries presence from server or local presence table)
+- [x] Agent directive handling — background listener thread to receive and act on Pause/Resume/Redirect/Abort directives from server
+- [x] Method-level presence — upgrade `PresenceUpdate` from file-level to symbol-level granularity (Phase 3 readiness)
+- [x] `WorkspacePreview` streaming — optionally stream workspace diffs through WebSocket at configurable frequency for ghost text
 
 ## 13. QA and Performance
 
