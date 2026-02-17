@@ -1111,6 +1111,10 @@ fn main() -> Result<()> {
 
             for event in events {
                 match event.kind {
+                    EventKind::Init(init) => println!(
+                        "{}  init  mode={}",
+                        event.timestamp, init.mode
+                    ),
                     EventKind::Checkpoint(cp) => println!(
                         "{}  commit  {}  {}  parent={}",
                         event.timestamp,
@@ -1347,17 +1351,19 @@ fn main() -> Result<()> {
                         print_full_diff_summary(&summary, &diffs, json)?;
                     }
                 }
-                // fl diff — latest checkpoint vs working directory (existing behavior)
+                // fl diff — latest checkpoint vs working directory
                 (None, None) => {
                     if intent {
                         let groups = repo.semantic_diff_with_intents()?;
                         print_intent_diff(&groups, json)?;
-                    } else {
-                        if !semantic {
-                            bail!("only `fl diff --semantic` or `fl diff --intent` is implemented;\nor use `fl diff <commit-id>` to diff a specific commit");
-                        }
+                    } else if semantic {
                         let diffs = repo.semantic_diff_from_latest_checkpoint()?;
                         print_semantic_diffs(&diffs, json)?;
+                    } else {
+                        // Basic diff: file-level summary + semantic changes
+                        let summary = repo.file_summary_from_latest_checkpoint()?;
+                        let diffs = repo.semantic_diff_from_latest_checkpoint()?;
+                        print_full_diff_summary(&summary, &diffs, json)?;
                     }
                 }
                 (None, Some(_)) => {

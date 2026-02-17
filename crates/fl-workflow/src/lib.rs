@@ -845,6 +845,9 @@ impl ReplayAccumulator {
                     }
                 }
             },
+            EventKind::Init(_) => {
+                // Init events are informational; no replay state changes needed.
+            },
         }
 
         if !self.applied_event_ids.contains(&event.id) {

@@ -24,6 +24,7 @@ pub struct Event {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "payload")]
 pub enum EventKind {
+    Init(InitEvent),
     Checkpoint(CheckpointEvent),
     Exploration(ExplorationEvent),
     Undo(UndoEvent),
@@ -70,6 +71,11 @@ pub struct FileChangeSummary {
     /// Number of semantic changes (symbol-level adds/removes/modifications) in this file.
     #[serde(default)]
     pub semantic_changes_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InitEvent {
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

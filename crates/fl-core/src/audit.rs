@@ -140,6 +140,7 @@ pub fn analyze_audit_trail(events: &[Event]) -> AuditReport {
 
 fn event_kind_label(kind: &EventKind) -> &'static str {
     match kind {
+        EventKind::Init(_) => "Init",
         EventKind::Checkpoint(_) => "Checkpoint",
         EventKind::Exploration(_) => "Exploration",
         EventKind::Undo(_) => "Undo",

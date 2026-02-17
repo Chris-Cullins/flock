@@ -166,6 +166,7 @@ impl WsSubscribeRequest {
 /// Helper function to get event kind name as string
 pub fn event_kind_name(kind: &EventKind) -> &'static str {
     match kind {
+        EventKind::Init(_) => "Init",
         EventKind::Checkpoint(_) => "Checkpoint",
         EventKind::Exploration(_) => "Exploration",
         EventKind::Undo(_) => "Undo",

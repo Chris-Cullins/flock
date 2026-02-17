@@ -27,11 +27,11 @@ pub use event::{
     ConflictAction, ConflictResolutionEvent, DecisionAction, DecisionEvent, Event, EventKind,
     EventRecord, ExplorationAction, ExplorationEvent, FileChangeKind, FileChangeSummary,
     GateAction, GateCondition, GateEvent, GatePolicy, GitBridgeAction, GitBridgeEvent, HookEvent,
-    IntelligenceAction, IntelligenceEvent, LockAction, LockEvent, NotifyConfig, PresenceAction,
-    PresenceEvent, RebaseEvent, RemoteSyncAction, RemoteSyncEvent, ResourceUsageEvent,
-    SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent, SubscriptionFilter,
-    TaskAction, TaskEvent, UndoEvent, UndoMode, PolicyEvent, PolicyVerdictKind, EscalationContextEvent,
-    DirectiveEvent, DirectiveKind,
+    InitEvent, IntelligenceAction, IntelligenceEvent, LockAction, LockEvent, NotifyConfig,
+    PresenceAction, PresenceEvent, RebaseEvent, RemoteSyncAction, RemoteSyncEvent,
+    ResourceUsageEvent, SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent,
+    SubscriptionFilter, TaskAction, TaskEvent, UndoEvent, UndoMode, PolicyEvent,
+    PolicyVerdictKind, EscalationContextEvent, DirectiveEvent, DirectiveKind,
     compute_event_hash, event_signing_payload,
 };
 pub use event_log::EventLog;
