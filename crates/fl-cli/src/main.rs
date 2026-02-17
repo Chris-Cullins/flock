@@ -4359,12 +4359,21 @@ fn print_ws_message(msg: &fl_core::WsServerMessage) {
                 eprintln!("auth failed: {}", error.as_deref().unwrap_or("unknown"));
             }
         }
-        WsServerMessage::Pong { .. } => {}
+        WsServerMessage::Ping { .. } | WsServerMessage::Pong { .. } => {}
         WsServerMessage::Subscribed { subscription_id, .. } => {
             println!("subscribed (id: {})", subscription_id);
         }
         WsServerMessage::EventNotification { event, .. } => {
             println!("[{}] {} {}", event.timestamp, event.actor, event.kind_name());
+        }
+        WsServerMessage::EventBroadcast { events } => {
+            println!("event broadcast: {} events", events.len());
+        }
+        WsServerMessage::EventsAppended { repo_id, count } => {
+            println!("events appended: {} new events in {}", count, repo_id);
+        }
+        WsServerMessage::SyncResponse { events } => {
+            println!("sync response: {} events", events.len());
         }
         WsServerMessage::PresenceUpdate { actor, workspace, files, intent, departed, .. } => {
             if *departed {
@@ -4374,18 +4383,53 @@ fn print_ws_message(msg: &fl_core::WsServerMessage) {
                 println!("presence: {} in {} editing {} {}", actor, workspace, files.join(", "), intent_str);
             }
         }
+        WsServerMessage::PresenceBroadcast { repo_id, presences } => {
+            println!("presence broadcast: {} actors in {}", presences.len(), repo_id);
+        }
+        WsServerMessage::AgentUpdate { agent_id, status, .. } => {
+            println!("agent update: {} -> {}", agent_id, status);
+        }
+        WsServerMessage::SemanticFeed { symbol_name, kind, file_path, .. } => {
+            println!("semantic: {} {} in {}", kind, symbol_name, file_path);
+        }
         WsServerMessage::HeadsUpWarning { actor, symbol, path, action } => {
             println!("heads-up: {} is {} {} in {}", actor, action, symbol, path);
         }
-        WsServerMessage::ConflictForecast { symbol, path, local_change, remote_change, remote_actor } => {
-            println!(
-                "conflict forecast: {} in {} — local:{} vs {}:{}",
-                symbol, path, local_change, remote_actor, remote_change
-            );
+        WsServerMessage::ConflictForecast { conflict_count, risk_level, .. } => {
+            println!("conflict forecast: {} conflicts (risk: {})", conflict_count, risk_level);
         }
-        WsServerMessage::TaskUpdate { task_id, title, status, assignee } => {
-            let assignee_str = assignee.as_deref().map(|a| format!(" @{}", a)).unwrap_or_default();
-            println!("task: {} [{}] {}{}", &task_id[..8.min(task_id.len())], status, title, assignee_str);
+        WsServerMessage::ConflictAlert { alert } => {
+            println!("conflict alert [{}]: {} ({} files)", alert.severity, alert.description, alert.affected_files.len());
+        }
+        WsServerMessage::TaskSync { task_id, status, assigned_agent_id, .. } => {
+            let agent_str = assigned_agent_id.as_deref().map(|a| format!(" @{}", a)).unwrap_or_default();
+            println!("task: {} [{}]{}", &task_id[..8.min(task_id.len())], status, agent_str);
+        }
+        WsServerMessage::TaskClaimResult { task_id, success, reason, .. } => {
+            if *success {
+                println!("task claimed: {}", task_id);
+            } else {
+                println!("task claim failed: {} — {}", task_id, reason.as_deref().unwrap_or("unknown"));
+            }
+        }
+        WsServerMessage::TaskAssignment { task_id, title, priority, .. } => {
+            println!("task assigned: {} [p{}] {}", task_id, priority, title);
+        }
+        WsServerMessage::LockResult { success, lock_id, reason } => {
+            if *success {
+                println!("lock ok: {}", lock_id.as_deref().unwrap_or("?"));
+            } else {
+                println!("lock failed: {}", reason.as_deref().unwrap_or("unknown"));
+            }
+        }
+        WsServerMessage::LockUpdate { action, lock, .. } => {
+            println!("lock {}: {} by {}", action, lock.patterns.join(", "), lock.owner);
+        }
+        WsServerMessage::LockList { locks, .. } => {
+            println!("locks: {} active", locks.len());
+        }
+        WsServerMessage::PolicyVerdict { decisions } => {
+            println!("policy: {} decisions", decisions.len());
         }
         WsServerMessage::Error { code, message } => {
             eprintln!("error [{}]: {}", code, message);
@@ -4394,7 +4438,7 @@ fn print_ws_message(msg: &fl_core::WsServerMessage) {
             let kind_str = match directive {
                 DirectiveKind::Pause => "pause".to_string(),
                 DirectiveKind::Resume => "resume".to_string(),
-                DirectiveKind::Redirect { new_task } => format!("redirect → {}", new_task),
+                DirectiveKind::Redirect { new_task } => format!("redirect -> {}", new_task),
                 DirectiveKind::Abort { reason } => format!("abort: {}", reason),
             };
             let reason_str = reason.as_deref()
@@ -4544,19 +4588,26 @@ fn ws_message_to_editor_notification(
                 action: action.clone(),
             })
         }
-        WsServerMessage::ConflictForecast { symbol, path, local_change, remote_change, remote_actor } => {
-            if !session.should_notify_for_path(path) {
+        WsServerMessage::ConflictForecast { conflict_count, risk_level, .. } => {
+            if *conflict_count == 0 {
                 return None;
             }
+            // Repo-level forecast — notify editor of overall risk
             Some(EditorNotification::ConflictForecastWarning {
-                symbol: symbol.clone(),
-                path: path.clone(),
-                local_change: local_change.clone(),
-                remote_change: remote_change.clone(),
-                remote_actor: remote_actor.clone(),
+                symbol: String::new(),
+                path: String::new(),
+                local_change: format!("{} conflicts", conflict_count),
+                remote_change: format!("risk: {}", risk_level),
+                remote_actor: String::new(),
             })
         }
-        WsServerMessage::TaskUpdate { task_id, title, .. } => {
+        WsServerMessage::TaskSync { task_id, status, .. } => {
+            Some(EditorNotification::TaskReady {
+                task_id: task_id.clone(),
+                title: status.clone(),
+            })
+        }
+        WsServerMessage::TaskAssignment { task_id, title, .. } => {
             Some(EditorNotification::TaskReady {
                 task_id: task_id.clone(),
                 title: title.clone(),

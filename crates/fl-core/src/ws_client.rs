@@ -23,6 +23,9 @@ pub struct WsClientConfig {
     pub heartbeat_interval: Duration,
     pub pong_timeout: Duration,
     pub max_reconnect_attempts: u32,
+    /// Session ID for reconnect resume. When set, the server can restore
+    /// previous subscriptions on reconnect instead of requiring re-subscribe.
+    pub session_id: Option<String>,
 }
 
 impl WsClientConfig {
@@ -34,6 +37,7 @@ impl WsClientConfig {
             heartbeat_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(10),
             max_reconnect_attempts: 10,
+            session_id: None,
         }
     }
 }
@@ -162,6 +166,7 @@ fn ws_event_loop(
         *state.lock().unwrap() = WsConnectionState::Authenticating;
         let auth_msg = WsClientMessage::Auth {
             token: config.token.clone(),
+            session_id: config.session_id.clone(),
         };
         if socket
             .send(tungstenite::Message::Text(

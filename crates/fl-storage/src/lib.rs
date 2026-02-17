@@ -65,7 +65,8 @@ pub use segmented_event_log::SegmentedEventLog;
 pub use segmented_refs::SegmentedRefStore;
 pub use snapshot_store::{IncrementalSnapshotReport, build_incremental_index, store_snapshot_incremental};
 pub use ws_protocol::{
-    PreviewDiff, WsClientMessage, WsServerMessage, WsSubscribeRequest,
+    ConflictAlertInfo, PresenceRecord, PreviewDiff, RegionLockInfo, WsClientMessage,
+    WsServerMessage, WsSubscribeRequest,
 };
 pub use credential_store::{
     AuthMethod, CredentialEntry, CredentialStore, credentials_path, resolve_token,

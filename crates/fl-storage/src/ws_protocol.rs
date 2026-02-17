@@ -1,14 +1,25 @@
 use crate::event::{DirectiveKind, Event, EventKind, SubscriptionFilter};
 use serde::{Deserialize, Serialize};
 
-/// Client-to-server WebSocket messages
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// ---------------------------------------------------------------------------
+// Client → Server messages
+// ---------------------------------------------------------------------------
+
+/// Client-to-server WebSocket messages.
+///
+/// Wire format: `{"type": "VariantName", "data": { ... }}` (adjacently tagged).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum WsClientMessage {
     Auth {
         token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     Ping {
+        seq: u64,
+    },
+    Pong {
         seq: u64,
     },
     Subscribe(WsSubscribeRequest),
@@ -36,28 +47,103 @@ pub enum WsClientMessage {
         interval_ms: u64,
     },
     StopPreview,
+    /// Request catch-up events since a known event ID.
+    SyncRequest {
+        last_event_id: String,
+    },
+    /// Claim a task for the current agent.
+    TaskClaim {
+        task_id: String,
+    },
+    /// Release a previously claimed task.
+    TaskRelease {
+        task_id: String,
+    },
+    /// Renew the TTL on a claimed task.
+    TaskRenew {
+        task_id: String,
+    },
+    /// Acquire a region lock.
+    LockAcquire {
+        repo_id: String,
+        patterns: Vec<String>,
+        /// TTL in seconds.
+        ttl: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Release a region lock.
+    LockRelease {
+        repo_id: String,
+        lock_id: String,
+    },
+    /// Query locks for a repo.
+    LockQuery {
+        repo_id: String,
+    },
+    /// Respond to a proactive task assignment.
+    TaskAssignmentResponse {
+        task_id: String,
+        accepted: bool,
+    },
 }
 
-/// Server-to-client WebSocket messages
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// ---------------------------------------------------------------------------
+// Server → Client messages
+// ---------------------------------------------------------------------------
+
+/// Server-to-client WebSocket messages.
+///
+/// Wire format: `{"type": "VariantName", "data": { ... }}` (adjacently tagged).
+/// This matches the envelope produced by both the server's typed enum serialization
+/// and its `send_compat()` helper.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum WsServerMessage {
+    // --- Handshake / control ---
     AuthResult {
         success: bool,
         identity: Option<String>,
         error: Option<String>,
+    },
+    /// Server-initiated heartbeat ping.
+    Ping {
+        seq: u64,
     },
     Pong {
         seq: u64,
     },
     Subscribed {
         subscription_id: String,
-        filter: WsSubscribeRequest,
+        filter: serde_json::Value,
     },
+    Error {
+        code: String,
+        message: String,
+    },
+
+    // --- Event streaming ---
+    /// Single-event notification with subscription routing (planned).
     EventNotification {
         subscription_id: String,
         event: Event,
     },
+    /// Batch event broadcast from the server.
+    EventBroadcast {
+        events: Vec<serde_json::Value>,
+    },
+    /// Notification that new events were appended (sent on `fl push`).
+    EventsAppended {
+        repo_id: String,
+        count: usize,
+    },
+    /// Catch-up events in response to a SyncRequest.
+    SyncResponse {
+        events: Vec<serde_json::Value>,
+    },
+
+    // --- Presence ---
+    /// Single-actor presence update (planned single-actor delivery).
     PresenceUpdate {
         actor: String,
         workspace: String,
@@ -66,40 +152,156 @@ pub enum WsServerMessage {
         intent: Option<String>,
         departed: bool,
     },
+    /// Bulk presence broadcast for a repo.
+    PresenceBroadcast {
+        repo_id: String,
+        presences: Vec<PresenceRecord>,
+    },
+
+    // --- Agent / semantic feeds ---
+    AgentUpdate {
+        agent_id: String,
+        repo_id: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_task_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_exploration_id: Option<String>,
+        timestamp: String,
+    },
+    SemanticFeed {
+        repo_id: String,
+        change_id: String,
+        kind: String,
+        symbol_name: String,
+        file_path: String,
+        timestamp: String,
+    },
+
+    // --- Conflict / warnings ---
+    ConflictForecast {
+        repo_id: String,
+        exploration_ids: Vec<String>,
+        conflict_count: usize,
+        risk_level: String,
+        timestamp: String,
+    },
+    ConflictAlert {
+        alert: ConflictAlertInfo,
+    },
     HeadsUpWarning {
         actor: String,
         symbol: String,
         path: String,
         action: String,
     },
-    ConflictForecast {
-        symbol: String,
-        path: String,
-        local_change: String,
-        remote_change: String,
-        remote_actor: String,
-    },
-    TaskUpdate {
+
+    // --- Tasks ---
+    TaskSync {
         task_id: String,
-        title: String,
+        repo_id: String,
         status: String,
-        assignee: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        assigned_agent_id: Option<String>,
+        timestamp: String,
     },
-    Error {
-        code: String,
-        message: String,
+    TaskClaimResult {
+        task_id: String,
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        claimed_by: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
+    /// Proactive task assignment from the server.
+    TaskAssignment {
+        task_id: String,
+        repo_id: String,
+        title: String,
+        description: String,
+        priority: u8,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        affected_files: Option<Vec<String>>,
+    },
+
+    // --- Locks ---
+    LockResult {
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lock_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    LockUpdate {
+        repo_id: String,
+        action: String,
+        lock: RegionLockInfo,
+    },
+    LockList {
+        repo_id: String,
+        locks: Vec<RegionLockInfo>,
+    },
+
+    // --- Policy ---
+    PolicyVerdict {
+        decisions: Vec<serde_json::Value>,
+    },
+
+    // --- Directives (planned) ---
     Directive {
         from_actor: String,
         directive: DirectiveKind,
         reason: Option<String>,
     },
+
+    // --- Preview (planned) ---
     WorkspacePreview {
         actor: String,
         workspace: String,
         diffs: Vec<PreviewDiff>,
         timestamp: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Supporting types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PresenceRecord {
+    pub identity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub workspace: String,
+    pub files: Vec<String>,
+    pub symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RegionLockInfo {
+    pub id: String,
+    pub repo_id: String,
+    pub owner: String,
+    pub patterns: Vec<String>,
+    pub acquired_at: String,
+    pub ttl_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConflictAlertInfo {
+    pub id: String,
+    pub repo_id: String,
+    pub severity: String,
+    pub affected_files: Vec<String>,
+    pub actors: Vec<String>,
+    pub description: String,
+    pub related_lock_ids: Vec<String>,
+    pub timestamp: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,7 +395,7 @@ pub fn event_kind_name(kind: &EventKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::event::{
-        CheckpointEvent, ExplorationEvent, ExplorationAction, TaskEvent, TaskAction, UndoEvent,
+        CheckpointEvent, ExplorationAction, ExplorationEvent, TaskAction, TaskEvent, UndoEvent,
         UndoMode,
     };
     use uuid::Uuid;
@@ -270,8 +472,21 @@ mod tests {
     fn test_ws_client_message_serde_auth() {
         let msg = WsClientMessage::Auth {
             token: "test-token".to_string(),
+            session_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_ws_client_message_serde_auth_with_session() {
+        let msg = WsClientMessage::Auth {
+            token: "test-token".to_string(),
+            session_id: Some("sess-123".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("sess-123"));
         let deserialized: WsClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, deserialized);
     }
@@ -336,6 +551,29 @@ mod tests {
     }
 
     #[test]
+    fn test_ws_client_message_serde_task_claim() {
+        let msg = WsClientMessage::TaskClaim {
+            task_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_ws_client_message_serde_lock_acquire() {
+        let msg = WsClientMessage::LockAcquire {
+            repo_id: "repo-1".to_string(),
+            patterns: vec!["src/**/*.rs".to_string()],
+            ttl: 300,
+            reason: Some("editing".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
     fn test_ws_server_message_serde_auth_result() {
         let msg = WsServerMessage::AuthResult {
             success: true,
@@ -359,15 +597,11 @@ mod tests {
     fn test_ws_server_message_serde_subscribed() {
         let msg = WsServerMessage::Subscribed {
             subscription_id: "sub-123".to_string(),
-            filter: WsSubscribeRequest {
-                filter: SubscriptionFilter {
-                    paths: vec![],
-                    symbols: vec![],
-                    modules: vec![],
-                },
-                agents: vec![],
-                event_kinds: vec!["Checkpoint".to_string()],
-            },
+            filter: serde_json::json!({
+                "filter": { "paths": [], "symbols": [], "modules": [] },
+                "agents": [],
+                "event_kinds": ["Checkpoint"],
+            }),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
@@ -380,6 +614,16 @@ mod tests {
         let msg = WsServerMessage::EventNotification {
             subscription_id: "sub-123".to_string(),
             event: event.clone(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_ws_server_message_serde_event_broadcast() {
+        let msg = WsServerMessage::EventBroadcast {
+            events: vec![serde_json::json!({"id": "test", "kind": "checkpoint"})],
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
@@ -402,6 +646,25 @@ mod tests {
     }
 
     #[test]
+    fn test_ws_server_message_serde_presence_broadcast() {
+        let msg = WsServerMessage::PresenceBroadcast {
+            repo_id: "repo-1".to_string(),
+            presences: vec![PresenceRecord {
+                identity: "alice".to_string(),
+                agent_id: None,
+                workspace: "main".to_string(),
+                files: vec!["src/lib.rs".to_string()],
+                symbols: vec![],
+                intent: None,
+                last_seen: "2026-02-17T12:00:00Z".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
     fn test_ws_server_message_serde_heads_up_warning() {
         let msg = WsServerMessage::HeadsUpWarning {
             actor: "bob".to_string(),
@@ -417,11 +680,11 @@ mod tests {
     #[test]
     fn test_ws_server_message_serde_conflict_forecast() {
         let msg = WsServerMessage::ConflictForecast {
-            symbol: "process".to_string(),
-            path: "src/lib.rs".to_string(),
-            local_change: "Modified signature".to_string(),
-            remote_change: "Modified implementation".to_string(),
-            remote_actor: "charlie".to_string(),
+            repo_id: "repo-1".to_string(),
+            exploration_ids: vec!["exp-1".to_string()],
+            conflict_count: 3,
+            risk_level: "high".to_string(),
+            timestamp: "2026-02-17T12:00:00Z".to_string(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
@@ -429,12 +692,69 @@ mod tests {
     }
 
     #[test]
-    fn test_ws_server_message_serde_task_update() {
-        let msg = WsServerMessage::TaskUpdate {
+    fn test_ws_server_message_serde_task_sync() {
+        let msg = WsServerMessage::TaskSync {
             task_id: "task-456".to_string(),
-            title: "Fix bug".to_string(),
+            repo_id: "repo-1".to_string(),
             status: "in_progress".to_string(),
-            assignee: Some("alice".to_string()),
+            assigned_agent_id: Some("agent-1".to_string()),
+            timestamp: "2026-02-17T12:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_ws_server_message_serde_task_claim_result() {
+        let msg = WsServerMessage::TaskClaimResult {
+            task_id: "task-456".to_string(),
+            success: true,
+            claimed_by: Some("alice".to_string()),
+            reason: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_ws_server_message_serde_lock_result() {
+        let msg = WsServerMessage::LockResult {
+            success: true,
+            lock_id: Some("lock-1".to_string()),
+            reason: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_ws_server_message_serde_lock_update() {
+        let msg = WsServerMessage::LockUpdate {
+            repo_id: "repo-1".to_string(),
+            action: "acquired".to_string(),
+            lock: RegionLockInfo {
+                id: "lock-1".to_string(),
+                repo_id: "repo-1".to_string(),
+                owner: "alice".to_string(),
+                patterns: vec!["src/**".to_string()],
+                acquired_at: "2026-02-17T12:00:00Z".to_string(),
+                ttl_secs: 300,
+                reason: None,
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_ws_server_message_serde_events_appended() {
+        let msg = WsServerMessage::EventsAppended {
+            repo_id: "repo-1".to_string(),
+            count: 5,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
@@ -450,6 +770,16 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: WsServerMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, deserialized);
+    }
+
+    #[test]
+    fn test_wire_format_envelope() {
+        // Verify the adjacently-tagged format produces the expected envelope
+        let msg = WsClientMessage::Ping { seq: 1 };
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "Ping");
+        assert_eq!(v["data"]["seq"], 1);
     }
 
     #[test]

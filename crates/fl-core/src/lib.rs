@@ -25,7 +25,10 @@ pub use event::{
 };
 pub use fl_storage::ApiCallRecord;
 pub use fl_storage::{CloneReport, PullReport, PushReport, RefKind, RemoteUrl, RepoRef, RoostEntry, WorkspaceRefConfig};
-pub use fl_storage::{PreviewDiff, WsClientMessage, WsServerMessage, WsSubscribeRequest};
+pub use fl_storage::{
+    ConflictAlertInfo, PresenceRecord, PreviewDiff, RegionLockInfo, WsClientMessage,
+    WsServerMessage, WsSubscribeRequest,
+};
 pub use fl_collab::DirectiveSummary;
 pub use repo::{
     CheckpointIntentMetadata, ConflictDetail, ConflictStatus, ConflictSummary, ConvertReport,
