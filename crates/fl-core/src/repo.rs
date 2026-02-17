@@ -7948,6 +7948,15 @@ impl Repo {
         // Pull with options.
         let pull_report = repo.pull_with_options("origin", None, depth, &final_sparse, lazy)?;
 
+        // Checkout working directory from the HEAD snapshot.
+        if !lazy {
+            if let Some(cp_event) = repo.latest_checkpoint() {
+                if let EventKind::Checkpoint(cp) = &cp_event.kind {
+                    repo.restore_workspace_from_snapshot(cp.snapshot_id)?;
+                }
+            }
+        }
+
         Ok(fl_storage::CloneReport {
             pull: pull_report,
             clone_dir: dir.to_string_lossy().to_string(),
