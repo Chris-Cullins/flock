@@ -5606,6 +5606,27 @@ impl Repo {
         if path.is_dir() {
             return Ok(path);
         }
+        // Native mode: materialize snapshot from block store
+        if self.repo_mode()? == RepoMode::Native {
+            let store = ContentStore::for_root(self.root());
+            let file_index = FileIndex::for_root(self.root());
+            let index = file_index.read(snapshot_id)?;
+
+            fs::create_dir_all(&path)?;
+            for (rel_path, entry) in &index.files {
+                let target = path.join(rel_path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut contents = Vec::with_capacity(entry.size as usize);
+                for block_ref in &entry.blocks {
+                    let block_data = store.get(&block_ref.hash)?;
+                    contents.extend_from_slice(&block_data);
+                }
+                fs::write(&target, &contents)?;
+            }
+            return Ok(path);
+        }
         // Try lazy extraction from git in colocated mode
         if self.repo_mode()? == RepoMode::GitColocated {
             if let Some(sha) = self.git_sha_for_snapshot(snapshot_id)? {
