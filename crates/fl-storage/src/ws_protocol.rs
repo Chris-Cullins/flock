@@ -315,6 +315,9 @@ pub struct PreviewDiff {
 /// Subscription request with filtering criteria
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WsSubscribeRequest {
+    /// Repository name (used by the server to route subscriptions).
+    #[serde(default)]
+    pub repo: String,
     pub filter: SubscriptionFilter,
     #[serde(default)]
     pub agents: Vec<String>,
@@ -502,6 +505,7 @@ mod tests {
     #[test]
     fn test_ws_client_message_serde_subscribe() {
         let msg = WsClientMessage::Subscribe(WsSubscribeRequest {
+            repo: "test-repo".to_string(),
             filter: SubscriptionFilter {
                 paths: vec!["src/main.rs".to_string()],
                 symbols: vec!["main".to_string()],
@@ -785,6 +789,7 @@ mod tests {
     #[test]
     fn test_matches_event_empty_filter_matches_all() {
         let filter = WsSubscribeRequest {
+            repo: String::new(),
             filter: SubscriptionFilter {
                 paths: vec![],
                 symbols: vec![],
@@ -799,6 +804,7 @@ mod tests {
     #[test]
     fn test_matches_event_event_kinds_filter() {
         let filter = WsSubscribeRequest {
+            repo: String::new(),
             filter: SubscriptionFilter {
                 paths: vec![],
                 symbols: vec![],
@@ -814,6 +820,7 @@ mod tests {
     #[test]
     fn test_matches_event_agents_filter() {
         let filter = WsSubscribeRequest {
+            repo: String::new(),
             filter: SubscriptionFilter {
                 paths: vec![],
                 symbols: vec![],
@@ -829,6 +836,7 @@ mod tests {
     #[test]
     fn test_matches_event_combined_filters() {
         let filter = WsSubscribeRequest {
+            repo: String::new(),
             filter: SubscriptionFilter {
                 paths: vec![],
                 symbols: vec![],
@@ -845,6 +853,7 @@ mod tests {
     #[test]
     fn test_matches_event_paths_filter_returns_true() {
         let filter = WsSubscribeRequest {
+            repo: String::new(),
             filter: SubscriptionFilter {
                 paths: vec!["src/main.rs".to_string()],
                 symbols: vec![],

@@ -2603,7 +2603,7 @@ fn main() -> Result<()> {
         Command::Preview { workspace, interval, remote, json } => {
             let repo = Repo::discover(cwd)?;
             let roost = remote.as_deref().unwrap_or("origin");
-            let ws = repo.ws_connect(roost).ok();
+            let ws = repo.ws_connect(roost).ok().map(|(client, _)| client);
             let ws_name = workspace.unwrap_or_else(|| "main".to_string());
 
             let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3431,7 +3431,7 @@ fn main() -> Result<()> {
         } => {
             let repo = Repo::discover(cwd)?;
             let roost = remote.as_deref().unwrap_or("origin");
-            let ws = repo.ws_connect(roost)?;
+            let (ws, repo_path) = repo.ws_connect(roost)?;
 
             // Subscribe with filters
             let filter = fl_core::SubscriptionFilter {
@@ -3440,6 +3440,7 @@ fn main() -> Result<()> {
                 modules: vec![],
             };
             let sub = fl_core::WsSubscribeRequest {
+                repo: repo_path,
                 filter,
                 agents: agent,
                 event_kinds: kind,
@@ -4453,8 +4454,9 @@ fn print_ws_message(msg: &fl_core::WsServerMessage) {
 }
 
 fn stream_live_task_updates(repo: &Repo, roost: &str, json: bool) -> Result<()> {
-    let ws = repo.ws_connect(roost)?;
+    let (ws, repo_path) = repo.ws_connect(roost)?;
     let sub = fl_core::WsSubscribeRequest {
+        repo: repo_path,
         filter: fl_core::SubscriptionFilter {
             paths: vec![],
             symbols: vec![],
@@ -4499,7 +4501,7 @@ fn run_editor_server(repo: &Repo, roost: &str) -> Result<()> {
     let mut session = EditorSession::new();
 
     // Try to connect WebSocket (non-fatal if it fails — editor still works locally)
-    let ws = repo.ws_connect(roost).ok();
+    let ws = repo.ws_connect(roost).ok().map(|(client, _)| client);
 
     for line in stdin.lock().lines() {
         let line = line?;

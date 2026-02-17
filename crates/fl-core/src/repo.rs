@@ -8413,10 +8413,12 @@ impl Repo {
     }
 
     /// Connect to a roost via WebSocket for real-time event streaming.
+    /// Returns `(WsClient, repo_path)` where `repo_path` is the repository
+    /// name from the roost URL (needed for Subscribe messages).
     pub fn ws_connect(
         &self,
         roost_name: &str,
-    ) -> Result<crate::ws_client::WsClient> {
+    ) -> Result<(crate::ws_client::WsClient, String)> {
         self.assert_initialized()?;
         let config = fl_storage::load_roosts(self.root())?;
         let entry = fl_storage::find_roost(&config, roost_name)
@@ -8424,12 +8426,14 @@ impl Repo {
 
         let url = fl_storage::RemoteUrl::parse(&entry.url)?;
         let ws_url = url.ws_url()?;
+        let repo_path = url.path.trim_start_matches('/').to_string();
         let resolved_token =
             fl_storage::resolve_token(entry.token.as_deref(), url.host.as_deref())?;
         let token = resolved_token.unwrap_or_default();
 
         let ws_config = crate::ws_client::WsClientConfig::new(ws_url, token);
-        crate::ws_client::WsClient::connect(ws_config)
+        let client = crate::ws_client::WsClient::connect(ws_config)?;
+        Ok((client, repo_path))
     }
 
     // -----------------------------------------------------------------------
