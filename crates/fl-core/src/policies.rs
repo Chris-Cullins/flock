@@ -2,8 +2,10 @@ use std::fs;
 use std::path::Path;
 
 use fl_policy::{
-    BudgetExceedAction, BudgetLimits, RateLimitExceedAction, RateLimits, ScopeEnforceMode,
-    ScopeMode, ScopePolicy, TestFailureAction, TestRequirements,
+    AntiPatternConfig, AntiPatternEnforce, AntiPatternRule, ArchRuleEnforce, ArchitectureRules,
+    BudgetExceedAction, BudgetLimits, DependencyDirectionRule, LayerBoundaryRule,
+    RateLimitExceedAction, RateLimits, ScopeEnforceMode, ScopeMode, ScopePolicy,
+    TestFailureAction, TestRequirements,
 };
 
 /// Configuration for commit hygiene enforcement.
@@ -37,6 +39,8 @@ pub struct PoliciesConfig {
     pub rate_limits: RateLimits,
     pub commit_hygiene: CommitHygieneConfig,
     pub test_requirements: TestRequirements,
+    pub architecture: ArchitectureRules,
+    pub anti_patterns: AntiPatternConfig,
 }
 
 impl Default for PoliciesConfig {
@@ -47,6 +51,8 @@ impl Default for PoliciesConfig {
             rate_limits: RateLimits::default(),
             commit_hygiene: CommitHygieneConfig::default(),
             test_requirements: TestRequirements::default(),
+            architecture: ArchitectureRules::default(),
+            anti_patterns: AntiPatternConfig::default(),
         }
     }
 }
@@ -104,6 +110,20 @@ enabled = false
 # test_command = "cargo test"
 # require_new_tests = false
 # on_failure = "block"
+
+# --- Architecture rules ---
+# Enforce layer boundaries and dependency direction.
+# Rules are defined in .flock/arch-rules.toml (see below for inline format).
+[architecture]
+enabled = false
+# enforce = "block"  # "block", "gate", or "warn"
+
+# --- Anti-pattern detection ---
+# Detect domain-specific anti-patterns in file contents.
+# Rules are defined in .flock/anti-patterns.toml (see below for inline format).
+[anti_patterns]
+enabled = false
+# enforce = "block_with_explanation"  # "block_with_explanation", "gate", or "warn"
 "#;
 
 /// Parse a `policies.toml` file into a `PoliciesConfig`.
@@ -136,6 +156,8 @@ pub fn parse_policies_config(content: &str) -> PoliciesConfig {
             "rate_limits" => parse_rate_limit_field(&mut config.rate_limits, key, value),
             "commit_hygiene" => parse_commit_hygiene_field(&mut config.commit_hygiene, key, value),
             "test_requirements" => parse_test_requirements_field(&mut config.test_requirements, key, value),
+            "architecture" => parse_architecture_field(&mut config.architecture, key, value),
+            "anti_patterns" => parse_anti_patterns_field(&mut config.anti_patterns, key, value),
             _ => {}
         }
     }
@@ -243,6 +265,198 @@ fn parse_test_requirements_field(config: &mut TestRequirements, key: &str, value
     }
 }
 
+fn parse_architecture_field(config: &mut ArchitectureRules, key: &str, value: &str) {
+    match key {
+        "enabled" => config.enabled = value == "true",
+        "enforce" => {
+            config.enforce = match parse_toml_string(value).as_str() {
+                "gate" => ArchRuleEnforce::Gate,
+                "warn" => ArchRuleEnforce::Warn,
+                _ => ArchRuleEnforce::Block,
+            };
+        }
+        _ => {}
+    }
+}
+
+fn parse_anti_patterns_field(config: &mut AntiPatternConfig, key: &str, value: &str) {
+    match key {
+        "enabled" => config.enabled = value == "true",
+        "enforce" => {
+            config.enforce = match parse_toml_string(value).as_str() {
+                "gate" => AntiPatternEnforce::Gate,
+                "warn" => AntiPatternEnforce::Warn,
+                _ => AntiPatternEnforce::BlockWithExplanation,
+            };
+        }
+        _ => {}
+    }
+}
+
+/// Parse `.flock/arch-rules.toml` — a simple line-oriented format:
+///
+/// ```toml
+/// # Layer boundary rules
+/// [layer.presentation]
+/// file_pattern = "src/ui/**"
+/// allowed_deps = "domain"
+///
+/// [layer.domain]
+/// file_pattern = "src/domain/**"
+/// allowed_deps = ""
+///
+/// # Dependency direction rules
+/// [deny.no-ui-to-infra]
+/// from_pattern = "src/ui/**"
+/// forbidden_pattern = "src/infra/**"
+/// ```
+pub fn parse_arch_rules(content: &str) -> (Vec<LayerBoundaryRule>, Vec<DependencyDirectionRule>) {
+    let mut layers = Vec::new();
+    let mut denies = Vec::new();
+    let mut current_section = "";
+    let mut current_name = String::new();
+    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    let flush =
+        |section: &str,
+         name: &str,
+         fields: &std::collections::HashMap<String, String>,
+         layers: &mut Vec<LayerBoundaryRule>,
+         denies: &mut Vec<DependencyDirectionRule>| {
+            if section.starts_with("layer.") && !name.is_empty() {
+                let file_pattern = fields.get("file_pattern").cloned().unwrap_or_default();
+                let allowed_deps: Vec<String> = fields
+                    .get("allowed_deps")
+                    .map(|s| {
+                        s.split(',')
+                            .map(|d| d.trim().to_string())
+                            .filter(|d| !d.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                layers.push(LayerBoundaryRule {
+                    layer: name.to_string(),
+                    file_pattern,
+                    allowed_deps,
+                });
+            } else if section.starts_with("deny.") && !name.is_empty() {
+                let from_pattern = fields.get("from_pattern").cloned().unwrap_or_default();
+                let forbidden_pattern =
+                    fields.get("forbidden_pattern").cloned().unwrap_or_default();
+                let description = fields
+                    .get("description")
+                    .cloned()
+                    .unwrap_or_else(|| name.to_string());
+                denies.push(DependencyDirectionRule {
+                    description,
+                    from_pattern,
+                    forbidden_pattern,
+                });
+            }
+        };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // Flush previous section.
+            flush(current_section, &current_name, &fields, &mut layers, &mut denies);
+            let section_str = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+            current_section = if section_str.starts_with("layer.") {
+                current_name = section_str.strip_prefix("layer.").unwrap_or("").to_string();
+                "layer."
+            } else if section_str.starts_with("deny.") {
+                current_name = section_str.strip_prefix("deny.").unwrap_or("").to_string();
+                "deny."
+            } else {
+                current_name.clear();
+                ""
+            };
+            fields.clear();
+            continue;
+        }
+
+        if let Some((key, value)) = trimmed.split_once('=') {
+            fields.insert(key.trim().to_string(), parse_toml_string(value.trim()));
+        }
+    }
+    // Flush last section.
+    flush(current_section, &current_name, &fields, &mut layers, &mut denies);
+
+    (layers, denies)
+}
+
+/// Parse `.flock/anti-patterns.toml` — a simple line-oriented format:
+///
+/// ```toml
+/// [rule.no-float-currency]
+/// file_pattern = "src/finance/**"
+/// pattern = "f64"
+/// description = "Float used for currency"
+/// explanation = "Floating point causes rounding errors"
+/// fix_suggestion = "Use Decimal type instead"
+/// ```
+pub fn parse_anti_pattern_rules(content: &str) -> Vec<AntiPatternRule> {
+    let mut rules = Vec::new();
+    let mut current_id = String::new();
+    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut in_rule = false;
+
+    let flush =
+        |id: &str, fields: &std::collections::HashMap<String, String>, rules: &mut Vec<AntiPatternRule>| {
+            if id.is_empty() {
+                return;
+            }
+            rules.push(AntiPatternRule {
+                id: id.to_string(),
+                description: fields.get("description").cloned().unwrap_or_else(|| id.to_string()),
+                file_pattern: fields.get("file_pattern").cloned().unwrap_or_else(|| "**".to_string()),
+                pattern: fields.get("pattern").cloned().unwrap_or_default(),
+                explanation: fields.get("explanation").cloned().unwrap_or_default(),
+                fix_suggestion: fields.get("fix_suggestion").cloned().unwrap_or_default(),
+            });
+        };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            // Flush previous rule.
+            if in_rule {
+                flush(&current_id, &fields, &mut rules);
+            }
+            let section = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+            if let Some(id) = section.strip_prefix("rule.") {
+                current_id = id.to_string();
+                in_rule = true;
+            } else {
+                current_id.clear();
+                in_rule = false;
+            }
+            fields.clear();
+            continue;
+        }
+
+        if in_rule {
+            if let Some((key, value)) = trimmed.split_once('=') {
+                fields.insert(key.trim().to_string(), parse_toml_string(value.trim()));
+            }
+        }
+    }
+    // Flush last rule.
+    if in_rule {
+        flush(&current_id, &fields, &mut rules);
+    }
+
+    rules
+}
+
 /// Parse a TOML string value (strip surrounding quotes).
 fn parse_toml_string(s: &str) -> String {
     let s = s.trim();
@@ -285,12 +499,32 @@ pub fn parse_duration_to_secs(s: &str) -> Option<u64> {
 }
 
 /// Load policies config from `.flock/policies.toml`, falling back to defaults.
+///
+/// Also loads architecture rules from `.flock/arch-rules.toml` and
+/// anti-pattern rules from `.flock/anti-patterns.toml` if those files exist.
 pub fn load_policies_config(root: &Path) -> PoliciesConfig {
     let config_path = root.join(".flock/policies.toml");
-    match fs::read_to_string(&config_path) {
+    let mut config = match fs::read_to_string(&config_path) {
         Ok(content) => parse_policies_config(&content),
         Err(_) => PoliciesConfig::default(),
+    };
+
+    // Load architecture rules from external file.
+    let arch_rules_path = root.join(".flock/arch-rules.toml");
+    if let Ok(content) = fs::read_to_string(&arch_rules_path) {
+        let (layers, denies) = parse_arch_rules(&content);
+        config.architecture.layer_boundaries = layers;
+        config.architecture.dependency_direction = denies;
     }
+
+    // Load anti-pattern rules from external file.
+    let anti_patterns_path = root.join(".flock/anti-patterns.toml");
+    if let Ok(content) = fs::read_to_string(&anti_patterns_path) {
+        let rules = parse_anti_pattern_rules(&content);
+        config.anti_patterns.rules = rules;
+    }
+
+    config
 }
 
 #[cfg(test)]
@@ -462,5 +696,93 @@ on_exceed = "block"
         assert_eq!(config.test_requirements.test_command, "cargo test");
         assert!(!config.test_requirements.require_new_tests);
         assert_eq!(config.test_requirements.on_failure, TestFailureAction::Block);
+    }
+
+    #[test]
+    fn test_parse_architecture_config() {
+        let toml = r#"
+[architecture]
+enabled = true
+enforce = "gate"
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.architecture.enabled);
+        assert_eq!(config.architecture.enforce, ArchRuleEnforce::Gate);
+    }
+
+    #[test]
+    fn test_parse_anti_patterns_config() {
+        let toml = r#"
+[anti_patterns]
+enabled = true
+enforce = "warn"
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.anti_patterns.enabled);
+        assert_eq!(config.anti_patterns.enforce, AntiPatternEnforce::Warn);
+    }
+
+    #[test]
+    fn test_parse_arch_rules_file() {
+        let content = r#"
+[layer.presentation]
+file_pattern = "src/ui/**"
+allowed_deps = "domain,shared"
+
+[layer.domain]
+file_pattern = "src/domain/**"
+allowed_deps = ""
+
+[deny.no-ui-to-infra]
+from_pattern = "src/ui/**"
+forbidden_pattern = "src/infra/**"
+description = "UI must not import from infra"
+"#;
+        let (layers, denies) = parse_arch_rules(content);
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].layer, "presentation");
+        assert_eq!(layers[0].file_pattern, "src/ui/**");
+        assert_eq!(layers[0].allowed_deps, vec!["domain", "shared"]);
+        assert_eq!(layers[1].layer, "domain");
+        assert!(layers[1].allowed_deps.is_empty());
+        assert_eq!(denies.len(), 1);
+        assert_eq!(denies[0].from_pattern, "src/ui/**");
+        assert_eq!(denies[0].forbidden_pattern, "src/infra/**");
+    }
+
+    #[test]
+    fn test_parse_anti_pattern_rules_file() {
+        let content = r#"
+[rule.no-float-currency]
+file_pattern = "src/finance/**"
+pattern = "f64"
+description = "Float used for currency"
+explanation = "Floating point causes rounding errors"
+fix_suggestion = "Use Decimal type instead"
+
+[rule.no-hardcoded-rates]
+file_pattern = "src/**"
+pattern = "exchange_rate ="
+description = "Hardcoded exchange rate"
+explanation = "Exchange rates change frequently"
+fix_suggestion = "Use a rate service or config"
+"#;
+        let rules = parse_anti_pattern_rules(content);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].id, "no-float-currency");
+        assert_eq!(rules[0].pattern, "f64");
+        assert_eq!(rules[1].id, "no-hardcoded-rates");
+        assert_eq!(rules[1].pattern, "exchange_rate =");
+    }
+
+    #[test]
+    fn test_default_architecture_and_anti_patterns() {
+        let config = PoliciesConfig::default();
+        assert!(!config.architecture.enabled);
+        assert_eq!(config.architecture.enforce, ArchRuleEnforce::Block);
+        assert!(config.architecture.layer_boundaries.is_empty());
+        assert!(!config.anti_patterns.enabled);
+        assert_eq!(config.anti_patterns.enforce, AntiPatternEnforce::BlockWithExplanation);
+        assert!(config.anti_patterns.rules.is_empty());
     }
 }

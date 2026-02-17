@@ -29,6 +29,8 @@ pub enum PolicyCategory {
     Budget,
     RateLimit,
     TestRequirement,
+    ArchitectureRule,
+    AntiPattern,
 }
 
 /// The operation being checked.
@@ -828,6 +830,435 @@ fn has_matching_test_file(source_path: &str, test_files: &[String]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Architecture rules types (12.5f)
+// ---------------------------------------------------------------------------
+
+/// Enforcement level for architecture rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArchRuleEnforce {
+    Block,
+    Gate,
+    Warn,
+}
+
+impl Default for ArchRuleEnforce {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+/// A layer boundary rule — files matching `layer_pattern` may only import
+/// from layers listed in `allowed_deps`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerBoundaryRule {
+    /// Human-readable layer name (e.g. "presentation", "domain", "infra").
+    pub layer: String,
+    /// Glob pattern matching files in this layer (e.g. "src/ui/**").
+    pub file_pattern: String,
+    /// Layers this layer is allowed to depend on.
+    pub allowed_deps: Vec<String>,
+}
+
+/// A dependency direction rule — files matching `from_pattern` must not
+/// import files matching `forbidden_pattern`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyDirectionRule {
+    /// Description for error messages.
+    pub description: String,
+    /// Glob pattern for the source (importing) files.
+    pub from_pattern: String,
+    /// Glob pattern for forbidden dependencies.
+    pub forbidden_pattern: String,
+}
+
+/// A namespace convention rule — files matching `file_pattern` must declare
+/// symbols whose names match `name_pattern` (regex).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceConventionRule {
+    /// Description for error messages.
+    pub description: String,
+    /// Glob pattern for files this rule applies to.
+    pub file_pattern: String,
+    /// Required module/namespace prefix (e.g. "MyApp.Services.").
+    pub required_prefix: String,
+}
+
+/// Top-level architecture rules config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchitectureRules {
+    pub enabled: bool,
+    pub enforce: ArchRuleEnforce,
+    pub layer_boundaries: Vec<LayerBoundaryRule>,
+    pub dependency_direction: Vec<DependencyDirectionRule>,
+    pub namespace_conventions: Vec<NamespaceConventionRule>,
+}
+
+impl Default for ArchitectureRules {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            enforce: ArchRuleEnforce::default(),
+            layer_boundaries: Vec::new(),
+            dependency_direction: Vec::new(),
+            namespace_conventions: Vec::new(),
+        }
+    }
+}
+
+/// Info about a detected import for architecture rule checking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportInfo {
+    /// The file containing the import.
+    pub source_file: String,
+    /// The path or module being imported.
+    pub imported_path: String,
+}
+
+/// Check architecture dependency direction rules for a set of imports.
+pub fn check_architecture_rules(
+    rules: &ArchitectureRules,
+    imports: &[ImportInfo],
+    files_changed: &[String],
+) -> PolicyDecision {
+    if !rules.enabled {
+        return PolicyDecision {
+            policy_name: "architecture".to_string(),
+            category: PolicyCategory::ArchitectureRule,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::Checkpoint,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut affected: Vec<String> = Vec::new();
+
+    // Check dependency direction rules.
+    for rule in &rules.dependency_direction {
+        let from_glob = match glob::Pattern::new(&rule.from_pattern) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        let forbidden_glob = match glob::Pattern::new(&rule.forbidden_pattern) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        for import in imports {
+            if from_glob.matches(&import.source_file)
+                && forbidden_glob.matches(&import.imported_path)
+            {
+                violations.push(format!(
+                    "{}: {} imports {} — {}",
+                    import.source_file, import.source_file,
+                    import.imported_path, rule.description
+                ));
+                if !affected.contains(&import.source_file) {
+                    affected.push(import.source_file.clone());
+                }
+            }
+        }
+    }
+
+    // Check layer boundary rules.
+    for rule in &rules.layer_boundaries {
+        let layer_glob = match glob::Pattern::new(&rule.file_pattern) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        for import in imports {
+            if !layer_glob.matches(&import.source_file) {
+                continue;
+            }
+            // Check if the imported path belongs to an allowed layer.
+            let import_in_allowed_layer = rules.layer_boundaries.iter().any(|other_rule| {
+                rule.allowed_deps.contains(&other_rule.layer)
+                    && glob::Pattern::new(&other_rule.file_pattern)
+                        .map(|g| g.matches(&import.imported_path))
+                        .unwrap_or(false)
+            });
+            // Also allow importing from the same layer.
+            let import_in_same_layer = layer_glob.matches(&import.imported_path);
+            // Allow imports that don't match any defined layer (external deps).
+            let import_in_any_layer = rules.layer_boundaries.iter().any(|other_rule| {
+                glob::Pattern::new(&other_rule.file_pattern)
+                    .map(|g| g.matches(&import.imported_path))
+                    .unwrap_or(false)
+            });
+
+            if import_in_any_layer && !import_in_allowed_layer && !import_in_same_layer {
+                let target_layer = rules
+                    .layer_boundaries
+                    .iter()
+                    .find(|r| {
+                        glob::Pattern::new(&r.file_pattern)
+                            .map(|g| g.matches(&import.imported_path))
+                            .unwrap_or(false)
+                    })
+                    .map(|r| r.layer.as_str())
+                    .unwrap_or("unknown");
+                violations.push(format!(
+                    "{}: layer \"{}\" cannot depend on layer \"{}\" (imported {})",
+                    import.source_file, rule.layer, target_layer, import.imported_path
+                ));
+                if !affected.contains(&import.source_file) {
+                    affected.push(import.source_file.clone());
+                }
+            }
+        }
+    }
+
+    // Check namespace conventions.
+    for rule in &rules.namespace_conventions {
+        let file_glob = match glob::Pattern::new(&rule.file_pattern) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        for path in files_changed {
+            if !file_glob.matches(path) {
+                continue;
+            }
+            // Extract the file stem as a proxy for the primary symbol name.
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if !stem.is_empty() && !stem.starts_with(&rule.required_prefix) {
+                violations.push(format!(
+                    "{}: file does not follow namespace convention (expected prefix \"{}\"): {}",
+                    path, rule.required_prefix, rule.description
+                ));
+                if !affected.contains(path) {
+                    affected.push(path.clone());
+                }
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        return PolicyDecision {
+            policy_name: "architecture".to_string(),
+            category: PolicyCategory::ArchitectureRule,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::Checkpoint,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let reason = format!(
+        "{} architecture rule violation(s):\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+
+    let verdict = match rules.enforce {
+        ArchRuleEnforce::Block => PolicyVerdict::Block {
+            reason,
+            fix_suggestion: Some(
+                "Restructure imports to respect layer boundaries and dependency direction rules"
+                    .to_string(),
+            ),
+        },
+        ArchRuleEnforce::Gate => PolicyVerdict::Gate {
+            reason,
+            justification_required: true,
+        },
+        ArchRuleEnforce::Warn => PolicyVerdict::Allow,
+    };
+
+    PolicyDecision {
+        policy_name: "architecture".to_string(),
+        category: PolicyCategory::ArchitectureRule,
+        verdict,
+        operation: PolicyOperation::Checkpoint,
+        actor: String::new(),
+        task_id: None,
+        exploration_id: None,
+        affected_files: affected,
+        escalation_context: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anti-pattern detection types (12.5g)
+// ---------------------------------------------------------------------------
+
+/// Enforcement level for anti-pattern rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AntiPatternEnforce {
+    BlockWithExplanation,
+    Gate,
+    Warn,
+}
+
+impl Default for AntiPatternEnforce {
+    fn default() -> Self {
+        Self::BlockWithExplanation
+    }
+}
+
+/// A single anti-pattern rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AntiPatternRule {
+    /// Unique rule ID (e.g. "no-float-currency").
+    pub id: String,
+    /// Human-readable description of what this rule catches.
+    pub description: String,
+    /// Glob pattern for files to check (e.g. "src/finance/**").
+    pub file_pattern: String,
+    /// Text pattern to search for (simple substring or regex-like).
+    pub pattern: String,
+    /// Explanation of why this is an anti-pattern.
+    pub explanation: String,
+    /// Suggested fix.
+    pub fix_suggestion: String,
+}
+
+/// Top-level anti-pattern detection config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AntiPatternConfig {
+    pub enabled: bool,
+    pub enforce: AntiPatternEnforce,
+    pub rules: Vec<AntiPatternRule>,
+}
+
+impl Default for AntiPatternConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            enforce: AntiPatternEnforce::default(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// A detected anti-pattern match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AntiPatternMatch {
+    pub rule_id: String,
+    pub file: String,
+    pub line_number: Option<u32>,
+    pub matched_text: String,
+}
+
+/// Check file contents against anti-pattern rules.
+pub fn check_anti_patterns(
+    config: &AntiPatternConfig,
+    file_contents: &[(String, String)], // (path, content)
+) -> PolicyDecision {
+    if !config.enabled {
+        return PolicyDecision {
+            policy_name: "anti_patterns".to_string(),
+            category: PolicyCategory::AntiPattern,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::Checkpoint,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let mut matches: Vec<(String, &AntiPatternRule)> = Vec::new();
+    let mut affected: Vec<String> = Vec::new();
+
+    for rule in &config.rules {
+        let file_glob = match glob::Pattern::new(&rule.file_pattern) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        for (path, content) in file_contents {
+            if !file_glob.matches(path) {
+                continue;
+            }
+
+            // Simple substring match against file content lines.
+            for (line_idx, line) in content.lines().enumerate() {
+                if line.contains(&rule.pattern) {
+                    matches.push((
+                        format!(
+                            "{}:{}: [{}] {} — {}",
+                            path,
+                            line_idx + 1,
+                            rule.id,
+                            rule.description,
+                            rule.explanation
+                        ),
+                        rule,
+                    ));
+                    if !affected.contains(path) {
+                        affected.push(path.clone());
+                    }
+                    break; // One match per rule per file is sufficient.
+                }
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        return PolicyDecision {
+            policy_name: "anti_patterns".to_string(),
+            category: PolicyCategory::AntiPattern,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::Checkpoint,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let violations: Vec<String> = matches.iter().map(|(desc, _)| desc.clone()).collect();
+    let fix_suggestions: Vec<String> = matches
+        .iter()
+        .map(|(_, rule)| format!("[{}] {}", rule.id, rule.fix_suggestion))
+        .collect();
+
+    let reason = format!(
+        "{} anti-pattern(s) detected:\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+
+    let verdict = match config.enforce {
+        AntiPatternEnforce::BlockWithExplanation => PolicyVerdict::Block {
+            reason,
+            fix_suggestion: Some(fix_suggestions.join("\n")),
+        },
+        AntiPatternEnforce::Gate => PolicyVerdict::Gate {
+            reason,
+            justification_required: true,
+        },
+        AntiPatternEnforce::Warn => PolicyVerdict::Allow,
+    };
+
+    PolicyDecision {
+        policy_name: "anti_patterns".to_string(),
+        category: PolicyCategory::AntiPattern,
+        verdict,
+        operation: PolicyOperation::Checkpoint,
+        actor: String::new(),
+        task_id: None,
+        exploration_id: None,
+        affected_files: affected,
+        escalation_context: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1398,5 +1829,240 @@ mod tests {
         };
         assert!(!gated.is_blocked());
         assert!(gated.is_gated());
+    }
+
+    // --- Architecture rules tests ---
+
+    #[test]
+    fn arch_rules_disabled_allows() {
+        let rules = ArchitectureRules::default();
+        let decision = check_architecture_rules(&rules, &[], &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn arch_dependency_direction_blocks_violation() {
+        let rules = ArchitectureRules {
+            enabled: true,
+            enforce: ArchRuleEnforce::Block,
+            layer_boundaries: Vec::new(),
+            dependency_direction: vec![DependencyDirectionRule {
+                description: "UI must not import from infra".to_string(),
+                from_pattern: "src/ui/**".to_string(),
+                forbidden_pattern: "src/infra/**".to_string(),
+            }],
+            namespace_conventions: Vec::new(),
+        };
+        let imports = vec![ImportInfo {
+            source_file: "src/ui/dashboard.ts".to_string(),
+            imported_path: "src/infra/database.ts".to_string(),
+        }];
+        let decision = check_architecture_rules(&rules, &imports, &[]);
+        assert!(decision.is_blocked());
+        assert_eq!(decision.affected_files, vec!["src/ui/dashboard.ts"]);
+    }
+
+    #[test]
+    fn arch_dependency_direction_allows_valid_import() {
+        let rules = ArchitectureRules {
+            enabled: true,
+            enforce: ArchRuleEnforce::Block,
+            layer_boundaries: Vec::new(),
+            dependency_direction: vec![DependencyDirectionRule {
+                description: "UI must not import from infra".to_string(),
+                from_pattern: "src/ui/**".to_string(),
+                forbidden_pattern: "src/infra/**".to_string(),
+            }],
+            namespace_conventions: Vec::new(),
+        };
+        let imports = vec![ImportInfo {
+            source_file: "src/ui/dashboard.ts".to_string(),
+            imported_path: "src/domain/user.ts".to_string(),
+        }];
+        let decision = check_architecture_rules(&rules, &imports, &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn arch_layer_boundary_blocks_forbidden_dep() {
+        let rules = ArchitectureRules {
+            enabled: true,
+            enforce: ArchRuleEnforce::Block,
+            layer_boundaries: vec![
+                LayerBoundaryRule {
+                    layer: "presentation".to_string(),
+                    file_pattern: "src/ui/**".to_string(),
+                    allowed_deps: vec!["domain".to_string()],
+                },
+                LayerBoundaryRule {
+                    layer: "domain".to_string(),
+                    file_pattern: "src/domain/**".to_string(),
+                    allowed_deps: vec![],
+                },
+                LayerBoundaryRule {
+                    layer: "infra".to_string(),
+                    file_pattern: "src/infra/**".to_string(),
+                    allowed_deps: vec!["domain".to_string()],
+                },
+            ],
+            dependency_direction: Vec::new(),
+            namespace_conventions: Vec::new(),
+        };
+        // Presentation importing from infra — not allowed.
+        let imports = vec![ImportInfo {
+            source_file: "src/ui/page.ts".to_string(),
+            imported_path: "src/infra/db.ts".to_string(),
+        }];
+        let decision = check_architecture_rules(&rules, &imports, &[]);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn arch_layer_boundary_allows_valid_dep() {
+        let rules = ArchitectureRules {
+            enabled: true,
+            enforce: ArchRuleEnforce::Block,
+            layer_boundaries: vec![
+                LayerBoundaryRule {
+                    layer: "presentation".to_string(),
+                    file_pattern: "src/ui/**".to_string(),
+                    allowed_deps: vec!["domain".to_string()],
+                },
+                LayerBoundaryRule {
+                    layer: "domain".to_string(),
+                    file_pattern: "src/domain/**".to_string(),
+                    allowed_deps: vec![],
+                },
+            ],
+            dependency_direction: Vec::new(),
+            namespace_conventions: Vec::new(),
+        };
+        // Presentation importing from domain — allowed.
+        let imports = vec![ImportInfo {
+            source_file: "src/ui/page.ts".to_string(),
+            imported_path: "src/domain/user.ts".to_string(),
+        }];
+        let decision = check_architecture_rules(&rules, &imports, &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn arch_rules_gate_mode() {
+        let rules = ArchitectureRules {
+            enabled: true,
+            enforce: ArchRuleEnforce::Gate,
+            layer_boundaries: Vec::new(),
+            dependency_direction: vec![DependencyDirectionRule {
+                description: "no cross-boundary".to_string(),
+                from_pattern: "src/a/**".to_string(),
+                forbidden_pattern: "src/b/**".to_string(),
+            }],
+            namespace_conventions: Vec::new(),
+        };
+        let imports = vec![ImportInfo {
+            source_file: "src/a/foo.rs".to_string(),
+            imported_path: "src/b/bar.rs".to_string(),
+        }];
+        let decision = check_architecture_rules(&rules, &imports, &[]);
+        assert!(decision.is_gated());
+    }
+
+    // --- Anti-pattern tests ---
+
+    #[test]
+    fn anti_pattern_disabled_allows() {
+        let config = AntiPatternConfig::default();
+        let decision = check_anti_patterns(&config, &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn anti_pattern_detects_match() {
+        let config = AntiPatternConfig {
+            enabled: true,
+            enforce: AntiPatternEnforce::BlockWithExplanation,
+            rules: vec![AntiPatternRule {
+                id: "no-float-currency".to_string(),
+                description: "Float used for currency".to_string(),
+                file_pattern: "src/finance/**".to_string(),
+                pattern: "f64".to_string(),
+                explanation: "Floating point arithmetic causes rounding errors in financial calculations".to_string(),
+                fix_suggestion: "Use a Decimal type or integer cents instead".to_string(),
+            }],
+        };
+        let files = vec![(
+            "src/finance/billing.rs".to_string(),
+            "let total: f64 = 19.99;".to_string(),
+        )];
+        let decision = check_anti_patterns(&config, &files);
+        assert!(decision.is_blocked());
+        assert_eq!(decision.affected_files, vec!["src/finance/billing.rs"]);
+    }
+
+    #[test]
+    fn anti_pattern_no_match_allows() {
+        let config = AntiPatternConfig {
+            enabled: true,
+            enforce: AntiPatternEnforce::BlockWithExplanation,
+            rules: vec![AntiPatternRule {
+                id: "no-float-currency".to_string(),
+                description: "Float used for currency".to_string(),
+                file_pattern: "src/finance/**".to_string(),
+                pattern: "f64".to_string(),
+                explanation: "Rounding errors".to_string(),
+                fix_suggestion: "Use Decimal".to_string(),
+            }],
+        };
+        let files = vec![(
+            "src/finance/billing.rs".to_string(),
+            "let total: Decimal = Decimal::new(1999, 2);".to_string(),
+        )];
+        let decision = check_anti_patterns(&config, &files);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn anti_pattern_ignores_non_matching_files() {
+        let config = AntiPatternConfig {
+            enabled: true,
+            enforce: AntiPatternEnforce::BlockWithExplanation,
+            rules: vec![AntiPatternRule {
+                id: "no-float-currency".to_string(),
+                description: "Float used for currency".to_string(),
+                file_pattern: "src/finance/**".to_string(),
+                pattern: "f64".to_string(),
+                explanation: "Rounding errors".to_string(),
+                fix_suggestion: "Use Decimal".to_string(),
+            }],
+        };
+        // File is not in src/finance/
+        let files = vec![(
+            "src/graphics/renderer.rs".to_string(),
+            "let scale: f64 = 1.5;".to_string(),
+        )];
+        let decision = check_anti_patterns(&config, &files);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn anti_pattern_warn_mode_allows() {
+        let config = AntiPatternConfig {
+            enabled: true,
+            enforce: AntiPatternEnforce::Warn,
+            rules: vec![AntiPatternRule {
+                id: "no-todo".to_string(),
+                description: "TODO comment".to_string(),
+                file_pattern: "**".to_string(),
+                pattern: "TODO".to_string(),
+                explanation: "TODOs should be tracked as tasks".to_string(),
+                fix_suggestion: "Create a task instead".to_string(),
+            }],
+        };
+        let files = vec![(
+            "src/main.rs".to_string(),
+            "// TODO: fix this later".to_string(),
+        )];
+        let decision = check_anti_patterns(&config, &files);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
     }
 }

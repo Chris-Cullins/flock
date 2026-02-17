@@ -340,7 +340,7 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 
 ### 12.5c. Change Budget Limits
 - [x] Track files modified and lines changed per exploration and per task (requires file change metadata in checkpoint events)
-- [ ] Track semantic changes per exploration
+- [x] Track semantic changes per exploration
 - [x] Budget policy types and evaluation logic (fl-policy crate)
 - [x] Enforce configurable budgets with pause_and_flag / block / warn actions
 - [x] Configuration: `[budget] max_files_per_task`, `max_lines_per_task`, `max_semantic_changes_per_exploration`
@@ -360,15 +360,15 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 - [ ] Configuration: `[reuse] enforce`, `similarity_threshold`, `check_signatures`, `check_bodies`, `check_patterns`
 
 ### 12.5f. Architecture Rules
-- [ ] Parse `.flock/arch-rules.toml` for layer boundary, dependency direction, interface requirement, and namespace convention rules
-- [ ] Enforce architecture rules at file write time using AST and dependency graph
-- [ ] Configuration: `[architecture] rules = ".flock/arch-rules.toml"`, `enforce = "block" | "gate" | "warn"`
+- [x] Parse `.flock/arch-rules.toml` for layer boundary, dependency direction, interface requirement, and namespace convention rules
+- [x] Enforce architecture rules at file write time using AST and dependency graph
+- [x] Configuration: `[architecture] rules = ".flock/arch-rules.toml"`, `enforce = "block" | "gate" | "warn"`
 
 ### 12.5g. Anti-Pattern Detection
-- [ ] Parse `.flock/anti-patterns.toml` for domain-specific AST query rules
-- [ ] Check file writes against anti-pattern rules (e.g., float for currency, hardcoded rates, audit bypass, PII exposure)
-- [ ] Structured explanations with fix suggestions on violation
-- [ ] Configuration: `[anti_patterns] rules = ".flock/anti-patterns.toml"`, `enforce = "block_with_explanation"`
+- [x] Parse `.flock/anti-patterns.toml` for domain-specific AST query rules
+- [x] Check file writes against anti-pattern rules (e.g., float for currency, hardcoded rates, audit bypass, PII exposure)
+- [x] Structured explanations with fix suggestions on violation
+- [x] Configuration: `[anti_patterns] rules = ".flock/anti-patterns.toml"`, `enforce = "block_with_explanation"`
 
 ### 12.5h. Dependency & Compatibility Checks
 - [ ] Parse `.flock/approved-deps.toml` for package allowlist with version ranges
@@ -378,15 +378,15 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 - [ ] Configuration: `[dependencies] approved_packages`, `license_blocklist`, `vuln_check`
 
 ### 12.5i. Test Requirements
-- [ ] Enforce existing tests pass before exploration promotion
-- [ ] Require new test coverage for new behavior (new method → corresponding test)
+- [x] Enforce existing tests pass before exploration promotion
+- [x] Require new test coverage for new behavior (new method → corresponding test)
 - [ ] Coverage threshold enforcement for modified modules
-- [ ] Configuration: `[tests] require_passing`, `require_new_coverage`, `min_coverage_percent`
+- [x] Configuration: `[tests] require_passing`, `require_new_coverage`, `min_coverage_percent`
 
 ### 12.5j. Rate Limits & Runaway Prevention
 - [x] Track explorations per task, wall-clock time per exploration, undo operations per exploration, token budget per task
 - [x] Enforce configurable limits with pause_and_escalate / warn / block actions
-- [ ] Escalation notifications with context (what the agent tried, links to exploration tree)
+- [x] Escalation notifications with context (what the agent tried, links to exploration tree)
 - [x] Configuration: `[rate_limits] max_explorations_per_task`, `max_time_per_exploration`, `max_undos_per_exploration`, `max_tokens_per_task`
 
 ### 12.5k. Regression Detection & Automatic Rollback

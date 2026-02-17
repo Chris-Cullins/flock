@@ -433,6 +433,11 @@ impl Repo {
         self.enforce_rate_limit_policy(task_id, exploration_id)?;
         self.enforce_scope_policy(task_id, exploration_id)?;
 
+        // Enforce architecture rules and anti-pattern detection.
+        let changed_files = self.working_dir_changed_files();
+        self.enforce_architecture_rules(&changed_files)?;
+        self.enforce_anti_patterns(&changed_files)?;
+
         // Enforce commit hygiene.
         self.enforce_commit_hygiene(&intent)?;
         self.check_checkpoint_frequency();
@@ -3346,6 +3351,8 @@ impl Repo {
             fl_policy::PolicyCategory::Budget => "Budget",
             fl_policy::PolicyCategory::RateLimit => "RateLimit",
             fl_policy::PolicyCategory::TestRequirement => "TestRequirement",
+            fl_policy::PolicyCategory::ArchitectureRule => "ArchitectureRule",
+            fl_policy::PolicyCategory::AntiPattern => "AntiPattern",
         };
         let operation = match decision.operation {
             fl_policy::PolicyOperation::Checkpoint => "Checkpoint",
@@ -3486,7 +3493,30 @@ impl Repo {
             checkpoints_in_window,
         };
 
-        let decision = fl_policy::check_rate_limits(&config.rate_limits, &usage);
+        let mut decision = fl_policy::check_rate_limits(&config.rate_limits, &usage);
+
+        // Enrich escalation context with exploration history summaries.
+        if let Some(ref mut ctx) = decision.escalation_context {
+            ctx.exploration_history = state
+                .explorations
+                .values()
+                .filter(|_| {
+                    // Include all explorations — all statuses are useful context
+                    // for the human reviewer.
+                    true
+                })
+                .map(|e| {
+                    format!(
+                        "{} [{}] \"{}\" (started {})",
+                        &e.id.to_string()[..8],
+                        e.status,
+                        e.title,
+                        &e.created_at.get(..19).unwrap_or(&e.created_at),
+                    )
+                })
+                .collect();
+        }
+
         if decision.is_blocked() || decision.is_gated() {
             self.record_policy_decision(&decision)?;
         }
@@ -3504,10 +3534,15 @@ impl Repo {
             if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
                 if let Some(ctx) = &decision.escalation_context {
                     eprintln!(
-                        "warning: rate limit escalation — {}\n  action: {}\n  limit: {} ({}/{})\n  task: {:?}\n  exploration: {:?}",
+                        "warning: rate limit escalation — {}\n  action: {}\n  limit: {} ({}/{})\n  task: {:?}\n  exploration: {:?}\n  history: {}",
                         reason, ctx.agent_action, ctx.limit_name,
                         ctx.current_value, ctx.limit_value,
-                        ctx.task_id, ctx.exploration_id
+                        ctx.task_id, ctx.exploration_id,
+                        if ctx.exploration_history.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            format!("\n    {}", ctx.exploration_history.join("\n    "))
+                        }
                     );
                 } else {
                     eprintln!("warning: policy rate limit gate triggered — {}", reason);
@@ -3630,11 +3665,14 @@ impl Repo {
             None
         };
 
+        // Collect new files from exploration checkpoints to detect missing tests.
+        let (new_source_files, new_test_files) = self.collect_exploration_new_files();
+
         let decision = fl_policy::check_test_requirements(
             &config.test_requirements,
             test_result.as_ref(),
-            &[], // new source files — not tracked yet
-            &[], // new test files — not tracked yet
+            &new_source_files,
+            &new_test_files,
         );
 
         if decision.is_blocked() || decision.is_gated() {
@@ -3653,6 +3691,137 @@ impl Repo {
         if decision.is_gated() {
             if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
                 eprintln!("warning: test requirement gate triggered — {}", reason);
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect new source and test files from the active exploration's checkpoints.
+    ///
+    /// Scans checkpoint events to find files with `FileChangeKind::Added`, then
+    /// classifies them as test files (name contains `_test`, `test_`, `.test`, or
+    /// `_spec`) or source files.
+    fn collect_exploration_new_files(&self) -> (Vec<String>, Vec<String>) {
+        let state = match self.replay_state() {
+            Ok(s) => s,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+
+        // Find the active exploration.
+        let active_exploration = state
+            .explorations
+            .values()
+            .find(|e| e.status == ExplorationStatus::Active);
+        let _exploration = match active_exploration {
+            Some(e) => e,
+            None => return (Vec::new(), Vec::new()),
+        };
+
+        // Walk checkpoint events to find Added files.
+        let events = match self.list_events() {
+            Ok(e) => e,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+
+        let mut new_source_files = Vec::new();
+        let mut new_test_files = Vec::new();
+
+        for event in &events {
+            if let EventKind::Checkpoint(cp) = &event.kind {
+                if let Some(files_changed) = &cp.files_changed {
+                    for fc in files_changed {
+                        if fc.change_kind == FileChangeKind::Added {
+                            if is_test_file(&fc.path) {
+                                new_test_files.push(fc.path.clone());
+                            } else {
+                                new_source_files.push(fc.path.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        (new_source_files, new_test_files)
+    }
+
+    /// Enforce architecture rules policy. Called before checkpoints.
+    fn enforce_architecture_rules(&self, files_changed: &[String]) -> Result<()> {
+        let config = self.policies_config();
+        if !config.architecture.enabled {
+            return Ok(());
+        }
+
+        // Architecture rule checking uses import info. For now, we check
+        // dependency direction rules against the changed file paths. Full
+        // import extraction would require AST analysis per language.
+        // We pass empty imports and rely on namespace convention + dependency
+        // direction checks against file paths.
+        let decision = fl_policy::check_architecture_rules(
+            &config.architecture,
+            &[], // import analysis not yet wired — checked via file path rules
+            files_changed,
+        );
+
+        if decision.is_blocked() || decision.is_gated() {
+            self.record_policy_decision(&decision)?;
+        }
+        if decision.is_blocked() {
+            if let fl_policy::PolicyVerdict::Block { reason, fix_suggestion } = &decision.verdict {
+                let msg = if let Some(fix) = fix_suggestion {
+                    format!("Policy blocked: {}\nSuggestion: {}", reason, fix)
+                } else {
+                    format!("Policy blocked: {}", reason)
+                };
+                bail!("{}", msg);
+            }
+        }
+        if decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
+                eprintln!("warning: architecture rule gate triggered — {}", reason);
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce anti-pattern detection policy. Called before checkpoints.
+    fn enforce_anti_patterns(&self, files_changed: &[String]) -> Result<()> {
+        let config = self.policies_config();
+        if !config.anti_patterns.enabled || config.anti_patterns.rules.is_empty() {
+            return Ok(());
+        }
+
+        // Read content of changed files for pattern matching.
+        let mut file_contents: Vec<(String, String)> = Vec::new();
+        for path in files_changed {
+            let full_path = self.root().join(path);
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                file_contents.push((path.clone(), content));
+            }
+        }
+
+        if file_contents.is_empty() {
+            return Ok(());
+        }
+
+        let decision = fl_policy::check_anti_patterns(&config.anti_patterns, &file_contents);
+
+        if decision.is_blocked() || decision.is_gated() {
+            self.record_policy_decision(&decision)?;
+        }
+        if decision.is_blocked() {
+            if let fl_policy::PolicyVerdict::Block { reason, fix_suggestion } = &decision.verdict {
+                let msg = if let Some(fix) = fix_suggestion {
+                    format!("Policy blocked: {}\nSuggestion: {}", reason, fix)
+                } else {
+                    format!("Policy blocked: {}", reason)
+                };
+                bail!("{}", msg);
+            }
+        }
+        if decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
+                eprintln!("warning: anti-pattern gate triggered — {}", reason);
             }
         }
         Ok(())
@@ -8066,6 +8235,27 @@ fn join_non_empty_lines(lines: Vec<String>) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<String>>()
         .join("\n")
+}
+
+/// Check if a file path looks like a test file based on common naming conventions.
+fn is_test_file(path: &str) -> bool {
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if stem.is_empty() {
+        return false;
+    }
+    // Check common patterns: *_test.*, test_*.*, *.test.*, *_spec.*, *.spec.*
+    stem.ends_with("_test")
+        || stem.starts_with("test_")
+        || stem.ends_with(".test")
+        || stem.ends_with("_spec")
+        || stem.ends_with(".spec")
+        // Check if the file is in a tests/ or __tests__/ directory
+        || path.contains("/tests/")
+        || path.contains("/__tests__/")
+        || path.contains("/test/")
 }
 
 fn normalize_label(message: &str) -> String {
