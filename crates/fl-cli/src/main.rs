@@ -1254,6 +1254,7 @@ fn main() -> Result<()> {
                         "new": report.new_files,
                         "modified": report.modified_files,
                         "deleted": report.deleted_files,
+                        "ignored_symlinks": report.ignored_symlinks,
                     }))?
                 );
             } else {
@@ -1282,6 +1283,17 @@ fn main() -> Result<()> {
                         "\n{} file(s) changed",
                         total
                     );
+                }
+                if !report.ignored_symlinks.is_empty() {
+                    println!();
+                    println!(
+                        "warning: {} symlink{} ignored (not tracked):",
+                        report.ignored_symlinks.len(),
+                        if report.ignored_symlinks.len() == 1 { "" } else { "s" }
+                    );
+                    for s in &report.ignored_symlinks {
+                        println!("  symlink:  {}", s);
+                    }
                 }
             }
         }
@@ -1481,7 +1493,7 @@ fn main() -> Result<()> {
         }
         Command::Review { id, expand, full } => {
             let repo = Repo::discover(cwd)?;
-            let exploration_id = parse_uuid(&id)?;
+            let exploration_id = resolve_exploration(&id, &repo)?;
             let summary = repo.review_exploration(exploration_id)?;
 
             println!(
@@ -1979,7 +1991,9 @@ fn main() -> Result<()> {
                     }
                 }
                 SessionCommand::Show { id, json } => {
-                    let session_id = parse_uuid(&id)?;
+                    let sessions = repo.list_sessions()?;
+                    let session_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+                    let session_id = resolve_uuid_prefix(&id, &session_ids)?;
                     let session = repo.session_info(session_id)?;
 
                     if json {
@@ -2915,19 +2929,25 @@ fn main() -> Result<()> {
                     }
                 }
                 GateCommand::Approve { id, reason } => {
-                    let gate_id = parse_uuid(&id)?;
+                    let gates = repo.list_gates()?;
+                    let gate_ids: Vec<Uuid> = gates.iter().map(|g| g.id).collect();
+                    let gate_id = resolve_uuid_prefix(&id, &gate_ids)?;
                     repo.approve_gate(gate_id, reason)?;
-                    println!("gate {} approved", &id[..8.min(id.len())]);
+                    println!("gate {} approved", &gate_id.simple().to_string()[..8]);
                 }
                 GateCommand::Reject { id, reason } => {
-                    let gate_id = parse_uuid(&id)?;
+                    let gates = repo.list_gates()?;
+                    let gate_ids: Vec<Uuid> = gates.iter().map(|g| g.id).collect();
+                    let gate_id = resolve_uuid_prefix(&id, &gate_ids)?;
                     repo.reject_gate(gate_id, reason)?;
-                    println!("gate {} rejected", &id[..8.min(id.len())]);
+                    println!("gate {} rejected", &gate_id.simple().to_string()[..8]);
                 }
                 GateCommand::Delete { id } => {
-                    let gate_id = parse_uuid(&id)?;
+                    let gates = repo.list_gates()?;
+                    let gate_ids: Vec<Uuid> = gates.iter().map(|g| g.id).collect();
+                    let gate_id = resolve_uuid_prefix(&id, &gate_ids)?;
                     repo.delete_gate(gate_id)?;
-                    println!("gate {} deleted", &id[..8.min(id.len())]);
+                    println!("gate {} deleted", &gate_id.simple().to_string()[..8]);
                 }
             }
         }

@@ -67,6 +67,7 @@ pub struct StatusReport {
     pub new_files: Vec<String>,
     pub modified_files: Vec<String>,
     pub deleted_files: Vec<String>,
+    pub ignored_symlinks: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -904,7 +905,7 @@ impl Repo {
         let colocated = self.repo_mode()? == RepoMode::GitColocated;
 
         // Collect all files in the working directory (using ignore filtering).
-        let current_files = collect_all_files_with_mode(self.root(), true, colocated)?;
+        let (current_files, symlinks) = collect_all_files_with_mode(self.root(), true, colocated)?;
 
         let checkpoint = self.latest_checkpoint();
         if checkpoint.is_none() {
@@ -915,6 +916,7 @@ impl Repo {
                 new_files: current_files.into_iter().collect(),
                 modified_files: Vec::new(),
                 deleted_files: Vec::new(),
+                ignored_symlinks: symlinks,
             });
         }
         let checkpoint = checkpoint.unwrap();
@@ -924,7 +926,7 @@ impl Repo {
         };
 
         let snapshot_root = self.ensure_snapshot_available(payload.snapshot_id)?;
-        let snapshot_files = collect_all_files_with_mode(&snapshot_root, false, false)?;
+        let (snapshot_files, _) = collect_all_files_with_mode(&snapshot_root, false, false)?;
 
         let mut new_files = Vec::new();
         let mut modified_files = Vec::new();
@@ -963,6 +965,7 @@ impl Repo {
             new_files,
             modified_files,
             deleted_files,
+            ignored_symlinks: symlinks,
         })
     }
 
@@ -2385,7 +2388,26 @@ impl Repo {
 
         let mut restored_checkpoint_event = None;
 
-        if matches!(target.kind, EventKind::Checkpoint(_)) {
+        if let EventKind::Undo(ref undo_event) = target.kind {
+            // Undoing an undo = redo: restore the checkpoint that was originally undone.
+            let original_target_id = undo_event.target_event_id;
+            let original_target = events
+                .iter()
+                .find(|e| e.id == original_target_id)
+                .ok_or_else(|| anyhow!("undo target event {} not found", original_target_id))?;
+
+            if let EventKind::Checkpoint(ref payload) = original_target.kind {
+                self.restore_workspace_from_snapshot(payload.snapshot_id)?;
+
+                let checkpoint_event = self.create_checkpoint_with_lineage(
+                    format!("redo-{}", original_target_id.simple()),
+                    Some(format!("redo: restore undone checkpoint {}", original_target_id)),
+                    Some(original_target_id),
+                    None,
+                )?;
+                restored_checkpoint_event = Some(checkpoint_event.id);
+            }
+        } else if matches!(target.kind, EventKind::Checkpoint(_)) {
             let Some(previous_checkpoint) = previous_checkpoint_before(&events, target.id) else {
                 bail!(
                     "cannot undo checkpoint {}: no earlier checkpoint exists",
@@ -8648,14 +8670,26 @@ fn collect_all_files_with_mode(
     root: &Path,
     apply_skip: bool,
     colocated: bool,
-) -> Result<BTreeSet<String>> {
+) -> Result<(BTreeSet<String>, Vec<String>)> {
     let mut files = BTreeSet::new();
+    let mut symlinks = Vec::new();
 
     if apply_skip {
         let walker = build_repo_walker(root, colocated);
         for entry in walker.build() {
             let entry = entry.context("failed while scanning files")?;
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            let ft = entry.file_type();
+
+            if ft.map_or(false, |ft| ft.is_symlink()) {
+                let rel = entry
+                    .path()
+                    .strip_prefix(root)
+                    .context("failed to compute relative path")?;
+                symlinks.push(rel.to_string_lossy().replace('\\', "/"));
+                continue;
+            }
+
+            if !ft.map_or(false, |ft| ft.is_file()) {
                 continue;
             }
 
@@ -8680,7 +8714,7 @@ fn collect_all_files_with_mode(
         }
     }
 
-    Ok(files)
+    Ok((files, symlinks))
 }
 
 fn enrich_semantic_impacts(
