@@ -467,3 +467,5 @@ Make the optimized storage paths the defaults so large repos and teams work out 
 
 - [x] `fl init --colocated` writes `mode = "git-compatible"` in `.flock/config.toml` instead of `"git-colocated"` — the `--colocated` flag is ignored when writing the config (verified: already working correctly)
 - [x] `fl task show/claim/done/fail` require full UUIDs — short prefixes (e.g. first 8 chars) should work like `fl diff <checkpoint>` does with prefix matching
+- [x] `fl diff` (non-semantic) shows "No changes" for unsupported file types — `file_summary_*` functions used `collect_source_files` which filtered by `supported_source()`, excluding files like `.razor`, `.txt` (GitHub #40)
+- [x] `fl explore promote` creates checkpoint with potentially inaccessible snapshot — added `ensure_snapshot_available` after promote checkpoint creation to guarantee materialization (GitHub #39)

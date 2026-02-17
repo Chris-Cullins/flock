@@ -1040,8 +1040,8 @@ impl Repo {
         };
 
         let snapshot_root = self.ensure_snapshot_available(payload.snapshot_id)?;
-        let snapshot_files = collect_source_files(&snapshot_root, false)?;
-        let current_files = collect_source_files(self.root(), true)?;
+        let snapshot_files = collect_all_repo_files(&snapshot_root, false)?;
+        let current_files = collect_all_repo_files(self.root(), true)?;
 
         let mut added = Vec::new();
         let mut modified = Vec::new();
@@ -1195,8 +1195,8 @@ impl Repo {
         let from_root = self.ensure_snapshot_available(from_payload.snapshot_id)?;
         let to_root = self.ensure_snapshot_available(to_payload.snapshot_id)?;
 
-        let from_files = collect_source_files(&from_root, false)?;
-        let to_files = collect_source_files(&to_root, false)?;
+        let from_files = collect_all_repo_files(&from_root, false)?;
+        let to_files = collect_all_repo_files(&to_root, false)?;
 
         let mut added = Vec::new();
         let mut modified = Vec::new();
@@ -1235,8 +1235,8 @@ impl Repo {
         let (_, payload) = self.find_checkpoint_by_prefix(checkpoint_prefix)?;
         let snapshot_root = self.ensure_snapshot_available(payload.snapshot_id)?;
 
-        let snapshot_files = collect_source_files(&snapshot_root, false)?;
-        let current_files = collect_source_files(self.root(), true)?;
+        let snapshot_files = collect_all_repo_files(&snapshot_root, false)?;
+        let current_files = collect_all_repo_files(self.root(), true)?;
 
         let mut added = Vec::new();
         let mut modified = Vec::new();
@@ -1550,12 +1550,22 @@ impl Repo {
         }
 
         let message = format!("promote exploration {}", existing.title);
-        self.create_checkpoint_with_lineage(
+        let promote_event = self.create_checkpoint_with_lineage(
             format!("promote-{}", normalize_label(&existing.title)),
             Some(message),
             None,
             None,
         )?;
+
+        // Ensure the promote checkpoint's snapshot is materialized on disk.
+        // In git-colocated mode, checkpoints use virtual snapshots that are
+        // lazily extracted from git.  Materializing here guarantees that
+        // subsequent operations (diff, undo, commit) can access the snapshot
+        // without relying on lazy extraction, which can fail if the git state
+        // changes between promote and the next operation.
+        if let EventKind::Checkpoint(ref payload) = promote_event.kind {
+            self.ensure_snapshot_available(payload.snapshot_id)?;
+        }
 
         self.append_event(EventKind::Exploration(ExplorationEvent {
             exploration_id: id,
@@ -8855,6 +8865,52 @@ fn collect_source_files_with_mode(
     Ok(files)
 }
 
+/// Collect all files under root (not filtered by semantic support), returning
+/// relative `PathBuf`s.  Used by `file_summary_*` functions so that diffs
+/// include every file, not just those with a semantic analyzer.
+fn collect_all_repo_files(root: &Path, apply_skip: bool) -> Result<BTreeSet<PathBuf>> {
+    collect_all_repo_files_with_mode(root, apply_skip, false)
+}
+
+fn collect_all_repo_files_with_mode(
+    root: &Path,
+    apply_skip: bool,
+    colocated: bool,
+) -> Result<BTreeSet<PathBuf>> {
+    let mut files = BTreeSet::new();
+
+    if apply_skip {
+        let walker = build_repo_walker(root, colocated);
+        for entry in walker.build() {
+            let entry = entry.context("failed while scanning repo files")?;
+            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                continue;
+            }
+
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .context("failed to compute relative path")?;
+            files.insert(rel.to_path_buf());
+        }
+    } else {
+        for entry in WalkDir::new(root) {
+            let entry = entry.context("failed while scanning repo files")?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .context("failed to compute relative path")?;
+            files.insert(rel.to_path_buf());
+        }
+    }
+
+    Ok(files)
+}
+
 /// Collect all files (not just source files) under root, returning relative
 /// path strings. Used by `status()` to compare working directory vs snapshot.
 fn collect_all_files_with_mode(
@@ -9937,6 +9993,248 @@ mod tests {
             .promote_exploration(started.id)
             .expect("exploration should promote");
         assert_eq!(promoted.status, ExplorationStatus::Promoted);
+    }
+
+    #[test]
+    fn promote_exploration_snapshot_accessible() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        // Create a file and initial checkpoint
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        repo.create_checkpoint(Some("initial".to_string()))
+            .expect("initial checkpoint should succeed");
+
+        // Start exploration and make changes
+        let started = repo
+            .start_exploration("test-explore".to_string())
+            .expect("exploration should start");
+        std::fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+        repo.create_checkpoint(Some("exploration-work".to_string()))
+            .expect("exploration checkpoint should succeed");
+
+        // Promote exploration
+        repo.promote_exploration(started.id)
+            .expect("promote should succeed");
+
+        // After promote, the latest checkpoint's snapshot must be accessible.
+        // This is the bug: the snapshot referenced by the promote checkpoint
+        // should exist or be lazily materialized.
+        let summary = repo
+            .file_summary_from_latest_checkpoint()
+            .expect("file_summary should work after promote");
+        // Working dir matches the promote checkpoint, so no changes expected
+        assert!(summary.modified.is_empty());
+    }
+
+    #[test]
+    fn promote_exploration_snapshot_accessible_colocated() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+
+        // Initialize git repo first
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init should succeed");
+        std::process::Command::new("git")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@test.com",
+                   "commit", "--allow-empty", "-m", "initial git commit"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git initial commit should succeed");
+
+        let repo = Repo::at(dir.path());
+        repo.init_colocated().expect("colocated init should succeed");
+
+        // Create a file and initial checkpoint
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        repo.create_checkpoint(Some("initial".to_string()))
+            .expect("initial checkpoint should succeed");
+
+        // Start exploration and make changes
+        let started = repo
+            .start_exploration("test-explore".to_string())
+            .expect("exploration should start");
+        std::fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+        repo.create_checkpoint(Some("exploration-work".to_string()))
+            .expect("exploration checkpoint should succeed");
+
+        // Promote exploration
+        repo.promote_exploration(started.id)
+            .expect("promote should succeed");
+
+        // After promote, the latest checkpoint's snapshot must be accessible.
+        let summary = repo
+            .file_summary_from_latest_checkpoint()
+            .expect("file_summary should work after promote in colocated mode");
+        assert!(summary.modified.is_empty());
+
+        // Undo should also work
+        let undo_result = repo
+            .undo(UndoRequest::Last)
+            .expect("undo after promote should succeed");
+        assert!(undo_result.target_event_id != Uuid::nil());
+    }
+
+    #[test]
+    fn promote_exploration_no_initial_checkpoint() {
+        // Reproduce exact steps from issue #39:
+        // 1. fl explore start (no initial checkpoint)
+        // 2. make changes + fl commit
+        // 3. fl explore promote
+        // 4. fl undo
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        // Step 1: start exploration without any prior checkpoint
+        let started = repo
+            .start_exploration("test".to_string())
+            .expect("exploration should start");
+
+        // Step 2: make changes and commit
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.create_checkpoint(Some("exploration work".to_string()))
+            .expect("checkpoint should succeed");
+
+        // Step 3: promote
+        repo.promote_exploration(started.id)
+            .expect("promote should succeed");
+
+        // Step 4: undo should work
+        let undo_result = repo
+            .undo(UndoRequest::Last)
+            .expect("undo should succeed after promote");
+        assert!(undo_result.target_event_id != Uuid::nil());
+
+        // fl diff should work after promote
+        let summary = repo
+            .file_summary_from_latest_checkpoint()
+            .expect("file_summary should work after promote");
+        // No changes since working dir == promote checkpoint
+        assert!(summary.modified.is_empty());
+    }
+
+    #[test]
+    fn promote_undo_targets_promote_checkpoint() {
+        // Test where undo targets the promote checkpoint event directly.
+        // The undo should restore from the previous checkpoint's snapshot.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        // Create initial state
+        std::fs::write(dir.path().join("file.txt"), "original").unwrap();
+        repo.create_checkpoint(Some("initial".to_string()))
+            .expect("initial checkpoint should succeed");
+
+        let started = repo
+            .start_exploration("test".to_string())
+            .expect("exploration should start");
+
+        std::fs::write(dir.path().join("file.txt"), "modified").unwrap();
+        repo.create_checkpoint(Some("exploration work".to_string()))
+            .expect("exploration checkpoint should succeed");
+
+        repo.promote_exploration(started.id)
+            .expect("promote should succeed");
+
+        // Get all events to find the promote checkpoint
+        let events = repo.list_events().expect("list events");
+        let promote_checkpoint = events.iter().rev()
+            .find(|e| matches!(&e.kind, EventKind::Checkpoint(cp) if cp.label.starts_with("promote-")))
+            .expect("promote checkpoint event should exist");
+
+        // Undo targeting the promote checkpoint specifically
+        let undo_result = repo
+            .undo(UndoRequest::To(promote_checkpoint.id.to_string()))
+            .expect("undo targeting promote checkpoint should succeed");
+        assert_eq!(undo_result.target_event_id, promote_checkpoint.id);
+
+        // After undoing the promote checkpoint, workspace should be restored
+        // to the state of the previous checkpoint (the exploration checkpoint,
+        // which has "modified" content).
+        let content = std::fs::read_to_string(dir.path().join("file.txt"))
+            .expect("file should exist");
+        assert_eq!(content.trim(), "modified",
+            "workspace should be restored to exploration checkpoint state");
+    }
+
+    #[test]
+    fn file_summary_includes_unsupported_file_types() {
+        // Regression test for issue #40: fl diff should detect changes in
+        // files that don't have a semantic analyzer (e.g. .razor, .txt).
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        // Create files of both supported and unsupported types
+        std::fs::write(dir.path().join("app.ts"), "const x = 1;").unwrap();
+        std::fs::write(dir.path().join("page.razor"), "<h1>Hello</h1>").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "some notes").unwrap();
+        repo.create_checkpoint(Some("initial".to_string()))
+            .expect("checkpoint should succeed");
+
+        // Modify all files
+        std::fs::write(dir.path().join("app.ts"), "const x = 2;").unwrap();
+        std::fs::write(dir.path().join("page.razor"), "<h1>Updated</h1>").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "updated notes").unwrap();
+
+        let summary = repo
+            .file_summary_from_latest_checkpoint()
+            .expect("file_summary should succeed");
+
+        // All three files should appear as modified, including unsupported types
+        assert!(
+            summary.modified.iter().any(|f| f.contains("app.ts")),
+            "supported file app.ts should be in modified list"
+        );
+        assert!(
+            summary.modified.iter().any(|f| f.contains("page.razor")),
+            "unsupported file page.razor should be in modified list"
+        );
+        assert!(
+            summary.modified.iter().any(|f| f.contains("notes.txt")),
+            "unsupported file notes.txt should be in modified list"
+        );
+    }
+
+    #[test]
+    fn promote_exploration_snapshot_accessible_native() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_native().expect("native init should succeed");
+
+        // Create a file and initial checkpoint
+        std::fs::write(dir.path().join("hello.txt"), "hello").unwrap();
+        repo.create_checkpoint(Some("initial".to_string()))
+            .expect("initial checkpoint should succeed");
+
+        // Start exploration and make changes
+        let started = repo
+            .start_exploration("test-explore".to_string())
+            .expect("exploration should start");
+        std::fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+        repo.create_checkpoint(Some("exploration-work".to_string()))
+            .expect("exploration checkpoint should succeed");
+
+        // Promote exploration
+        repo.promote_exploration(started.id)
+            .expect("promote should succeed");
+
+        // After promote, the latest checkpoint's snapshot must be accessible.
+        let summary = repo
+            .file_summary_from_latest_checkpoint()
+            .expect("file_summary should work after promote in native mode");
+        assert!(summary.modified.is_empty());
+
+        // Undo should also work
+        let undo_result = repo
+            .undo(UndoRequest::Last)
+            .expect("undo after promote should succeed");
+        assert!(undo_result.target_event_id != Uuid::nil());
     }
 
     #[test]
