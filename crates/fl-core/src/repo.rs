@@ -780,44 +780,58 @@ impl Repo {
         }
 
         let snapshot_root = self.root.join(SNAPSHOT_DIR);
-        if !snapshot_root.is_dir() {
-            bail!("snapshots directory missing: {}", snapshot_root.display());
-        }
-
         let mut snapshot_count = 0usize;
-        for entry in fs::read_dir(&snapshot_root)
-            .with_context(|| format!("failed to read {}", snapshot_root.display()))?
-        {
-            let entry = entry
-                .with_context(|| format!("failed to read entry in {}", snapshot_root.display()))?;
-            let path = entry.path();
-            let metadata = entry
-                .metadata()
-                .with_context(|| format!("failed to stat {}", path.display()))?;
 
-            if !metadata.is_dir() {
-                bail!(
-                    "unexpected non-directory entry in snapshots directory: {}",
-                    path.display()
-                );
+        // In native mode, snapshots live in the block store / file index,
+        // not as directories under .flock/snapshots/.  Count verified
+        // checkpoint snapshot indices instead.
+        if self.repo_mode()? == RepoMode::Native {
+            let file_index = FileIndex::for_root(self.root());
+            for sid in &checkpoint_snapshot_ids {
+                if file_index.has(*sid) {
+                    snapshot_count += 1;
+                }
             }
+        } else if snapshot_root.is_dir() {
+            for entry in fs::read_dir(&snapshot_root)
+                .with_context(|| format!("failed to read {}", snapshot_root.display()))?
+            {
+                let entry = entry.with_context(|| {
+                    format!("failed to read entry in {}", snapshot_root.display())
+                })?;
+                let path = entry.path();
+                let metadata = entry
+                    .metadata()
+                    .with_context(|| format!("failed to stat {}", path.display()))?;
 
-            let name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| anyhow!("invalid snapshot directory name: {}", path.display()))?;
-            let snapshot_id = Uuid::parse_str(name).with_context(|| {
-                format!("snapshot directory name is not a UUID: {}", path.display())
-            })?;
+                if !metadata.is_dir() {
+                    bail!(
+                        "unexpected non-directory entry in snapshots directory: {}",
+                        path.display()
+                    );
+                }
 
-            if !checkpoint_snapshot_ids.contains(&snapshot_id) {
-                bail!(
-                    "snapshot {} is not referenced by any checkpoint event",
-                    snapshot_id
-                );
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| {
+                        anyhow!("invalid snapshot directory name: {}", path.display())
+                    })?;
+                let snapshot_id = Uuid::parse_str(name).with_context(|| {
+                    format!("snapshot directory name is not a UUID: {}", path.display())
+                })?;
+
+                if !checkpoint_snapshot_ids.contains(&snapshot_id) {
+                    bail!(
+                        "snapshot {} is not referenced by any checkpoint event",
+                        snapshot_id
+                    );
+                }
+
+                snapshot_count += 1;
             }
-
-            snapshot_count += 1;
+        } else if !checkpoint_snapshot_ids.is_empty() {
+            bail!("snapshots directory missing: {}", snapshot_root.display());
         }
 
         let refs = AutoRefStore::for_root(self.root())
@@ -1648,6 +1662,14 @@ impl Repo {
                         }
                     }
                 }
+                // Emit a Prune event so the exploration is removed from
+                // replayed state.
+                self.append_event(EventKind::Exploration(ExplorationEvent {
+                    exploration_id: exploration.id,
+                    title: exploration.title.clone(),
+                    base_checkpoint_event: exploration.base_checkpoint_event,
+                    action: ExplorationAction::Prune,
+                }))?;
                 pruned += 1;
             }
         }

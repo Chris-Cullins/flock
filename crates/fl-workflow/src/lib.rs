@@ -414,6 +414,9 @@ impl ReplayAccumulator {
                         entry.updated_at = event.timestamp.clone();
                     }
                 }
+                ExplorationAction::Prune => {
+                    self.explorations.remove(&exploration.exploration_id);
+                }
             },
             EventKind::Undo(undo) => {
                 if undo.target_event_id == event.id {

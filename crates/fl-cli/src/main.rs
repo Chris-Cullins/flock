@@ -593,9 +593,9 @@ enum ExploreCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Prune old abandoned explorations
+    /// Prune abandoned explorations
     Prune {
-        #[arg(long, default_value = "7d")]
+        #[arg(long, default_value = "0s")]
         older_than: String,
     },
     /// Show visual exploration tree grouped by base checkpoint
@@ -1077,6 +1077,16 @@ fn main() -> Result<()> {
             } else {
                 None
             };
+
+            // Reject empty commits when the working tree is clean.
+            let st = repo.status()?;
+            if st.checkpoint_id.is_some()
+                && st.new_files.is_empty()
+                && st.modified_files.is_empty()
+                && st.deleted_files.is_empty()
+            {
+                bail!("nothing to commit — working tree is clean");
+            }
 
             let event = repo.create_checkpoint_with_options(message, allow_secrets, skip_hooks, intent)?;
             let commit_id = event.id;
@@ -1617,7 +1627,7 @@ fn main() -> Result<()> {
                     }
                 }
                 ExploreCommand::Promote { id } => {
-                    let exploration_id = parse_uuid(&id)?;
+                    let exploration_id = resolve_exploration(&id, &repo)?;
                     let exploration = repo.promote_exploration(exploration_id)?;
                     println!(
                         "exploration {} promoted: {}",
@@ -1625,7 +1635,7 @@ fn main() -> Result<()> {
                     );
                 }
                 ExploreCommand::Abandon { id } => {
-                    let exploration_id = parse_uuid(&id)?;
+                    let exploration_id = resolve_exploration(&id, &repo)?;
                     let exploration = repo.abandon_exploration(exploration_id)?;
                     println!(
                         "exploration {} abandoned: {}",
@@ -1633,8 +1643,11 @@ fn main() -> Result<()> {
                     );
                 }
                 ExploreCommand::Compare { left, right, json } => {
-                    let left_id = parse_uuid(&left)?;
-                    let right_id = right.as_deref().map(parse_uuid).transpose()?;
+                    let left_id = resolve_exploration(&left, &repo)?;
+                    let right_id = right
+                        .as_deref()
+                        .map(|r| resolve_exploration(r, &repo))
+                        .transpose()?;
                     let diffs = repo.compare_explorations(left_id, right_id)?;
 
                     if diffs.is_empty() {
@@ -2724,9 +2737,11 @@ fn main() -> Result<()> {
                     }
                 }
                 LockCommand::Release { id } => {
-                    let lock_id = parse_uuid(&id)?;
+                    let locks = repo.list_locks()?;
+                    let lock_ids: Vec<Uuid> = locks.iter().map(|l| l.id).collect();
+                    let lock_id = resolve_uuid_prefix(&id, &lock_ids)?;
                     repo.release_lock(lock_id)?;
-                    println!("lock {} released", &id[..8.min(id.len())]);
+                    println!("lock {} released", &lock_id.to_string()[..8]);
                 }
             }
         }
@@ -2746,9 +2761,11 @@ fn main() -> Result<()> {
         }
         Command::Unsubscribe { id } => {
             let repo = Repo::discover(cwd)?;
-            let sub_id = parse_uuid(&id)?;
+            let subs = repo.list_subscriptions()?;
+            let sub_ids: Vec<Uuid> = subs.iter().map(|s| s.id).collect();
+            let sub_id = resolve_uuid_prefix(&id, &sub_ids)?;
             repo.unsubscribe(sub_id)?;
-            println!("subscription {} cancelled", &id[..8.min(id.len())]);
+            println!("subscription {} cancelled", &sub_id.to_string()[..8]);
         }
         Command::Subscriptions { json } => {
             let repo = Repo::discover(cwd)?;
@@ -3933,6 +3950,62 @@ fn build_undo_request(
 
 fn parse_uuid(value: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("invalid UUID `{}`", value))
+}
+
+/// Resolve a UUID or UUID prefix against a list of known UUIDs.
+/// Accepts full UUIDs or unique prefixes (like the 8-char short IDs shown
+/// in `fl lock list` and `fl subscriptions`).
+fn resolve_uuid_prefix(value: &str, known: &[Uuid]) -> Result<Uuid> {
+    // Try exact parse first.
+    if let Ok(id) = Uuid::parse_str(value) {
+        return Ok(id);
+    }
+    // Prefix match against known UUIDs.
+    let prefix = value.replace('-', "").to_lowercase();
+    let matches: Vec<Uuid> = known
+        .iter()
+        .filter(|id| {
+            id.simple().to_string().starts_with(&prefix)
+        })
+        .copied()
+        .collect();
+    match matches.len() {
+        0 => bail!("no UUID matching prefix `{}`", value),
+        1 => Ok(matches[0]),
+        _ => bail!(
+            "ambiguous UUID prefix `{}` — matches {} entries",
+            value,
+            matches.len()
+        ),
+    }
+}
+
+/// Resolve an exploration identifier that may be a UUID, UUID prefix, or
+/// exploration title.
+fn resolve_exploration(value: &str, repo: &Repo) -> Result<Uuid> {
+    // Try exact UUID parse first.
+    if let Ok(id) = Uuid::parse_str(value) {
+        return Ok(id);
+    }
+    let explorations = repo.list_explorations()?;
+    // Try title match (case-sensitive).
+    let by_title: Vec<_> = explorations
+        .iter()
+        .filter(|e| e.title == value)
+        .collect();
+    if by_title.len() == 1 {
+        return Ok(by_title[0].id);
+    }
+    if by_title.len() > 1 {
+        bail!(
+            "ambiguous exploration title `{}` — matches {} explorations",
+            value,
+            by_title.len()
+        );
+    }
+    // Try UUID prefix match.
+    let ids: Vec<Uuid> = explorations.iter().map(|e| e.id).collect();
+    resolve_uuid_prefix(value, &ids)
 }
 
 fn format_bytes(bytes: u64) -> String {

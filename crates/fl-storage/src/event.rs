@@ -124,6 +124,7 @@ pub enum ExplorationAction {
     Start,
     Promote,
     Abandon,
+    Prune,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
