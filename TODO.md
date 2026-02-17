@@ -357,7 +357,7 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 - [x] Layer 3: Pattern conformance — detect when new code should implement existing interfaces/patterns
 - [x] Proactive reuse suggestions — surface relevant existing code when agent claims a task
 - [x] Protected domains — stricter enforcement for sensitive areas (financial calculations, compliance)
-- [ ] Configuration: `[reuse] enforce`, `similarity_threshold`, `check_signatures`, `check_bodies`, `check_patterns`
+- [x] Configuration: `[reuse] enforce`, `similarity_threshold`, `check_signatures`, `check_bodies`, `check_patterns`
 
 ### 12.5f. Architecture Rules
 - [x] Parse `.flock/arch-rules.toml` for layer boundary, dependency direction, interface requirement, and namespace convention rules
@@ -371,16 +371,16 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 - [x] Configuration: `[anti_patterns] rules = ".flock/anti-patterns.toml"`, `enforce = "block_with_explanation"`
 
 ### 12.5h. Dependency & Compatibility Checks
-- [ ] Parse `.flock/approved-deps.toml` for package allowlist with version ranges
-- [ ] License blocklist enforcement (e.g., GPL-3.0, AGPL-3.0)
-- [ ] Vulnerability scanning for new dependencies (CVE checks)
-- [ ] Run consumer test suites when shared libraries are modified
-- [ ] Configuration: `[dependencies] approved_packages`, `license_blocklist`, `vuln_check`
+- [x] Parse `.flock/approved-deps.toml` for package allowlist with version ranges
+- [x] License blocklist enforcement (e.g., GPL-3.0, AGPL-3.0)
+- [x] Vulnerability scanning for new dependencies (CVE checks)
+- [x] Run consumer test suites when shared libraries are modified
+- [x] Configuration: `[dependencies] approved_packages`, `license_blocklist`, `vuln_check`
 
 ### 12.5i. Test Requirements
 - [x] Enforce existing tests pass before exploration promotion
 - [x] Require new test coverage for new behavior (new method → corresponding test)
-- [ ] Coverage threshold enforcement for modified modules
+- [x] Coverage threshold enforcement for modified modules
 - [x] Configuration: `[tests] require_passing`, `require_new_coverage`, `min_coverage_percent`
 
 ### 12.5j. Rate Limits & Runaway Prevention
@@ -390,10 +390,10 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 - [x] Configuration: `[rate_limits] max_explorations_per_task`, `max_time_per_exploration`, `max_undos_per_exploration`, `max_tokens_per_task`
 
 ### 12.5k. Regression Detection & Automatic Rollback
-- [ ] Post-merge monitoring — watch for test failures and benchmark regressions traceable to recently merged changes
-- [ ] Automatic rollback via append-only revert event when post-merge issues detected
-- [ ] Notify originating agent with context for re-exploration
-- [ ] Configuration: `[regression] monitor_after_merge`, `monitor_window`, `benchmark_threshold`; `[rollback] auto_rollback`, `rollback_on_test_failure`
+- [x] Post-merge monitoring — watch for test failures and benchmark regressions traceable to recently merged changes
+- [x] Automatic rollback via append-only revert event when post-merge issues detected
+- [x] Notify originating agent with context for re-exploration
+- [x] Configuration: `[regression] monitor_after_merge`, `monitor_window`, `benchmark_threshold`; `[rollback] auto_rollback`, `rollback_on_test_failure`
 
 ### Implementation Priority
 

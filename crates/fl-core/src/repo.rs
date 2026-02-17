@@ -438,6 +438,7 @@ impl Repo {
         self.enforce_architecture_rules(&changed_files)?;
         self.enforce_anti_patterns(&changed_files)?;
         self.enforce_reuse_policy(&changed_files)?;
+        self.enforce_dependency_policy(&changed_files)?;
 
         // Enforce commit hygiene.
         self.enforce_commit_hygiene(&intent)?;
@@ -1471,6 +1472,9 @@ impl Repo {
             base_checkpoint_event: existing.base_checkpoint_event,
             action: ExplorationAction::Promote,
         }))?;
+
+        // Post-promote regression monitoring (best-effort, non-blocking).
+        self.post_promote_regression_check(id);
 
         self.list_explorations()?
             .into_iter()
@@ -3355,6 +3359,8 @@ impl Repo {
             fl_policy::PolicyCategory::ArchitectureRule => "ArchitectureRule",
             fl_policy::PolicyCategory::AntiPattern => "AntiPattern",
             fl_policy::PolicyCategory::DuplicationReuse => "DuplicationReuse",
+            fl_policy::PolicyCategory::DependencyCheck => "DependencyCheck",
+            fl_policy::PolicyCategory::Regression => "Regression",
         };
         let operation = match decision.operation {
             fl_policy::PolicyOperation::Checkpoint => "Checkpoint",
@@ -4013,6 +4019,180 @@ impl Repo {
             }
         }
         Ok(())
+    }
+
+    /// Enforce dependency policy — check manifest files for unapproved packages,
+    /// blocked licenses, and known vulnerabilities.
+    fn enforce_dependency_policy(&self, files_changed: &[String]) -> Result<()> {
+        let config = self.policies_config();
+        if !config.dependencies.enabled {
+            return Ok(());
+        }
+
+        // Only check when manifest files are modified.
+        let manifest_patterns = [
+            "Cargo.toml",
+            "package.json",
+            "go.mod",
+            "requirements.txt",
+            "Pipfile",
+            "Gemfile",
+            "pom.xml",
+            "build.gradle",
+        ];
+
+        let changed_manifests: Vec<&String> = files_changed
+            .iter()
+            .filter(|f| {
+                manifest_patterns
+                    .iter()
+                    .any(|pat| f.ends_with(pat))
+            })
+            .collect();
+
+        if changed_manifests.is_empty() {
+            return Ok(());
+        }
+
+        // Parse dependencies from changed manifest files.
+        let mut deps: Vec<fl_policy::DetectedDependency> = Vec::new();
+        for manifest in &changed_manifests {
+            let full_path = self.root().join(manifest);
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                let file_deps = parse_manifest_dependencies(manifest, &content);
+                deps.extend(file_deps);
+            }
+        }
+
+        if deps.is_empty() {
+            return Ok(());
+        }
+
+        let decision = fl_policy::check_dependency_policy(&config.dependencies, &deps);
+
+        if decision.is_blocked() || decision.is_gated() {
+            self.record_policy_decision(&decision)?;
+        }
+        if decision.is_blocked() {
+            if let fl_policy::PolicyVerdict::Block {
+                reason,
+                fix_suggestion,
+            } = &decision.verdict
+            {
+                let msg = if let Some(fix) = fix_suggestion {
+                    format!("Policy blocked: {}\nSuggestion: {}", reason, fix)
+                } else {
+                    format!("Policy blocked: {}", reason)
+                };
+                bail!("{}", msg);
+            }
+        }
+        if decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
+                eprintln!("warning: dependency check gate triggered — {}", reason);
+            }
+        }
+
+        // Run consumer test suites if configured and shared libraries are modified.
+        if !config.dependencies.consumer_test_command.is_empty() {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&config.dependencies.consumer_test_command)
+                .current_dir(self.root())
+                .output();
+            match output {
+                Ok(result) if !result.status.success() => {
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    eprintln!(
+                        "warning: consumer test suite failed: {}",
+                        stderr.lines().take(5).collect::<Vec<_>>().join("\n")
+                    );
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to run consumer test command: {}", e);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Post-promote regression check — run test suite after promotion and
+    /// automatically rollback if failures are detected.
+    fn post_promote_regression_check(&self, exploration_id: Uuid) {
+        let config = self.policies_config();
+        if !config.regression.enabled || !config.regression.monitor_after_merge {
+            return;
+        }
+
+        // Run the configured test command to check for regressions.
+        let test_cmd = if config.test_requirements.test_command.is_empty() {
+            "cargo test"
+        } else {
+            &config.test_requirements.test_command
+        };
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(test_cmd)
+            .current_dir(self.root())
+            .output();
+
+        let test_passed = match &output {
+            Ok(result) => result.status.success(),
+            Err(_) => true, // If we can't run tests, don't block
+        };
+
+        if test_passed {
+            return;
+        }
+
+        let stderr = output
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+            .unwrap_or_default();
+
+        let regression = fl_policy::RegressionDetection {
+            source_event_id: exploration_id,
+            kind: fl_policy::RegressionKind::TestFailure,
+            description: format!(
+                "Test failures detected after promotion: {}",
+                stderr.lines().take(3).collect::<Vec<_>>().join("; ")
+            ),
+            affected_files: Vec::new(),
+            originating_actor: std::env::var("FL_ACTOR").unwrap_or_else(|_| "unknown".to_string()),
+        };
+
+        let decision = fl_policy::check_regression_policy(
+            &config.regression,
+            &config.rollback,
+            &regression,
+        );
+
+        // Record the regression detection.
+        let _ = self.record_policy_decision(&decision);
+
+        if decision.is_blocked() && config.rollback.enabled && config.rollback.auto_rollback {
+            // Automatic rollback via undo.
+            eprintln!(
+                "warning: regression detected after promotion of exploration {}. Attempting automatic rollback.",
+                exploration_id
+            );
+            if let Err(e) = self.undo(UndoRequest::Last) {
+                eprintln!("error: automatic rollback failed: {}", e);
+            } else {
+                eprintln!(
+                    "info: automatic rollback complete. Originating agent should re-explore."
+                );
+            }
+        } else if decision.is_blocked() || decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Block { reason, .. }
+            | fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict
+            {
+                eprintln!("warning: post-merge regression — {}", reason);
+            }
+        }
     }
 
     /// Recursively collect symbols from source files that are NOT in the changed set.
@@ -8498,6 +8678,163 @@ fn is_test_file(path: &str) -> bool {
         || path.contains("/tests/")
         || path.contains("/__tests__/")
         || path.contains("/test/")
+}
+
+/// Parse dependencies from a manifest file (Cargo.toml, package.json, go.mod, etc.).
+/// Returns detected dependencies for policy checking.
+fn parse_manifest_dependencies(
+    manifest_path: &str,
+    content: &str,
+) -> Vec<fl_policy::DetectedDependency> {
+    let mut deps = Vec::new();
+
+    if manifest_path.ends_with("Cargo.toml") {
+        // Parse [dependencies] and [dev-dependencies] sections.
+        let mut in_deps = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_deps = trimmed == "[dependencies]"
+                    || trimmed == "[dev-dependencies]"
+                    || trimmed == "[build-dependencies]";
+                continue;
+            }
+            if !in_deps || trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some((name, rest)) = trimmed.split_once('=') {
+                let name = name.trim().trim_matches('"');
+                let version = rest
+                    .trim()
+                    .trim_matches('"')
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
+                // Handle inline table: { version = "1.0", features = [...] }
+                let version = if version.starts_with('{') {
+                    version
+                        .trim_start_matches('{')
+                        .split(',')
+                        .find(|s| s.trim().starts_with("version"))
+                        .and_then(|s| s.split('=').nth(1))
+                        .map(|v| v.trim().trim_matches('"').trim_matches('}').to_string())
+                        .unwrap_or_default()
+                } else {
+                    version
+                };
+                if !name.is_empty() {
+                    deps.push(fl_policy::DetectedDependency {
+                        name: name.to_string(),
+                        version,
+                        manifest_file: manifest_path.to_string(),
+                        license: None,
+                        vulnerabilities: Vec::new(),
+                    });
+                }
+            }
+        }
+    } else if manifest_path.ends_with("package.json") {
+        // Simple JSON parsing for dependencies/devDependencies.
+        let mut in_deps = false;
+        let mut brace_depth = 0;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("\"dependencies\"") || trimmed.contains("\"devDependencies\"") {
+                in_deps = true;
+                brace_depth = 0;
+                if trimmed.contains('{') {
+                    brace_depth += 1;
+                }
+                continue;
+            }
+            if in_deps {
+                if trimmed.contains('{') {
+                    brace_depth += 1;
+                }
+                if trimmed.contains('}') {
+                    brace_depth -= 1;
+                    if brace_depth <= 0 {
+                        in_deps = false;
+                        continue;
+                    }
+                }
+                // Parse "name": "version"
+                let parts: Vec<&str> = trimmed.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    let name = parts[0].trim().trim_matches('"').trim_matches(',');
+                    let version = parts[1]
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches(',')
+                        .to_string();
+                    if !name.is_empty() && !name.starts_with('/') {
+                        deps.push(fl_policy::DetectedDependency {
+                            name: name.to_string(),
+                            version,
+                            manifest_file: manifest_path.to_string(),
+                            license: None,
+                            vulnerabilities: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+    } else if manifest_path.ends_with("go.mod") {
+        // Parse require blocks.
+        let mut in_require = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed == "require (" {
+                in_require = true;
+                continue;
+            }
+            if trimmed == ")" {
+                in_require = false;
+                continue;
+            }
+            if in_require {
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    deps.push(fl_policy::DetectedDependency {
+                        name: parts[0].to_string(),
+                        version: parts[1].to_string(),
+                        manifest_file: manifest_path.to_string(),
+                        license: None,
+                        vulnerabilities: Vec::new(),
+                    });
+                }
+            }
+        }
+    } else if manifest_path.ends_with("requirements.txt") {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // Parse name==version or name>=version.
+            let (name, version) = if let Some(idx) = trimmed.find("==") {
+                (&trimmed[..idx], &trimmed[idx + 2..])
+            } else if let Some(idx) = trimmed.find(">=") {
+                (&trimmed[..idx], &trimmed[idx + 2..])
+            } else {
+                (trimmed, "")
+            };
+            if !name.is_empty() {
+                deps.push(fl_policy::DetectedDependency {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    manifest_file: manifest_path.to_string(),
+                    license: None,
+                    vulnerabilities: Vec::new(),
+                });
+            }
+        }
+    }
+
+    deps
 }
 
 fn normalize_label(message: &str) -> String {

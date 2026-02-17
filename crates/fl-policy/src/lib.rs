@@ -32,6 +32,8 @@ pub enum PolicyCategory {
     ArchitectureRule,
     AntiPattern,
     DuplicationReuse,
+    DependencyCheck,
+    Regression,
 }
 
 /// The operation being checked.
@@ -304,6 +306,8 @@ pub struct TestRequirements {
     pub test_command: String,
     /// Require test files for new source files.
     pub require_new_tests: bool,
+    /// Minimum coverage percentage for modified modules (0--100).
+    pub min_coverage_percent: Option<u32>,
     /// Action when test requirements fail.
     pub on_failure: TestFailureAction,
 }
@@ -315,6 +319,7 @@ impl Default for TestRequirements {
             require_passing: true,
             test_command: "cargo test".to_string(),
             require_new_tests: false,
+            min_coverage_percent: None,
             on_failure: TestFailureAction::default(),
         }
     }
@@ -326,6 +331,15 @@ pub struct TestResult {
     pub passed: bool,
     pub exit_code: i32,
     pub output_summary: String,
+}
+
+/// Coverage data for modified modules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoverageResult {
+    /// Per-module coverage percentages (module_path → coverage %).
+    pub module_coverage: Vec<(String, f64)>,
+    /// Overall coverage percentage.
+    pub overall_percent: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1514,6 +1528,468 @@ pub fn signature_similarity(
     score / total
 }
 
+// ---------------------------------------------------------------------------
+// Dependency & Compatibility types (12.5h)
+// ---------------------------------------------------------------------------
+
+/// Enforcement level for dependency checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DependencyEnforce {
+    Block,
+    Gate,
+    Warn,
+}
+
+impl Default for DependencyEnforce {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+/// An approved package with allowed version range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedPackage {
+    /// Package name (e.g. "serde", "react").
+    pub name: String,
+    /// Allowed version range (e.g. ">=1.0,<2.0" or "*" for any).
+    pub version_range: String,
+}
+
+/// A detected dependency in a manifest file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectedDependency {
+    /// Package name.
+    pub name: String,
+    /// Declared version.
+    pub version: String,
+    /// Which manifest file declares it.
+    pub manifest_file: String,
+    /// License identifier (if detected).
+    pub license: Option<String>,
+    /// Known vulnerabilities (CVE IDs).
+    pub vulnerabilities: Vec<String>,
+}
+
+/// Top-level dependency policy config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyPolicy {
+    pub enabled: bool,
+    pub enforce: DependencyEnforce,
+    /// Approved packages (from .flock/approved-deps.toml).
+    pub approved_packages: Vec<ApprovedPackage>,
+    /// Blocked license identifiers (e.g. "GPL-3.0", "AGPL-3.0").
+    pub license_blocklist: Vec<String>,
+    /// Whether to check for known vulnerabilities.
+    pub vuln_check: bool,
+    /// Command to run consumer test suites when shared libraries are modified.
+    pub consumer_test_command: String,
+}
+
+impl Default for DependencyPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            enforce: DependencyEnforce::default(),
+            approved_packages: Vec::new(),
+            license_blocklist: Vec::new(),
+            vuln_check: false,
+            consumer_test_command: String::new(),
+        }
+    }
+}
+
+/// Check detected dependencies against the dependency policy.
+pub fn check_dependency_policy(
+    config: &DependencyPolicy,
+    dependencies: &[DetectedDependency],
+) -> PolicyDecision {
+    if !config.enabled {
+        return PolicyDecision {
+            policy_name: "dependencies".to_string(),
+            category: PolicyCategory::DependencyCheck,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::Checkpoint,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut affected: Vec<String> = Vec::new();
+
+    for dep in dependencies {
+        // Check against approved packages allowlist (if non-empty).
+        if !config.approved_packages.is_empty() {
+            let approved = config
+                .approved_packages
+                .iter()
+                .any(|a| a.name == dep.name && version_matches(&dep.version, &a.version_range));
+            if !approved {
+                violations.push(format!(
+                    "{}: package '{}@{}' is not in the approved packages list",
+                    dep.manifest_file, dep.name, dep.version
+                ));
+                if !affected.contains(&dep.manifest_file) {
+                    affected.push(dep.manifest_file.clone());
+                }
+            }
+        }
+
+        // Check license blocklist.
+        if let Some(license) = &dep.license {
+            if config
+                .license_blocklist
+                .iter()
+                .any(|blocked| license.contains(blocked))
+            {
+                violations.push(format!(
+                    "{}: package '{}' has blocked license '{}'",
+                    dep.manifest_file, dep.name, license
+                ));
+                if !affected.contains(&dep.manifest_file) {
+                    affected.push(dep.manifest_file.clone());
+                }
+            }
+        }
+
+        // Check for known vulnerabilities.
+        if config.vuln_check && !dep.vulnerabilities.is_empty() {
+            violations.push(format!(
+                "{}: package '{}@{}' has known vulnerabilities: {}",
+                dep.manifest_file,
+                dep.name,
+                dep.version,
+                dep.vulnerabilities.join(", ")
+            ));
+            if !affected.contains(&dep.manifest_file) {
+                affected.push(dep.manifest_file.clone());
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        return PolicyDecision {
+            policy_name: "dependencies".to_string(),
+            category: PolicyCategory::DependencyCheck,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::Checkpoint,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let reason = format!(
+        "{} dependency violation(s):\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+
+    let verdict = match config.enforce {
+        DependencyEnforce::Block => PolicyVerdict::Block {
+            reason,
+            fix_suggestion: Some(
+                "Update .flock/approved-deps.toml or remove the offending dependency".to_string(),
+            ),
+        },
+        DependencyEnforce::Gate => PolicyVerdict::Gate {
+            reason,
+            justification_required: true,
+        },
+        DependencyEnforce::Warn => PolicyVerdict::Allow,
+    };
+
+    PolicyDecision {
+        policy_name: "dependencies".to_string(),
+        category: PolicyCategory::DependencyCheck,
+        verdict,
+        operation: PolicyOperation::Checkpoint,
+        actor: String::new(),
+        task_id: None,
+        exploration_id: None,
+        affected_files: affected,
+        escalation_context: None,
+    }
+}
+
+/// Simple version matching. Supports "*" (any), exact match, and basic range
+/// prefixes like ">=", "^", "~".
+fn version_matches(actual: &str, range: &str) -> bool {
+    if range == "*" || range.is_empty() {
+        return true;
+    }
+    if range == actual {
+        return true;
+    }
+    // Caret range: ^1.2.3 means >=1.2.3,<2.0.0 (simplified: major must match).
+    if let Some(prefix) = range.strip_prefix('^') {
+        let range_major = prefix.split('.').next().unwrap_or("");
+        let actual_major = actual.split('.').next().unwrap_or("");
+        return range_major == actual_major;
+    }
+    // Tilde range: ~1.2.3 means >=1.2.3,<1.3.0 (simplified: major.minor must match).
+    if let Some(prefix) = range.strip_prefix('~') {
+        let range_parts: Vec<&str> = prefix.split('.').collect();
+        let actual_parts: Vec<&str> = actual.split('.').collect();
+        return range_parts.first() == actual_parts.first()
+            && range_parts.get(1) == actual_parts.get(1);
+    }
+    // >= range.
+    if let Some(min) = range.strip_prefix(">=") {
+        return actual >= min.trim();
+    }
+    false
+}
+
+/// Check coverage thresholds for modified modules.
+pub fn check_coverage_threshold(
+    requirements: &TestRequirements,
+    coverage: Option<&CoverageResult>,
+    modified_files: &[String],
+) -> PolicyDecision {
+    if !requirements.enabled {
+        return PolicyDecision {
+            policy_name: "coverage_threshold".to_string(),
+            category: PolicyCategory::TestRequirement,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::ExplorationPromote,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let min_pct = match requirements.min_coverage_percent {
+        Some(pct) => pct as f64,
+        None => {
+            return PolicyDecision {
+                policy_name: "coverage_threshold".to_string(),
+                category: PolicyCategory::TestRequirement,
+                verdict: PolicyVerdict::Allow,
+                operation: PolicyOperation::ExplorationPromote,
+                actor: String::new(),
+                task_id: None,
+                exploration_id: None,
+                affected_files: Vec::new(),
+                escalation_context: None,
+            };
+        }
+    };
+
+    let coverage = match coverage {
+        Some(c) => c,
+        None => {
+            return make_test_decision(
+                requirements,
+                format!(
+                    "Coverage data not available — min_coverage_percent={} required",
+                    min_pct
+                ),
+            );
+        }
+    };
+
+    let mut below_threshold: Vec<(String, f64)> = Vec::new();
+    for (module, pct) in &coverage.module_coverage {
+        // Only check modules that have modified files.
+        let module_relevant = modified_files
+            .iter()
+            .any(|f| f.starts_with(module) || module.starts_with(f));
+        if module_relevant && *pct < min_pct {
+            below_threshold.push((module.clone(), *pct));
+        }
+    }
+
+    if below_threshold.is_empty() {
+        return PolicyDecision {
+            policy_name: "coverage_threshold".to_string(),
+            category: PolicyCategory::TestRequirement,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::ExplorationPromote,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let details: Vec<String> = below_threshold
+        .iter()
+        .map(|(m, pct)| format!("{}: {:.1}% (min {}%)", m, pct, min_pct))
+        .collect();
+    let affected: Vec<String> = below_threshold.iter().map(|(m, _)| m.clone()).collect();
+
+    let reason = format!(
+        "Coverage below threshold for modified modules:\n  {}",
+        details.join("\n  ")
+    );
+
+    let verdict = match requirements.on_failure {
+        TestFailureAction::Block => PolicyVerdict::Block {
+            reason,
+            fix_suggestion: Some("Add tests to increase coverage for modified modules".to_string()),
+        },
+        TestFailureAction::Warn => PolicyVerdict::Allow,
+        TestFailureAction::Gate => PolicyVerdict::Gate {
+            reason,
+            justification_required: true,
+        },
+    };
+
+    PolicyDecision {
+        policy_name: "coverage_threshold".to_string(),
+        category: PolicyCategory::TestRequirement,
+        verdict,
+        operation: PolicyOperation::ExplorationPromote,
+        actor: String::new(),
+        task_id: None,
+        exploration_id: None,
+        affected_files: affected,
+        escalation_context: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regression detection & rollback types (12.5k)
+// ---------------------------------------------------------------------------
+
+/// Configuration for post-merge regression monitoring.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegressionConfig {
+    pub enabled: bool,
+    /// Whether to monitor test results after merge/promotion.
+    pub monitor_after_merge: bool,
+    /// How long to monitor after merge (in seconds).
+    pub monitor_window_secs: u64,
+    /// Performance regression threshold (fractional, e.g. 0.1 = 10% slower).
+    pub benchmark_threshold: f64,
+}
+
+impl Default for RegressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            monitor_after_merge: true,
+            monitor_window_secs: 3600,
+            benchmark_threshold: 0.1,
+        }
+    }
+}
+
+/// Configuration for automatic rollback on regression.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackConfig {
+    pub enabled: bool,
+    /// Whether to auto-rollback on detected regression.
+    pub auto_rollback: bool,
+    /// Whether test failures trigger rollback.
+    pub rollback_on_test_failure: bool,
+}
+
+impl Default for RollbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_rollback: true,
+            rollback_on_test_failure: true,
+        }
+    }
+}
+
+/// Detected regression after a merge/promotion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegressionDetection {
+    /// The event (checkpoint/merge) that introduced the regression.
+    pub source_event_id: Uuid,
+    /// What kind of regression was detected.
+    pub kind: RegressionKind,
+    /// Human-readable description.
+    pub description: String,
+    /// Files implicated in the regression.
+    pub affected_files: Vec<String>,
+    /// Actor who made the change.
+    pub originating_actor: String,
+}
+
+/// What type of regression was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegressionKind {
+    /// Test suite failures.
+    TestFailure,
+    /// Performance benchmark regression.
+    BenchmarkRegression,
+}
+
+/// Check whether a regression should trigger a rollback.
+pub fn check_regression_policy(
+    regression_config: &RegressionConfig,
+    rollback_config: &RollbackConfig,
+    regression: &RegressionDetection,
+) -> PolicyDecision {
+    if !regression_config.enabled {
+        return PolicyDecision {
+            policy_name: "regression".to_string(),
+            category: PolicyCategory::Regression,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::ExplorationPromote,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    let should_rollback = rollback_config.enabled
+        && rollback_config.auto_rollback
+        && match regression.kind {
+            RegressionKind::TestFailure => rollback_config.rollback_on_test_failure,
+            RegressionKind::BenchmarkRegression => true,
+        };
+
+    let reason = format!(
+        "Regression detected after merge: {} (source event: {}, actor: {})",
+        regression.description,
+        regression.source_event_id,
+        regression.originating_actor
+    );
+
+    let verdict = if should_rollback {
+        PolicyVerdict::Block {
+            reason,
+            fix_suggestion: Some(format!(
+                "Automatic rollback will revert event {}. Originating agent will be notified for re-exploration.",
+                regression.source_event_id
+            )),
+        }
+    } else {
+        PolicyVerdict::Gate {
+            reason,
+            justification_required: true,
+        }
+    };
+
+    PolicyDecision {
+        policy_name: "regression".to_string(),
+        category: PolicyCategory::Regression,
+        verdict,
+        operation: PolicyOperation::ExplorationPromote,
+        actor: regression.originating_actor.clone(),
+        task_id: None,
+        exploration_id: None,
+        affected_files: regression.affected_files.clone(),
+        escalation_context: None,
+    }
+}
+
 fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
@@ -1960,6 +2436,7 @@ mod tests {
             require_passing: true,
             test_command: "cargo test".to_string(),
             require_new_tests: false,
+            min_coverage_percent: None,
             on_failure: TestFailureAction::Block,
         };
         let result = TestResult {
@@ -1978,6 +2455,7 @@ mod tests {
             require_passing: true,
             test_command: "cargo test".to_string(),
             require_new_tests: false,
+            min_coverage_percent: None,
             on_failure: TestFailureAction::Block,
         };
         let result = TestResult {
@@ -1996,6 +2474,7 @@ mod tests {
             require_passing: true,
             test_command: "cargo test".to_string(),
             require_new_tests: false,
+            min_coverage_percent: None,
             on_failure: TestFailureAction::Block,
         };
         let decision = check_test_requirements(&req, None, &[], &[]);
@@ -2009,6 +2488,7 @@ mod tests {
             require_passing: true,
             test_command: "cargo test".to_string(),
             require_new_tests: false,
+            min_coverage_percent: None,
             on_failure: TestFailureAction::Gate,
         };
         let result = TestResult {
@@ -2027,6 +2507,7 @@ mod tests {
             require_passing: false,
             test_command: "cargo test".to_string(),
             require_new_tests: true,
+            min_coverage_percent: None,
             on_failure: TestFailureAction::Block,
         };
         let new_source = vec!["src/auth.rs".to_string()];
@@ -2042,6 +2523,7 @@ mod tests {
             require_passing: false,
             test_command: "cargo test".to_string(),
             require_new_tests: true,
+            min_coverage_percent: None,
             on_failure: TestFailureAction::Block,
         };
         let new_source = vec!["src/auth.rs".to_string(), "src/db.rs".to_string()];
@@ -2486,5 +2968,323 @@ mod tests {
         let sig_a: (Vec<(Option<String>, bool)>, Option<String>) = (vec![], Some("String".to_string()));
         let sig_b: (Vec<(Option<String>, bool)>, Option<String>) = (vec![], Some("String".to_string()));
         assert!((signature_similarity(&sig_a, &sig_b) - 1.0).abs() < 0.01);
+    }
+
+    // --- Dependency policy tests ---
+
+    #[test]
+    fn dependency_disabled_allows() {
+        let config = DependencyPolicy::default();
+        let deps = vec![DetectedDependency {
+            name: "evil-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            manifest_file: "Cargo.toml".to_string(),
+            license: Some("GPL-3.0".to_string()),
+            vulnerabilities: vec!["CVE-2024-0001".to_string()],
+        }];
+        let decision = check_dependency_policy(&config, &deps);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn dependency_unapproved_package_blocks() {
+        let config = DependencyPolicy {
+            enabled: true,
+            enforce: DependencyEnforce::Block,
+            approved_packages: vec![ApprovedPackage {
+                name: "serde".to_string(),
+                version_range: "*".to_string(),
+            }],
+            license_blocklist: Vec::new(),
+            vuln_check: false,
+            consumer_test_command: String::new(),
+        };
+        let deps = vec![DetectedDependency {
+            name: "unknown-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            manifest_file: "Cargo.toml".to_string(),
+            license: None,
+            vulnerabilities: Vec::new(),
+        }];
+        let decision = check_dependency_policy(&config, &deps);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn dependency_approved_package_allows() {
+        let config = DependencyPolicy {
+            enabled: true,
+            enforce: DependencyEnforce::Block,
+            approved_packages: vec![ApprovedPackage {
+                name: "serde".to_string(),
+                version_range: "^1.0".to_string(),
+            }],
+            license_blocklist: Vec::new(),
+            vuln_check: false,
+            consumer_test_command: String::new(),
+        };
+        let deps = vec![DetectedDependency {
+            name: "serde".to_string(),
+            version: "1.0.200".to_string(),
+            manifest_file: "Cargo.toml".to_string(),
+            license: None,
+            vulnerabilities: Vec::new(),
+        }];
+        let decision = check_dependency_policy(&config, &deps);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn dependency_blocked_license() {
+        let config = DependencyPolicy {
+            enabled: true,
+            enforce: DependencyEnforce::Block,
+            approved_packages: Vec::new(),
+            license_blocklist: vec!["GPL-3.0".to_string(), "AGPL-3.0".to_string()],
+            vuln_check: false,
+            consumer_test_command: String::new(),
+        };
+        let deps = vec![DetectedDependency {
+            name: "copyleft-lib".to_string(),
+            version: "2.0".to_string(),
+            manifest_file: "package.json".to_string(),
+            license: Some("GPL-3.0-or-later".to_string()),
+            vulnerabilities: Vec::new(),
+        }];
+        let decision = check_dependency_policy(&config, &deps);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn dependency_vulnerability_blocks() {
+        let config = DependencyPolicy {
+            enabled: true,
+            enforce: DependencyEnforce::Block,
+            approved_packages: Vec::new(),
+            license_blocklist: Vec::new(),
+            vuln_check: true,
+            consumer_test_command: String::new(),
+        };
+        let deps = vec![DetectedDependency {
+            name: "vuln-pkg".to_string(),
+            version: "0.1.0".to_string(),
+            manifest_file: "Cargo.toml".to_string(),
+            license: None,
+            vulnerabilities: vec!["CVE-2024-1234".to_string()],
+        }];
+        let decision = check_dependency_policy(&config, &deps);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn dependency_gate_mode() {
+        let config = DependencyPolicy {
+            enabled: true,
+            enforce: DependencyEnforce::Gate,
+            approved_packages: vec![ApprovedPackage {
+                name: "allowed".to_string(),
+                version_range: "*".to_string(),
+            }],
+            license_blocklist: Vec::new(),
+            vuln_check: false,
+            consumer_test_command: String::new(),
+        };
+        let deps = vec![DetectedDependency {
+            name: "new-dep".to_string(),
+            version: "1.0.0".to_string(),
+            manifest_file: "Cargo.toml".to_string(),
+            license: None,
+            vulnerabilities: Vec::new(),
+        }];
+        let decision = check_dependency_policy(&config, &deps);
+        assert!(decision.is_gated());
+    }
+
+    // --- Version matching tests ---
+
+    #[test]
+    fn version_match_wildcard() {
+        assert!(version_matches("1.2.3", "*"));
+        assert!(version_matches("0.0.1", ""));
+    }
+
+    #[test]
+    fn version_match_exact() {
+        assert!(version_matches("1.2.3", "1.2.3"));
+        assert!(!version_matches("1.2.4", "1.2.3"));
+    }
+
+    #[test]
+    fn version_match_caret() {
+        assert!(version_matches("1.5.0", "^1.0"));
+        assert!(!version_matches("2.0.0", "^1.0"));
+    }
+
+    #[test]
+    fn version_match_tilde() {
+        assert!(version_matches("1.2.9", "~1.2"));
+        assert!(!version_matches("1.3.0", "~1.2"));
+    }
+
+    #[test]
+    fn version_match_gte() {
+        assert!(version_matches("2.0.0", ">=1.0"));
+        assert!(!version_matches("0.9.0", ">=1.0"));
+    }
+
+    // --- Coverage threshold tests ---
+
+    #[test]
+    fn coverage_disabled_allows() {
+        let req = TestRequirements::default();
+        let decision = check_coverage_threshold(&req, None, &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn coverage_no_threshold_allows() {
+        let req = TestRequirements {
+            enabled: true,
+            min_coverage_percent: None,
+            ..TestRequirements::default()
+        };
+        let decision = check_coverage_threshold(&req, None, &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn coverage_below_threshold_blocks() {
+        let req = TestRequirements {
+            enabled: true,
+            min_coverage_percent: Some(80),
+            on_failure: TestFailureAction::Block,
+            ..TestRequirements::default()
+        };
+        let coverage = CoverageResult {
+            module_coverage: vec![("src/auth".to_string(), 45.0)],
+            overall_percent: 45.0,
+        };
+        let modified = vec!["src/auth/login.rs".to_string()];
+        let decision = check_coverage_threshold(&req, Some(&coverage), &modified);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn coverage_above_threshold_allows() {
+        let req = TestRequirements {
+            enabled: true,
+            min_coverage_percent: Some(80),
+            on_failure: TestFailureAction::Block,
+            ..TestRequirements::default()
+        };
+        let coverage = CoverageResult {
+            module_coverage: vec![("src/auth".to_string(), 90.0)],
+            overall_percent: 90.0,
+        };
+        let modified = vec!["src/auth/login.rs".to_string()];
+        let decision = check_coverage_threshold(&req, Some(&coverage), &modified);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn coverage_no_data_blocks() {
+        let req = TestRequirements {
+            enabled: true,
+            min_coverage_percent: Some(80),
+            on_failure: TestFailureAction::Block,
+            ..TestRequirements::default()
+        };
+        let modified = vec!["src/auth/login.rs".to_string()];
+        let decision = check_coverage_threshold(&req, None, &modified);
+        assert!(decision.is_blocked());
+    }
+
+    // --- Regression policy tests ---
+
+    #[test]
+    fn regression_disabled_allows() {
+        let reg_config = RegressionConfig::default();
+        let rollback_config = RollbackConfig::default();
+        let regression = RegressionDetection {
+            source_event_id: test_task_id(),
+            kind: RegressionKind::TestFailure,
+            description: "tests failed".to_string(),
+            affected_files: vec!["src/main.rs".to_string()],
+            originating_actor: "agent-1".to_string(),
+        };
+        let decision = check_regression_policy(&reg_config, &rollback_config, &regression);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn regression_test_failure_with_rollback_blocks() {
+        let reg_config = RegressionConfig {
+            enabled: true,
+            monitor_after_merge: true,
+            monitor_window_secs: 3600,
+            benchmark_threshold: 0.1,
+        };
+        let rollback_config = RollbackConfig {
+            enabled: true,
+            auto_rollback: true,
+            rollback_on_test_failure: true,
+        };
+        let regression = RegressionDetection {
+            source_event_id: test_task_id(),
+            kind: RegressionKind::TestFailure,
+            description: "3 tests failed".to_string(),
+            affected_files: vec!["src/lib.rs".to_string()],
+            originating_actor: "agent-2".to_string(),
+        };
+        let decision = check_regression_policy(&reg_config, &rollback_config, &regression);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn regression_without_rollback_gates() {
+        let reg_config = RegressionConfig {
+            enabled: true,
+            monitor_after_merge: true,
+            monitor_window_secs: 3600,
+            benchmark_threshold: 0.1,
+        };
+        let rollback_config = RollbackConfig {
+            enabled: false,
+            auto_rollback: false,
+            rollback_on_test_failure: false,
+        };
+        let regression = RegressionDetection {
+            source_event_id: test_task_id(),
+            kind: RegressionKind::TestFailure,
+            description: "tests failed".to_string(),
+            affected_files: Vec::new(),
+            originating_actor: "agent-1".to_string(),
+        };
+        let decision = check_regression_policy(&reg_config, &rollback_config, &regression);
+        assert!(decision.is_gated());
+    }
+
+    #[test]
+    fn regression_benchmark_with_rollback_blocks() {
+        let reg_config = RegressionConfig {
+            enabled: true,
+            monitor_after_merge: true,
+            monitor_window_secs: 3600,
+            benchmark_threshold: 0.1,
+        };
+        let rollback_config = RollbackConfig {
+            enabled: true,
+            auto_rollback: true,
+            rollback_on_test_failure: false, // only test failures disabled
+        };
+        let regression = RegressionDetection {
+            source_event_id: test_task_id(),
+            kind: RegressionKind::BenchmarkRegression,
+            description: "15% slower".to_string(),
+            affected_files: vec!["src/engine.rs".to_string()],
+            originating_actor: "agent-3".to_string(),
+        };
+        let decision = check_regression_policy(&reg_config, &rollback_config, &regression);
+        assert!(decision.is_blocked());
     }
 }

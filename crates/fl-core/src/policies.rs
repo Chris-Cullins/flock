@@ -3,9 +3,10 @@ use std::path::Path;
 
 use fl_policy::{
     AntiPatternConfig, AntiPatternEnforce, AntiPatternRule, ArchRuleEnforce, ArchitectureRules,
-    BudgetExceedAction, BudgetLimits, DependencyDirectionRule, LayerBoundaryRule,
-    RateLimitExceedAction, RateLimits, ReuseEnforce, ReusePolicy, ScopeEnforceMode, ScopeMode,
-    ScopePolicy, TestFailureAction, TestRequirements,
+    BudgetExceedAction, BudgetLimits, DependencyDirectionRule, DependencyEnforce,
+    DependencyPolicy, LayerBoundaryRule, RateLimitExceedAction, RateLimits, RegressionConfig,
+    ReuseEnforce, ReusePolicy, RollbackConfig, ScopeEnforceMode, ScopeMode, ScopePolicy,
+    TestFailureAction, TestRequirements,
 };
 
 /// Configuration for commit hygiene enforcement.
@@ -42,6 +43,9 @@ pub struct PoliciesConfig {
     pub architecture: ArchitectureRules,
     pub anti_patterns: AntiPatternConfig,
     pub reuse: ReusePolicy,
+    pub dependencies: DependencyPolicy,
+    pub regression: RegressionConfig,
+    pub rollback: RollbackConfig,
 }
 
 impl Default for PoliciesConfig {
@@ -55,6 +59,9 @@ impl Default for PoliciesConfig {
             architecture: ArchitectureRules::default(),
             anti_patterns: AntiPatternConfig::default(),
             reuse: ReusePolicy::default(),
+            dependencies: DependencyPolicy::default(),
+            regression: RegressionConfig::default(),
+            rollback: RollbackConfig::default(),
         }
     }
 }
@@ -129,6 +136,7 @@ enabled = false
 
 # --- DRY / Duplication prevention ---
 # Detect duplicate code by comparing new symbols against existing ones.
+# Protected domains with stricter thresholds are defined in .flock/reuse-domains.toml.
 [reuse]
 enabled = false
 # enforce = "gate"  # "block", "gate", or "warn"
@@ -136,6 +144,31 @@ enabled = false
 # check_signatures = true
 # check_bodies = true
 # check_patterns = true
+
+# --- Dependency & compatibility checks ---
+# Enforce an approved package allowlist, block forbidden licenses, and scan for vulnerabilities.
+# Approved packages are defined in .flock/approved-deps.toml.
+[dependencies]
+enabled = false
+# enforce = "block"  # "block", "gate", or "warn"
+# license_blocklist = ["GPL-3.0", "AGPL-3.0"]
+# vuln_check = true
+# consumer_test_command = ""
+
+# --- Regression detection ---
+# Monitor for test failures and benchmark regressions after merge/promotion.
+[regression]
+enabled = false
+# monitor_after_merge = true
+# monitor_window = "1h"
+# benchmark_threshold = 0.1
+
+# --- Automatic rollback ---
+# Automatically revert merged changes when regressions are detected.
+[rollback]
+enabled = false
+# auto_rollback = true
+# rollback_on_test_failure = true
 "#;
 
 /// Parse a `policies.toml` file into a `PoliciesConfig`.
@@ -171,6 +204,9 @@ pub fn parse_policies_config(content: &str) -> PoliciesConfig {
             "architecture" => parse_architecture_field(&mut config.architecture, key, value),
             "anti_patterns" => parse_anti_patterns_field(&mut config.anti_patterns, key, value),
             "reuse" => parse_reuse_field(&mut config.reuse, key, value),
+            "dependencies" => parse_dependency_field(&mut config.dependencies, key, value),
+            "regression" => parse_regression_field(&mut config.regression, key, value),
+            "rollback" => parse_rollback_field(&mut config.rollback, key, value),
             _ => {}
         }
     }
@@ -267,6 +303,7 @@ fn parse_test_requirements_field(config: &mut TestRequirements, key: &str, value
         "require_passing" => config.require_passing = value == "true",
         "test_command" => config.test_command = parse_toml_string(value),
         "require_new_tests" => config.require_new_tests = value == "true",
+        "min_coverage_percent" => config.min_coverage_percent = value.parse().ok(),
         "on_failure" => {
             config.on_failure = match parse_toml_string(value).as_str() {
                 "warn" => TestFailureAction::Warn,
@@ -326,6 +363,192 @@ fn parse_reuse_field(config: &mut ReusePolicy, key: &str, value: &str) {
         "check_patterns" => config.check_patterns = value == "true",
         _ => {}
     }
+}
+
+/// Parse `.flock/reuse-domains.toml` — protected domains with stricter thresholds:
+///
+/// ```toml
+/// [domain.finance]
+/// file_pattern = "src/finance/**"
+/// similarity_threshold = 0.5
+///
+/// [domain.compliance]
+/// file_pattern = "src/compliance/**"
+/// similarity_threshold = 0.4
+/// ```
+pub fn parse_reuse_domains(content: &str) -> Vec<fl_policy::ProtectedDomain> {
+    let mut domains = Vec::new();
+    let mut in_domain = false;
+    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    let flush =
+        |fields: &std::collections::HashMap<String, String>,
+         domains: &mut Vec<fl_policy::ProtectedDomain>| {
+            let file_pattern = match fields.get("file_pattern") {
+                Some(p) if !p.is_empty() => p.clone(),
+                _ => return,
+            };
+            let threshold = fields
+                .get("similarity_threshold")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+            domains.push(fl_policy::ProtectedDomain {
+                file_pattern,
+                similarity_threshold: threshold,
+            });
+        };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_domain {
+                flush(&fields, &mut domains);
+            }
+            let section = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+            in_domain = section.starts_with("domain.");
+            fields.clear();
+            continue;
+        }
+
+        if in_domain {
+            if let Some((key, value)) = trimmed.split_once('=') {
+                fields.insert(key.trim().to_string(), parse_toml_string(value.trim()));
+            }
+        }
+    }
+    if in_domain {
+        flush(&fields, &mut domains);
+    }
+
+    domains
+}
+
+fn parse_dependency_field(config: &mut DependencyPolicy, key: &str, value: &str) {
+    match key {
+        "enabled" => config.enabled = value == "true",
+        "enforce" => {
+            config.enforce = match parse_toml_string(value).as_str() {
+                "gate" => DependencyEnforce::Gate,
+                "warn" => DependencyEnforce::Warn,
+                _ => DependencyEnforce::Block,
+            };
+        }
+        "vuln_check" => config.vuln_check = value == "true",
+        "consumer_test_command" => config.consumer_test_command = parse_toml_string(value),
+        "license_blocklist" => {
+            // Parse as comma-separated or TOML array-like: ["GPL-3.0", "AGPL-3.0"]
+            let s = parse_toml_string(value);
+            let s = s.trim_start_matches('[').trim_end_matches(']');
+            config.license_blocklist = s
+                .split(',')
+                .map(|item| {
+                    let item = item.trim();
+                    let item = item.trim_matches('"').trim_matches('\'');
+                    item.to_string()
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        _ => {}
+    }
+}
+
+fn parse_regression_field(config: &mut RegressionConfig, key: &str, value: &str) {
+    match key {
+        "enabled" => config.enabled = value == "true",
+        "monitor_after_merge" => config.monitor_after_merge = value == "true",
+        "monitor_window" => {
+            if let Some(secs) = parse_duration_to_secs(value) {
+                config.monitor_window_secs = secs;
+            }
+        }
+        "benchmark_threshold" => {
+            if let Ok(v) = parse_toml_string(value).parse::<f64>() {
+                config.benchmark_threshold = v.clamp(0.0, 1.0);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_rollback_field(config: &mut RollbackConfig, key: &str, value: &str) {
+    match key {
+        "enabled" => config.enabled = value == "true",
+        "auto_rollback" => config.auto_rollback = value == "true",
+        "rollback_on_test_failure" => config.rollback_on_test_failure = value == "true",
+        _ => {}
+    }
+}
+
+/// Parse `.flock/approved-deps.toml` — approved package definitions:
+///
+/// ```toml
+/// [package.serde]
+/// version_range = "^1.0"
+///
+/// [package.tokio]
+/// version_range = ">=1.0"
+/// ```
+pub fn parse_approved_deps(content: &str) -> Vec<fl_policy::ApprovedPackage> {
+    let mut packages = Vec::new();
+    let mut current_name = String::new();
+    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut in_package = false;
+
+    let flush = |name: &str,
+                 fields: &std::collections::HashMap<String, String>,
+                 packages: &mut Vec<fl_policy::ApprovedPackage>| {
+        if name.is_empty() {
+            return;
+        }
+        let version_range = fields
+            .get("version_range")
+            .cloned()
+            .unwrap_or_else(|| "*".to_string());
+        packages.push(fl_policy::ApprovedPackage {
+            name: name.to_string(),
+            version_range,
+        });
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_package {
+                flush(&current_name, &fields, &mut packages);
+            }
+            let section = trimmed.trim_start_matches('[').trim_end_matches(']').trim();
+            if let Some(name) = section.strip_prefix("package.") {
+                current_name = name.to_string();
+                in_package = true;
+            } else {
+                current_name.clear();
+                in_package = false;
+            }
+            fields.clear();
+            continue;
+        }
+
+        if in_package {
+            if let Some((key, value)) = trimmed.split_once('=') {
+                fields.insert(key.trim().to_string(), parse_toml_string(value.trim()));
+            }
+        }
+    }
+    if in_package {
+        flush(&current_name, &fields, &mut packages);
+    }
+
+    packages
 }
 
 /// Parse `.flock/arch-rules.toml` — a simple line-oriented format:
@@ -557,6 +780,20 @@ pub fn load_policies_config(root: &Path) -> PoliciesConfig {
     if let Ok(content) = fs::read_to_string(&anti_patterns_path) {
         let rules = parse_anti_pattern_rules(&content);
         config.anti_patterns.rules = rules;
+    }
+
+    // Load reuse protected domains from external file.
+    let reuse_domains_path = root.join(".flock/reuse-domains.toml");
+    if let Ok(content) = fs::read_to_string(&reuse_domains_path) {
+        let domains = parse_reuse_domains(&content);
+        config.reuse.protected_domains = domains;
+    }
+
+    // Load approved dependencies from external file.
+    let approved_deps_path = root.join(".flock/approved-deps.toml");
+    if let Ok(content) = fs::read_to_string(&approved_deps_path) {
+        let packages = parse_approved_deps(&content);
+        config.dependencies.approved_packages = packages;
     }
 
     config
@@ -850,5 +1087,132 @@ check_patterns = false
         assert!(config.reuse.check_signatures);
         assert!(config.reuse.check_bodies);
         assert!(config.reuse.check_patterns);
+    }
+
+    #[test]
+    fn test_parse_reuse_domains() {
+        let content = r#"
+[domain.finance]
+file_pattern = "src/finance/**"
+similarity_threshold = 0.5
+
+[domain.compliance]
+file_pattern = "src/compliance/**"
+similarity_threshold = 0.4
+"#;
+        let domains = parse_reuse_domains(content);
+        assert_eq!(domains.len(), 2);
+        assert_eq!(domains[0].file_pattern, "src/finance/**");
+        assert!((domains[0].similarity_threshold - 0.5).abs() < 0.001);
+        assert_eq!(domains[1].file_pattern, "src/compliance/**");
+        assert!((domains[1].similarity_threshold - 0.4).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_dependency_config() {
+        let toml = r#"
+[dependencies]
+enabled = true
+enforce = "gate"
+vuln_check = true
+license_blocklist = ["GPL-3.0", "AGPL-3.0"]
+consumer_test_command = "npm run test:consumers"
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.dependencies.enabled);
+        assert_eq!(config.dependencies.enforce, DependencyEnforce::Gate);
+        assert!(config.dependencies.vuln_check);
+        assert_eq!(
+            config.dependencies.license_blocklist,
+            vec!["GPL-3.0", "AGPL-3.0"]
+        );
+        assert_eq!(config.dependencies.consumer_test_command, "npm run test:consumers");
+    }
+
+    #[test]
+    fn test_parse_approved_deps() {
+        let content = r#"
+[package.serde]
+version_range = "^1.0"
+
+[package.tokio]
+version_range = ">=1.0"
+
+[package.uuid]
+version_range = "*"
+"#;
+        let packages = parse_approved_deps(content);
+        assert_eq!(packages.len(), 3);
+        assert_eq!(packages[0].name, "serde");
+        assert_eq!(packages[0].version_range, "^1.0");
+        assert_eq!(packages[1].name, "tokio");
+        assert_eq!(packages[1].version_range, ">=1.0");
+        assert_eq!(packages[2].name, "uuid");
+        assert_eq!(packages[2].version_range, "*");
+    }
+
+    #[test]
+    fn test_parse_regression_config() {
+        let toml = r#"
+[regression]
+enabled = true
+monitor_after_merge = true
+monitor_window = "2h"
+benchmark_threshold = 0.15
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.regression.enabled);
+        assert!(config.regression.monitor_after_merge);
+        assert_eq!(config.regression.monitor_window_secs, 7200);
+        assert!((config.regression.benchmark_threshold - 0.15).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_rollback_config() {
+        let toml = r#"
+[rollback]
+enabled = true
+auto_rollback = true
+rollback_on_test_failure = false
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.rollback.enabled);
+        assert!(config.rollback.auto_rollback);
+        assert!(!config.rollback.rollback_on_test_failure);
+    }
+
+    #[test]
+    fn test_default_dependency_config() {
+        let config = PoliciesConfig::default();
+        assert!(!config.dependencies.enabled);
+        assert_eq!(config.dependencies.enforce, DependencyEnforce::Block);
+        assert!(config.dependencies.approved_packages.is_empty());
+        assert!(config.dependencies.license_blocklist.is_empty());
+        assert!(!config.dependencies.vuln_check);
+    }
+
+    #[test]
+    fn test_default_regression_rollback_config() {
+        let config = PoliciesConfig::default();
+        assert!(!config.regression.enabled);
+        assert!(config.regression.monitor_after_merge);
+        assert_eq!(config.regression.monitor_window_secs, 3600);
+        assert!(!config.rollback.enabled);
+        assert!(config.rollback.auto_rollback);
+        assert!(config.rollback.rollback_on_test_failure);
+    }
+
+    #[test]
+    fn test_parse_test_requirements_with_coverage() {
+        let toml = r#"
+[test_requirements]
+enabled = true
+require_passing = true
+min_coverage_percent = 80
+on_failure = "block"
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.test_requirements.enabled);
+        assert_eq!(config.test_requirements.min_coverage_percent, Some(80));
     }
 }
