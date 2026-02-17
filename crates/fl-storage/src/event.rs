@@ -53,6 +53,13 @@ impl Event {
     }
 }
 
+impl EventKind {
+    /// Human-readable variant name (e.g. "Undo", "Init").
+    pub fn variant_name(&self) -> &'static str {
+        crate::ws_protocol::event_kind_name(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileChangeKind {
     Added,

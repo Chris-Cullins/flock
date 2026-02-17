@@ -25,7 +25,7 @@ use crate::event::{
     GateCondition, GateEvent, GatePolicy, GitBridgeAction, GitBridgeEvent, LockAction, LockEvent,
     NotifyConfig, PresenceAction, PresenceEvent, RebaseEvent, ResourceUsageEvent, SessionAction,
     SessionEvent, SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent,
-    UndoEvent,
+    UndoEvent, UndoMode,
 };
 use fl_collab::can_acquire_lock;
 use fl_storage::ApiCallRecord;
@@ -2422,9 +2422,58 @@ impl Repo {
         self.create_checkpoint_with_lineage(label, Some("quick save".to_string()), None, None)
     }
 
-    /// Quick restore: undo to the last checkpoint, optimized for agent use.
+    /// Quick restore: restore workspace to the last quick-save checkpoint.
+    ///
+    /// Unlike generic undo (which restores to *before* the target), quick-restore
+    /// restores *to* the quick-save snapshot so the agent gets back exactly the
+    /// state it saved.
     pub fn quick_restore(&self) -> Result<UndoResult> {
-        self.undo(UndoRequest::Last)
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        if events.is_empty() {
+            bail!("cannot quick-restore: event log is empty");
+        }
+
+        // Find the most recent quick-save checkpoint by scanning backwards.
+        let quick_save = events
+            .iter()
+            .rev()
+            .find(|e| {
+                if let EventKind::Checkpoint(ref cp) = e.kind {
+                    cp.message.as_deref() == Some("quick save")
+                } else {
+                    false
+                }
+            })
+            .ok_or_else(|| anyhow!("no quick-save checkpoint found"))?;
+
+        let EventKind::Checkpoint(ref payload) = quick_save.kind else {
+            bail!("expected checkpoint payload");
+        };
+
+        // Restore workspace TO the quick-save snapshot (not before it).
+        self.restore_workspace_from_snapshot(payload.snapshot_id)?;
+
+        let checkpoint_event = self.create_checkpoint_with_lineage(
+            format!("quick-restore-{}", quick_save.id.simple()),
+            Some(format!("quick-restore to checkpoint {}", quick_save.id)),
+            Some(quick_save.id),
+            None,
+        )?;
+        let restored_checkpoint_event = Some(checkpoint_event.id);
+
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id: quick_save.id,
+            mode: UndoMode::Last,
+            restored_checkpoint_event,
+            file_scope: None,
+        }))?;
+
+        Ok(UndoResult {
+            target_event_id: quick_save.id,
+            restored_checkpoint_event,
+        })
     }
 
     pub fn undo(&self, request: UndoRequest) -> Result<UndoResult> {
@@ -2520,9 +2569,37 @@ impl Repo {
 
         if !matches!(&target.kind, EventKind::Checkpoint(_)) {
             bail!(
-                "file-scoped undo in git-compatible mode supports checkpoint targets only; resolved target {} is not a checkpoint",
-                target.id
+                "file-scoped undo requires a checkpoint target; resolved target {} is a {:?} event \
+                 (hint: the file '{}' may not exist in any recent commit)",
+                target.id,
+                target.kind.variant_name(),
+                scoped_file_display
             );
+        }
+
+        let EventKind::Checkpoint(ref target_cp) = target.kind else {
+            unreachable!();
+        };
+
+        // Check if the file actually exists in the target checkpoint before
+        // looking for the previous one — give a clear error if it doesn't.
+        if !self.snapshot_contains_file(target_cp.snapshot_id, &scoped_file)? {
+            // Also check the previous checkpoint
+            let in_previous = previous_checkpoint_before(&events, target.id)
+                .and_then(|prev| {
+                    if let EventKind::Checkpoint(cp) = prev.kind {
+                        self.snapshot_contains_file(cp.snapshot_id, &scoped_file).ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(false);
+            if !in_previous {
+                bail!(
+                    "file '{}' was not found in the last commit or its predecessor",
+                    scoped_file_display
+                );
+            }
         }
 
         let Some(previous_checkpoint) = previous_checkpoint_before(&events, target.id) else {
@@ -5193,6 +5270,23 @@ impl Repo {
         Ok(())
     }
 
+    /// Check whether a file exists in a given snapshot (native or directory-based).
+    fn snapshot_contains_file(&self, snapshot_id: Uuid, rel_path: &Path) -> Result<bool> {
+        if self.repo_mode()? == RepoMode::Native {
+            let file_index = FileIndex::for_root(self.root());
+            if !file_index.has(snapshot_id) {
+                return Ok(false);
+            }
+            let index = file_index.read(snapshot_id)?;
+            let rel_key = rel_path_to_key(rel_path);
+            return Ok(index.files.contains_key(&rel_key));
+        }
+
+        let snapshot_root = self.ensure_snapshot_available(snapshot_id)?;
+        let snapshot_file = snapshot_root.join(rel_path);
+        Ok(snapshot_file.exists() && !snapshot_file.is_dir())
+    }
+
     /// Create a checkpoint event using the merkle root computed from the native
     /// snapshot index (rather than walking a snapshot directory).
     fn create_checkpoint_event_with_native_merkle(
@@ -6725,10 +6819,13 @@ impl Repo {
         self.assert_initialized()?;
         let events = self.list_events()?;
         let state = replay_state(&events)?;
-        let _gate = state
+        let gate = state
             .gates
             .get(&gate_id)
             .ok_or_else(|| anyhow!("gate {} not found", gate_id))?;
+        if gate.status == GateStatus::Deleted {
+            bail!("gate {} has already been deleted", gate_id);
+        }
         self.append_event(EventKind::Gate(GateEvent {
             gate_id,
             action: GateAction::Delete,
@@ -6749,6 +6846,14 @@ impl Repo {
             .into_values()
             .filter(|g| g.status == GateStatus::Active)
             .collect())
+    }
+
+    /// List all gates regardless of status (for delete/admin operations).
+    pub fn list_all_gates(&self) -> Result<Vec<GateSummary>> {
+        self.assert_initialized()?;
+        let events = self.list_events()?;
+        let state = replay_state(&events)?;
+        Ok(state.gates.into_values().collect())
     }
 
     pub fn check_gates_for_path(&self, path: &str) -> Result<Vec<GateSummary>> {
@@ -10941,7 +11046,7 @@ mod tests {
         repo.create_checkpoint(Some("initial".to_string()))
             .expect("checkpoint");
 
-        // Quick save
+        // Quick save with v = 2
         fs::write(&file, "export const v = 2;").expect("modify");
         let save_event = repo.quick_save(Some("my-save".to_string())).expect("quick save");
         let EventKind::Checkpoint(payload) = &save_event.kind else {
@@ -10949,12 +11054,16 @@ mod tests {
         };
         assert!(payload.label.contains("my-save"));
 
-        // Modify further
+        // Modify further to v = 3
         fs::write(&file, "export const v = 3;").expect("modify again");
 
-        // Quick restore - should undo back to the quick-save point
+        // Quick restore - should restore TO the quick-save state (v = 2)
         let result = repo.quick_restore().expect("quick restore");
         assert_eq!(result.target_event_id, save_event.id);
+
+        // The file should contain v = 2 (the quick-save state), NOT v = 1
+        let content = fs::read_to_string(&file).expect("read restored");
+        assert_eq!(content, "export const v = 2;");
     }
 
     #[test]

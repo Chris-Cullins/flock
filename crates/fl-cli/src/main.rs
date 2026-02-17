@@ -1116,9 +1116,10 @@ fn main() -> Result<()> {
                         event.timestamp, init.mode
                     ),
                     EventKind::Checkpoint(cp) => println!(
-                        "{}  commit  {}  {}  parent={}",
+                        "{}  commit  {}  id={}  snapshot={}  parent={}",
                         event.timestamp,
                         cp.label,
+                        event.id,
                         cp.snapshot_id,
                         cp.parent_checkpoint_event
                             .map(|id| id.to_string())
@@ -2665,7 +2666,7 @@ fn main() -> Result<()> {
         Command::QuickRestore => {
             let repo = Repo::discover(cwd)?;
             let result = repo.quick_restore()?;
-            println!("restored to before event {}", result.target_event_id);
+            println!("restored to quick-save {}", result.target_event_id);
             if let Some(cp) = result.restored_checkpoint_event {
                 println!("new commit: {}", cp);
             }
@@ -2949,7 +2950,7 @@ fn main() -> Result<()> {
                     println!("gate {} rejected", &gate_id.simple().to_string()[..8]);
                 }
                 GateCommand::Delete { id } => {
-                    let gates = repo.list_gates()?;
+                    let gates = repo.list_all_gates()?;
                     let gate_ids: Vec<Uuid> = gates.iter().map(|g| g.id).collect();
                     let gate_id = resolve_uuid_prefix(&id, &gate_ids)?;
                     repo.delete_gate(gate_id)?;

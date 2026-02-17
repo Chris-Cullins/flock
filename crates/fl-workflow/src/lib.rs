@@ -424,34 +424,39 @@ impl ReplayAccumulator {
                 }
 
                 if undo.file_scope.is_none() {
-                    let rewound = state_before_event
+                    if let Some(rewound) = state_before_event
                         .get(&undo.target_event_id)
                         .cloned()
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "undo event {} targets unknown event {}",
-                                event.id,
-                                undo.target_event_id
-                            )
-                        })?;
-                    *self = rewound;
+                    {
+                        *self = rewound;
+                    } else {
+                        // The target event is missing from the replay
+                        // history.  This can happen when incremental
+                        // replay state was materialized between the
+                        // target and this undo, or after heavy undo
+                        // operations that rewrite effective history.
+                        // Skip the state rewind — the restored
+                        // checkpoint (if any) will still be applied
+                        // below, keeping the latest snapshot correct.
+                        eprintln!(
+                            "warning: undo event {} targets unknown event {}; skipping state rewind",
+                            event.id, undo.target_event_id
+                        );
+                    }
                 }
 
                 if let Some(restored_checkpoint_event) = undo.restored_checkpoint_event {
-                    let snapshot_id = checkpoints
-                        .get(&restored_checkpoint_event)
-                        .copied()
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "undo event {} references unknown restored checkpoint {}",
-                                event.id,
-                                restored_checkpoint_event
-                            )
-                        })?;
-                    self.latest_checkpoint_event_id = Some(restored_checkpoint_event);
-                    self.latest_checkpoint_snapshot_id = Some(snapshot_id);
-                    if !self.applied_event_ids.contains(&restored_checkpoint_event) {
-                        self.applied_event_ids.push(restored_checkpoint_event);
+                    if let Some(&snapshot_id) = checkpoints.get(&restored_checkpoint_event) {
+                        self.latest_checkpoint_event_id = Some(restored_checkpoint_event);
+                        self.latest_checkpoint_snapshot_id = Some(snapshot_id);
+                        if !self.applied_event_ids.contains(&restored_checkpoint_event) {
+                            self.applied_event_ids.push(restored_checkpoint_event);
+                        }
+                    } else {
+                        eprintln!(
+                            "warning: undo event {} references unknown restored checkpoint {}; skipping",
+                            event.id, restored_checkpoint_event
+                        );
                     }
                 }
                 // Track undo counts for rate limiting — attribute to the
@@ -884,6 +889,10 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
 
 /// Replay state incrementally starting from a materialized state.
 /// Only processes events after `start_index`.
+///
+/// If any new undo event targets an event before the materialization point,
+/// falls back to full replay since the pre-materialization state snapshots
+/// are not available.
 pub fn replay_state_incremental(
     events: &[Event],
     start_index: usize,
@@ -891,6 +900,21 @@ pub fn replay_state_incremental(
 ) -> Result<ReplayedState> {
     if start_index >= events.len() {
         return Ok(base_state);
+    }
+
+    // Check whether any new undo event targets an event before the
+    // materialization point.  If so, we need the full state_before_event
+    // history which incremental replay cannot provide — fall back.
+    let pre_event_ids: std::collections::HashSet<Uuid> = events[..start_index]
+        .iter()
+        .map(|e| e.id)
+        .collect();
+    for event in &events[start_index..] {
+        if let EventKind::Undo(ref undo) = event.kind {
+            if undo.file_scope.is_none() && pre_event_ids.contains(&undo.target_event_id) {
+                return replay_state(events);
+            }
+        }
     }
 
     let checkpoints: BTreeMap<Uuid, Uuid> = events

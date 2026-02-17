@@ -384,7 +384,7 @@ pub fn format_findings(findings: &[SecretFinding]) -> String {
         ));
     }
     msg.push_str(
-        "\nTo commit anyway, use: fl checkpoint --allow-secrets -m \"your message\"\n\
+        "\nTo commit anyway, use: fl commit --allow-secrets -m \"your message\"\n\
          To configure exceptions, edit .flock/secrets.toml",
     );
     msg
