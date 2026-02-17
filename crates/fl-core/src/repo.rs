@@ -1434,6 +1434,9 @@ impl Repo {
         let task_id = self.active_task_id();
         self.enforce_budget_policy(task_id, Some(id))?;
 
+        // Enforce test requirements before promoting.
+        self.enforce_test_requirements()?;
+
         let existing = self
             .list_explorations()?
             .into_iter()
@@ -3342,6 +3345,7 @@ impl Repo {
             fl_policy::PolicyCategory::Scope => "Scope",
             fl_policy::PolicyCategory::Budget => "Budget",
             fl_policy::PolicyCategory::RateLimit => "RateLimit",
+            fl_policy::PolicyCategory::TestRequirement => "TestRequirement",
         };
         let operation = match decision.operation {
             fl_policy::PolicyOperation::Checkpoint => "Checkpoint",
@@ -3350,6 +3354,17 @@ impl Repo {
             fl_policy::PolicyOperation::Undo => "Undo",
             fl_policy::PolicyOperation::TaskClaim => "TaskClaim",
         };
+        let escalation_context = decision.escalation_context.as_ref().map(|ctx| {
+            fl_storage::EscalationContextEvent {
+                agent_action: ctx.agent_action.clone(),
+                limit_name: ctx.limit_name.clone(),
+                current_value: ctx.current_value,
+                limit_value: ctx.limit_value,
+                exploration_id: ctx.exploration_id,
+                task_id: ctx.task_id,
+                exploration_history: ctx.exploration_history.clone(),
+            }
+        });
         self.append_event(EventKind::Policy(fl_storage::PolicyEvent {
             policy_name: decision.policy_name.clone(),
             policy_category: category.to_string(),
@@ -3359,6 +3374,7 @@ impl Repo {
             task_id: decision.task_id,
             exploration_id: decision.exploration_id,
             affected_files: decision.affected_files.clone(),
+            escalation_context,
         }))?;
         Ok(())
     }
@@ -3388,6 +3404,12 @@ impl Repo {
             exploration_files_modified: tracker
                 .and_then(|t| {
                     exploration_id.and_then(|eid| t.exploration_files.get(&eid).map(|s| s.len() as u32))
+                })
+                .unwrap_or(0),
+            semantic_changes: tracker.map(|t| t.semantic_changes).unwrap_or(0),
+            exploration_semantic_changes: tracker
+                .and_then(|t| {
+                    exploration_id.and_then(|eid| t.exploration_semantic_changes.get(&eid).copied())
                 })
                 .unwrap_or(0),
         };
@@ -3480,7 +3502,16 @@ impl Repo {
         }
         if decision.is_gated() {
             if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
-                eprintln!("warning: policy rate limit gate triggered — {}", reason);
+                if let Some(ctx) = &decision.escalation_context {
+                    eprintln!(
+                        "warning: rate limit escalation — {}\n  action: {}\n  limit: {} ({}/{})\n  task: {:?}\n  exploration: {:?}",
+                        reason, ctx.agent_action, ctx.limit_name,
+                        ctx.current_value, ctx.limit_value,
+                        ctx.task_id, ctx.exploration_id
+                    );
+                } else {
+                    eprintln!("warning: policy rate limit gate triggered — {}", reason);
+                }
             }
         }
         Ok(())
@@ -3548,6 +3579,80 @@ impl Repo {
         if decision.is_gated() {
             if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
                 eprintln!("warning: policy scope gate triggered — {}", reason);
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce test requirements policy. Called before exploration promotion.
+    fn enforce_test_requirements(&self) -> Result<()> {
+        let config = self.policies_config();
+        if !config.test_requirements.enabled {
+            return Ok(());
+        }
+
+        // Run the test command if require_passing is enabled.
+        let test_result = if config.test_requirements.require_passing {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&config.test_requirements.test_command)
+                .current_dir(self.root())
+                .output();
+
+            match output {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let summary = if stderr.len() > 200 {
+                        format!("{}...", &stderr[..200])
+                    } else if !stderr.is_empty() {
+                        stderr.to_string()
+                    } else if stdout.len() > 200 {
+                        format!("{}...", &stdout[..200])
+                    } else {
+                        stdout.to_string()
+                    };
+                    Some(fl_policy::TestResult {
+                        passed: out.status.success(),
+                        exit_code: out.status.code().unwrap_or(-1),
+                        output_summary: summary,
+                    })
+                }
+                Err(e) => {
+                    Some(fl_policy::TestResult {
+                        passed: false,
+                        exit_code: -1,
+                        output_summary: format!("Failed to run test command: {}", e),
+                    })
+                }
+            }
+        } else {
+            None
+        };
+
+        let decision = fl_policy::check_test_requirements(
+            &config.test_requirements,
+            test_result.as_ref(),
+            &[], // new source files — not tracked yet
+            &[], // new test files — not tracked yet
+        );
+
+        if decision.is_blocked() || decision.is_gated() {
+            self.record_policy_decision(&decision)?;
+        }
+        if decision.is_blocked() {
+            if let fl_policy::PolicyVerdict::Block { reason, fix_suggestion } = &decision.verdict {
+                let msg = if let Some(fix) = fix_suggestion {
+                    format!("Policy blocked: {}\nSuggestion: {}", reason, fix)
+                } else {
+                    format!("Policy blocked: {}", reason)
+                };
+                bail!("{}", msg);
+            }
+        }
+        if decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
+                eprintln!("warning: test requirement gate triggered — {}", reason);
             }
         }
         Ok(())
@@ -3650,15 +3755,17 @@ impl Repo {
         for path in &new_files {
             let path_str = path.display().to_string();
             if !old_files.contains(path) {
-                // Added file
+                // Added file — count all content as new semantic changes.
                 let line_count = fs::read_to_string(new_root.join(path))
                     .map(|s| s.lines().count() as u32)
                     .unwrap_or(0);
+                // For added files, estimate 1 semantic change (the whole file addition).
                 changes.push(FileChangeSummary {
                     path: path_str,
                     change_kind: FileChangeKind::Added,
                     lines_added: line_count,
                     lines_removed: 0,
+                    semantic_changes_count: Some(1),
                 });
             } else {
                 let old_content = fs::read(old_root.join(path)).unwrap_or_default();
@@ -3666,11 +3773,16 @@ impl Repo {
                 if old_content != new_content {
                     let old_lines = String::from_utf8_lossy(&old_content).lines().count() as u32;
                     let new_lines = String::from_utf8_lossy(&new_content).lines().count() as u32;
+                    // Try semantic diff to count symbol-level changes.
+                    let semantic_count = self.count_semantic_changes(
+                        &old_content, &new_content, &path_str,
+                    );
                     changes.push(FileChangeSummary {
                         path: path_str,
                         change_kind: FileChangeKind::Modified,
                         lines_added: new_lines.saturating_sub(old_lines),
                         lines_removed: old_lines.saturating_sub(new_lines),
+                        semantic_changes_count: semantic_count,
                     });
                 }
             }
@@ -3681,11 +3793,13 @@ impl Repo {
                 let line_count = fs::read_to_string(old_root.join(path))
                     .map(|s| s.lines().count() as u32)
                     .unwrap_or(0);
+                // Deleted file = 1 semantic change (the whole file deletion).
                 changes.push(FileChangeSummary {
                     path: path.display().to_string(),
                     change_kind: FileChangeKind::Deleted,
                     lines_added: 0,
                     lines_removed: line_count,
+                    semantic_changes_count: Some(1),
                 });
             }
         }
@@ -3694,6 +3808,21 @@ impl Repo {
             None
         } else {
             Some(changes)
+        }
+    }
+
+    /// Count semantic (symbol-level) changes between old and new file content.
+    /// Returns None if the file type is unsupported by the semantic analyzer.
+    fn count_semantic_changes(
+        &self,
+        old_content: &[u8],
+        new_content: &[u8],
+        path_str: &str,
+    ) -> Option<u32> {
+        let path = std::path::PathBuf::from(path_str);
+        match fl_semantic::diff(&path, Some(old_content), Some(new_content)) {
+            Ok(Some(diff)) => Some(diff.changes.len() as u32),
+            _ => None,
         }
     }
 

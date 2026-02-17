@@ -188,6 +188,12 @@ pub struct PolicyBudgetTracker {
     pub lines_changed: u32,
     /// Per-exploration file tracking.
     pub exploration_files: BTreeMap<Uuid, BTreeSet<String>>,
+    /// Total semantic changes across the task.
+    #[serde(default)]
+    pub semantic_changes: u32,
+    /// Per-exploration semantic change tracking.
+    #[serde(default)]
+    pub exploration_semantic_changes: BTreeMap<Uuid, u32>,
 }
 
 /// Tracks rate limit usage per task for policy enforcement.
@@ -341,14 +347,18 @@ impl ReplayAccumulator {
                     if let Some(tracker) = self.policy_rate_limits.get_mut(&tid) {
                         tracker.checkpoint_timestamps.push(event.timestamp.clone());
                     }
-                    // Budget file/line tracking from file change metadata.
+                    // Budget file/line/semantic tracking from file change metadata.
                     if let Some(files_changed) = &checkpoint.files_changed {
                         if let Some(tracker) = self.policy_budgets.get_mut(&tid) {
                             for fc in files_changed {
                                 tracker.files_modified.insert(fc.path.clone());
                                 tracker.lines_changed += fc.lines_added + fc.lines_removed;
+                                // Accumulate semantic changes.
+                                if let Some(sc) = fc.semantic_changes_count {
+                                    tracker.semantic_changes += sc;
+                                }
                             }
-                            // Track per-exploration files.
+                            // Track per-exploration files and semantic changes.
                             let active_exploration = self.explorations.values()
                                 .find(|e| e.status == ExplorationStatus::Active)
                                 .map(|e| e.id);
@@ -356,6 +366,9 @@ impl ReplayAccumulator {
                                 let exp_files = tracker.exploration_files.entry(exp_id).or_default();
                                 for fc in files_changed {
                                     exp_files.insert(fc.path.clone());
+                                    if let Some(sc) = fc.semantic_changes_count {
+                                        *tracker.exploration_semantic_changes.entry(exp_id).or_default() += sc;
+                                    }
                                 }
                             }
                         }

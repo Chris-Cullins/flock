@@ -66,6 +66,9 @@ pub struct FileChangeSummary {
     pub lines_added: u32,
     #[serde(default)]
     pub lines_removed: u32,
+    /// Number of semantic changes (symbol-level adds/removes/modifications) in this file.
+    #[serde(default)]
+    pub semantic_changes_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -455,6 +458,24 @@ pub struct PolicyEvent {
     pub exploration_id: Option<Uuid>,
     #[serde(default)]
     pub affected_files: Vec<String>,
+    /// Structured escalation context when a rate limit triggers PauseAndEscalate.
+    #[serde(default)]
+    pub escalation_context: Option<EscalationContextEvent>,
+}
+
+/// Persisted escalation context for rate limit escalations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EscalationContextEvent {
+    pub agent_action: String,
+    pub limit_name: String,
+    pub current_value: u32,
+    pub limit_value: u32,
+    #[serde(default)]
+    pub exploration_id: Option<Uuid>,
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+    #[serde(default)]
+    pub exploration_history: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

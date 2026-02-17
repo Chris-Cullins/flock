@@ -28,6 +28,7 @@ pub enum PolicyCategory {
     Scope,
     Budget,
     RateLimit,
+    TestRequirement,
 }
 
 /// The operation being checked.
@@ -38,6 +39,25 @@ pub enum PolicyOperation {
     ExplorationPromote,
     Undo,
     TaskClaim,
+}
+
+/// Structured context provided when a rate limit triggers PauseAndEscalate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscalationContext {
+    /// What the agent was trying to do.
+    pub agent_action: String,
+    /// Which limit was hit.
+    pub limit_name: String,
+    /// Current counter value.
+    pub current_value: u32,
+    /// Configured limit value.
+    pub limit_value: u32,
+    /// Exploration where the limit was hit.
+    pub exploration_id: Option<Uuid>,
+    /// Task associated with the limit.
+    pub task_id: Option<Uuid>,
+    /// Summary of recent exploration history for context.
+    pub exploration_history: Vec<String>,
 }
 
 /// A fully-resolved policy evaluation result with context.
@@ -51,6 +71,9 @@ pub struct PolicyDecision {
     pub task_id: Option<Uuid>,
     pub exploration_id: Option<Uuid>,
     pub affected_files: Vec<String>,
+    /// Populated when a rate limit triggers PauseAndEscalate.
+    #[serde(default)]
+    pub escalation_context: Option<EscalationContext>,
 }
 
 impl PolicyDecision {
@@ -155,6 +178,8 @@ pub struct BudgetLimits {
     pub max_files_per_exploration: Option<u32>,
     /// Max total line changes per task.
     pub max_lines_per_task: Option<u32>,
+    /// Max semantic changes (symbol-level) per exploration.
+    pub max_semantic_changes_per_exploration: Option<u32>,
     /// Action when budget is exceeded.
     pub on_exceed: BudgetExceedAction,
 }
@@ -166,6 +191,7 @@ impl Default for BudgetLimits {
             max_files_per_task: None,
             max_files_per_exploration: None,
             max_lines_per_task: None,
+            max_semantic_changes_per_exploration: None,
             on_exceed: BudgetExceedAction::default(),
         }
     }
@@ -180,6 +206,12 @@ pub struct BudgetUsage {
     pub exploration_id: Option<Uuid>,
     /// Files modified in the current exploration only.
     pub exploration_files_modified: u32,
+    /// Semantic changes (symbol-level) accumulated globally.
+    #[serde(default)]
+    pub semantic_changes: u32,
+    /// Semantic changes in the current exploration only.
+    #[serde(default)]
+    pub exploration_semantic_changes: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +274,58 @@ pub struct RateLimitUsage {
 }
 
 // ---------------------------------------------------------------------------
+// Test requirement types
+// ---------------------------------------------------------------------------
+
+/// What happens when test requirements fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TestFailureAction {
+    Block,
+    Warn,
+    Gate,
+}
+
+impl Default for TestFailureAction {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+/// Policy requiring tests to pass before exploration promotion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestRequirements {
+    pub enabled: bool,
+    /// Tests must pass before promotion.
+    pub require_passing: bool,
+    /// Command to run tests.
+    pub test_command: String,
+    /// Require test files for new source files.
+    pub require_new_tests: bool,
+    /// Action when test requirements fail.
+    pub on_failure: TestFailureAction,
+}
+
+impl Default for TestRequirements {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_passing: true,
+            test_command: "cargo test".to_string(),
+            require_new_tests: false,
+            on_failure: TestFailureAction::default(),
+        }
+    }
+}
+
+/// Result of running the test command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestResult {
+    pub passed: bool,
+    pub exit_code: i32,
+    pub output_summary: String,
+}
+
+// ---------------------------------------------------------------------------
 // Pure evaluation functions
 // ---------------------------------------------------------------------------
 
@@ -278,6 +362,7 @@ pub fn check_scope_policy(
             task_id: Some(task_scope.task_id),
             exploration_id: None,
             affected_files: Vec::new(),
+            escalation_context: None,
         };
     }
 
@@ -297,6 +382,7 @@ pub fn check_scope_policy(
             task_id: Some(task_scope.task_id),
             exploration_id: None,
             affected_files: Vec::new(),
+            escalation_context: None,
         };
     }
 
@@ -330,6 +416,7 @@ pub fn check_scope_policy(
         task_id: Some(task_scope.task_id),
         exploration_id: None,
         affected_files: out_of_scope,
+        escalation_context: None,
     }
 }
 
@@ -345,6 +432,7 @@ pub fn check_budget_limits(limits: &BudgetLimits, usage: &BudgetUsage) -> Policy
             task_id: Some(usage.task_id),
             exploration_id: usage.exploration_id,
             affected_files: Vec::new(),
+            escalation_context: None,
         };
     }
 
@@ -390,6 +478,20 @@ pub fn check_budget_limits(limits: &BudgetLimits, usage: &BudgetUsage) -> Policy
         }
     }
 
+    // Check per-exploration semantic change limit.
+    if let Some(max) = limits.max_semantic_changes_per_exploration {
+        if usage.exploration_semantic_changes > max {
+            return make_budget_decision(
+                limits,
+                usage,
+                format!(
+                    "Exploration has {} semantic changes (limit: {})",
+                    usage.exploration_semantic_changes, max
+                ),
+            );
+        }
+    }
+
     PolicyDecision {
         policy_name: "budget".to_string(),
         category: PolicyCategory::Budget,
@@ -399,6 +501,7 @@ pub fn check_budget_limits(limits: &BudgetLimits, usage: &BudgetUsage) -> Policy
         task_id: Some(usage.task_id),
         exploration_id: usage.exploration_id,
         affected_files: Vec::new(),
+        escalation_context: None,
     }
 }
 
@@ -431,6 +534,7 @@ fn make_budget_decision(
         task_id: Some(usage.task_id),
         exploration_id: usage.exploration_id,
         affected_files: Vec::new(),
+        escalation_context: None,
     }
 }
 
@@ -446,6 +550,7 @@ pub fn check_rate_limits(limits: &RateLimits, usage: &RateLimitUsage) -> PolicyD
             task_id: Some(usage.task_id),
             exploration_id: usage.exploration_id,
             affected_files: Vec::new(),
+            escalation_context: None,
         };
     }
 
@@ -455,6 +560,9 @@ pub fn check_rate_limits(limits: &RateLimits, usage: &RateLimitUsage) -> PolicyD
             return make_rate_limit_decision(
                 limits,
                 usage,
+                "max_explorations_per_task",
+                usage.explorations_started,
+                max,
                 format!(
                     "Task has started {} explorations (limit: {})",
                     usage.explorations_started, max
@@ -470,6 +578,9 @@ pub fn check_rate_limits(limits: &RateLimits, usage: &RateLimitUsage) -> PolicyD
             return make_rate_limit_decision(
                 limits,
                 usage,
+                "max_undos_per_exploration",
+                usage.undos_in_exploration,
+                max,
                 format!(
                     "Exploration has {} undos (limit: {})",
                     usage.undos_in_exploration, max
@@ -485,6 +596,9 @@ pub fn check_rate_limits(limits: &RateLimits, usage: &RateLimitUsage) -> PolicyD
             return make_rate_limit_decision(
                 limits,
                 usage,
+                "max_checkpoints_per_window",
+                usage.checkpoints_in_window,
+                max,
                 format!(
                     "{} checkpoints in current window (limit: {})",
                     usage.checkpoints_in_window, max
@@ -503,15 +617,21 @@ pub fn check_rate_limits(limits: &RateLimits, usage: &RateLimitUsage) -> PolicyD
         task_id: Some(usage.task_id),
         exploration_id: usage.exploration_id,
         affected_files: Vec::new(),
+        escalation_context: None,
     }
 }
 
 fn make_rate_limit_decision(
     limits: &RateLimits,
     usage: &RateLimitUsage,
+    limit_name: &str,
+    current_value: u32,
+    limit_value: u32,
     reason: String,
     operation: PolicyOperation,
 ) -> PolicyDecision {
+    let is_escalation = matches!(limits.on_exceed, RateLimitExceedAction::PauseAndEscalate);
+
     let verdict = match limits.on_exceed {
         RateLimitExceedAction::Block => PolicyVerdict::Block {
             reason: reason.clone(),
@@ -526,6 +646,20 @@ fn make_rate_limit_decision(
         },
     };
 
+    let escalation_context = if is_escalation {
+        Some(EscalationContext {
+            agent_action: format!("{:?}", operation),
+            limit_name: limit_name.to_string(),
+            current_value,
+            limit_value,
+            exploration_id: usage.exploration_id,
+            task_id: Some(usage.task_id),
+            exploration_history: Vec::new(),
+        })
+    } else {
+        None
+    };
+
     PolicyDecision {
         policy_name: "rate_limit".to_string(),
         category: PolicyCategory::RateLimit,
@@ -535,7 +669,162 @@ fn make_rate_limit_decision(
         task_id: Some(usage.task_id),
         exploration_id: usage.exploration_id,
         affected_files: Vec::new(),
+        escalation_context,
     }
+}
+
+/// Evaluate test requirements for exploration promotion.
+pub fn check_test_requirements(
+    requirements: &TestRequirements,
+    test_result: Option<&TestResult>,
+    new_source_files: &[String],
+    new_test_files: &[String],
+) -> PolicyDecision {
+    if !requirements.enabled {
+        return PolicyDecision {
+            policy_name: "test_requirements".to_string(),
+            category: PolicyCategory::TestRequirement,
+            verdict: PolicyVerdict::Allow,
+            operation: PolicyOperation::ExplorationPromote,
+            actor: String::new(),
+            task_id: None,
+            exploration_id: None,
+            affected_files: Vec::new(),
+            escalation_context: None,
+        };
+    }
+
+    // Check test passing requirement.
+    if requirements.require_passing {
+        match test_result {
+            None => {
+                return make_test_decision(
+                    requirements,
+                    "No test results available — tests were not run".to_string(),
+                );
+            }
+            Some(result) if !result.passed => {
+                return make_test_decision(
+                    requirements,
+                    format!(
+                        "Tests failed (exit code {}): {}",
+                        result.exit_code, result.output_summary
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Check new test coverage requirement.
+    if requirements.require_new_tests && !new_source_files.is_empty() {
+        let uncovered: Vec<&String> = new_source_files
+            .iter()
+            .filter(|src| !has_matching_test_file(src, new_test_files))
+            .collect();
+
+        if !uncovered.is_empty() {
+            let files: Vec<String> = uncovered.iter().map(|s| (*s).clone()).collect();
+            return PolicyDecision {
+                policy_name: "test_requirements".to_string(),
+                category: PolicyCategory::TestRequirement,
+                verdict: match requirements.on_failure {
+                    TestFailureAction::Block => PolicyVerdict::Block {
+                        reason: format!(
+                            "New source files without corresponding test files: {}",
+                            files.join(", ")
+                        ),
+                        fix_suggestion: Some(
+                            "Add test files for the new source files".to_string(),
+                        ),
+                    },
+                    TestFailureAction::Warn => PolicyVerdict::Allow,
+                    TestFailureAction::Gate => PolicyVerdict::Gate {
+                        reason: format!(
+                            "New source files without corresponding test files: {}",
+                            files.join(", ")
+                        ),
+                        justification_required: true,
+                    },
+                },
+                operation: PolicyOperation::ExplorationPromote,
+                actor: String::new(),
+                task_id: None,
+                exploration_id: None,
+                affected_files: files,
+                escalation_context: None,
+            };
+        }
+    }
+
+    PolicyDecision {
+        policy_name: "test_requirements".to_string(),
+        category: PolicyCategory::TestRequirement,
+        verdict: PolicyVerdict::Allow,
+        operation: PolicyOperation::ExplorationPromote,
+        actor: String::new(),
+        task_id: None,
+        exploration_id: None,
+        affected_files: Vec::new(),
+        escalation_context: None,
+    }
+}
+
+fn make_test_decision(requirements: &TestRequirements, reason: String) -> PolicyDecision {
+    let verdict = match requirements.on_failure {
+        TestFailureAction::Block => PolicyVerdict::Block {
+            reason,
+            fix_suggestion: Some(
+                "Fix failing tests before promoting the exploration".to_string(),
+            ),
+        },
+        TestFailureAction::Warn => PolicyVerdict::Allow,
+        TestFailureAction::Gate => PolicyVerdict::Gate {
+            reason,
+            justification_required: true,
+        },
+    };
+
+    PolicyDecision {
+        policy_name: "test_requirements".to_string(),
+        category: PolicyCategory::TestRequirement,
+        verdict,
+        operation: PolicyOperation::ExplorationPromote,
+        actor: String::new(),
+        task_id: None,
+        exploration_id: None,
+        affected_files: Vec::new(),
+        escalation_context: None,
+    }
+}
+
+/// Check if a source file has a matching test file.
+fn has_matching_test_file(source_path: &str, test_files: &[String]) -> bool {
+    // Extract the stem (filename without extension).
+    let source_stem = std::path::Path::new(source_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    if source_stem.is_empty() {
+        return false;
+    }
+
+    // Common test file naming conventions.
+    let test_patterns = [
+        format!("{}_test", source_stem),
+        format!("test_{}", source_stem),
+        format!("{}.test", source_stem),
+        format!("{}_spec", source_stem),
+    ];
+
+    test_files.iter().any(|test_path| {
+        let test_stem = std::path::Path::new(test_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        test_patterns.iter().any(|pattern| test_stem == pattern)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +937,8 @@ mod tests {
             lines_changed: 999999,
             exploration_id: None,
             exploration_files_modified: 0,
+            semantic_changes: 0,
+            exploration_semantic_changes: 0,
         };
         let decision = check_budget_limits(&limits, &usage);
         assert_eq!(decision.verdict, PolicyVerdict::Allow);
@@ -660,6 +951,7 @@ mod tests {
             max_files_per_task: Some(10),
             max_lines_per_task: Some(500),
             max_files_per_exploration: None,
+            max_semantic_changes_per_exploration: None,
             on_exceed: BudgetExceedAction::Block,
         };
         let usage = BudgetUsage {
@@ -668,6 +960,8 @@ mod tests {
             lines_changed: 200,
             exploration_id: None,
             exploration_files_modified: 0,
+            semantic_changes: 0,
+            exploration_semantic_changes: 0,
         };
         let decision = check_budget_limits(&limits, &usage);
         assert_eq!(decision.verdict, PolicyVerdict::Allow);
@@ -680,6 +974,7 @@ mod tests {
             max_files_per_task: Some(5),
             max_lines_per_task: None,
             max_files_per_exploration: None,
+            max_semantic_changes_per_exploration: None,
             on_exceed: BudgetExceedAction::Block,
         };
         let usage = BudgetUsage {
@@ -688,6 +983,8 @@ mod tests {
             lines_changed: 0,
             exploration_id: None,
             exploration_files_modified: 0,
+            semantic_changes: 0,
+            exploration_semantic_changes: 0,
         };
         let decision = check_budget_limits(&limits, &usage);
         assert!(decision.is_blocked());
@@ -700,6 +997,7 @@ mod tests {
             max_files_per_task: Some(5),
             max_lines_per_task: None,
             max_files_per_exploration: None,
+            max_semantic_changes_per_exploration: None,
             on_exceed: BudgetExceedAction::Warn,
         };
         let usage = BudgetUsage {
@@ -708,6 +1006,8 @@ mod tests {
             lines_changed: 0,
             exploration_id: None,
             exploration_files_modified: 0,
+            semantic_changes: 0,
+            exploration_semantic_changes: 0,
         };
         let decision = check_budget_limits(&limits, &usage);
         assert_eq!(decision.verdict, PolicyVerdict::Allow);
@@ -720,6 +1020,7 @@ mod tests {
             max_files_per_task: None,
             max_lines_per_task: None,
             max_files_per_exploration: Some(3),
+            max_semantic_changes_per_exploration: None,
             on_exceed: BudgetExceedAction::Block,
         };
         let usage = BudgetUsage {
@@ -728,6 +1029,8 @@ mod tests {
             lines_changed: 0,
             exploration_id: Some(test_exploration_id()),
             exploration_files_modified: 4,
+            semantic_changes: 0,
+            exploration_semantic_changes: 0,
         };
         let decision = check_budget_limits(&limits, &usage);
         assert!(decision.is_blocked());
@@ -740,6 +1043,7 @@ mod tests {
             max_files_per_task: None,
             max_lines_per_task: Some(100),
             max_files_per_exploration: None,
+            max_semantic_changes_per_exploration: None,
             on_exceed: BudgetExceedAction::PauseAndFlag,
         };
         let usage = BudgetUsage {
@@ -748,9 +1052,57 @@ mod tests {
             lines_changed: 150,
             exploration_id: None,
             exploration_files_modified: 0,
+            semantic_changes: 0,
+            exploration_semantic_changes: 0,
         };
         let decision = check_budget_limits(&limits, &usage);
         assert!(decision.is_gated());
+    }
+
+    #[test]
+    fn budget_semantic_changes_exceeded_blocks() {
+        let limits = BudgetLimits {
+            enabled: true,
+            max_files_per_task: None,
+            max_lines_per_task: None,
+            max_files_per_exploration: None,
+            max_semantic_changes_per_exploration: Some(10),
+            on_exceed: BudgetExceedAction::Block,
+        };
+        let usage = BudgetUsage {
+            task_id: test_task_id(),
+            files_modified: 0,
+            lines_changed: 0,
+            exploration_id: Some(test_exploration_id()),
+            exploration_files_modified: 0,
+            semantic_changes: 15,
+            exploration_semantic_changes: 12,
+        };
+        let decision = check_budget_limits(&limits, &usage);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn budget_semantic_changes_within_limit_allows() {
+        let limits = BudgetLimits {
+            enabled: true,
+            max_files_per_task: None,
+            max_lines_per_task: None,
+            max_files_per_exploration: None,
+            max_semantic_changes_per_exploration: Some(20),
+            on_exceed: BudgetExceedAction::Block,
+        };
+        let usage = BudgetUsage {
+            task_id: test_task_id(),
+            files_modified: 0,
+            lines_changed: 0,
+            exploration_id: Some(test_exploration_id()),
+            exploration_files_modified: 0,
+            semantic_changes: 15,
+            exploration_semantic_changes: 8,
+        };
+        let decision = check_budget_limits(&limits, &usage);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
     }
 
     // --- Rate limit tests ---
@@ -853,6 +1205,160 @@ mod tests {
         };
         let decision = check_rate_limits(&limits, &usage);
         assert!(decision.is_gated());
+        assert!(decision.escalation_context.is_some());
+        let ctx = decision.escalation_context.unwrap();
+        assert_eq!(ctx.limit_name, "max_checkpoints_per_window");
+        assert_eq!(ctx.current_value, 15);
+        assert_eq!(ctx.limit_value, 10);
+    }
+
+    #[test]
+    fn rate_limit_escalation_context_not_present_on_block() {
+        let limits = RateLimits {
+            enabled: true,
+            max_explorations_per_task: Some(3),
+            max_undos_per_exploration: None,
+            max_checkpoints_per_window: None,
+            window_secs: 3600,
+            on_exceed: RateLimitExceedAction::Block,
+        };
+        let usage = RateLimitUsage {
+            task_id: test_task_id(),
+            explorations_started: 4,
+            exploration_id: None,
+            undos_in_exploration: 0,
+            checkpoints_in_window: 0,
+        };
+        let decision = check_rate_limits(&limits, &usage);
+        assert!(decision.is_blocked());
+        assert!(decision.escalation_context.is_none());
+    }
+
+    // --- Test requirement tests ---
+
+    #[test]
+    fn test_requirements_disabled_allows() {
+        let req = TestRequirements::default(); // enabled: false
+        let decision = check_test_requirements(&req, None, &[], &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn test_requirements_passing_tests_allows() {
+        let req = TestRequirements {
+            enabled: true,
+            require_passing: true,
+            test_command: "cargo test".to_string(),
+            require_new_tests: false,
+            on_failure: TestFailureAction::Block,
+        };
+        let result = TestResult {
+            passed: true,
+            exit_code: 0,
+            output_summary: "all tests passed".to_string(),
+        };
+        let decision = check_test_requirements(&req, Some(&result), &[], &[]);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn test_requirements_failing_tests_blocks() {
+        let req = TestRequirements {
+            enabled: true,
+            require_passing: true,
+            test_command: "cargo test".to_string(),
+            require_new_tests: false,
+            on_failure: TestFailureAction::Block,
+        };
+        let result = TestResult {
+            passed: false,
+            exit_code: 1,
+            output_summary: "2 tests failed".to_string(),
+        };
+        let decision = check_test_requirements(&req, Some(&result), &[], &[]);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn test_requirements_no_results_blocks() {
+        let req = TestRequirements {
+            enabled: true,
+            require_passing: true,
+            test_command: "cargo test".to_string(),
+            require_new_tests: false,
+            on_failure: TestFailureAction::Block,
+        };
+        let decision = check_test_requirements(&req, None, &[], &[]);
+        assert!(decision.is_blocked());
+    }
+
+    #[test]
+    fn test_requirements_failing_tests_gates() {
+        let req = TestRequirements {
+            enabled: true,
+            require_passing: true,
+            test_command: "cargo test".to_string(),
+            require_new_tests: false,
+            on_failure: TestFailureAction::Gate,
+        };
+        let result = TestResult {
+            passed: false,
+            exit_code: 1,
+            output_summary: "1 test failed".to_string(),
+        };
+        let decision = check_test_requirements(&req, Some(&result), &[], &[]);
+        assert!(decision.is_gated());
+    }
+
+    #[test]
+    fn test_requirements_new_tests_required_with_coverage() {
+        let req = TestRequirements {
+            enabled: true,
+            require_passing: false,
+            test_command: "cargo test".to_string(),
+            require_new_tests: true,
+            on_failure: TestFailureAction::Block,
+        };
+        let new_source = vec!["src/auth.rs".to_string()];
+        let new_tests = vec!["tests/auth_test.rs".to_string()];
+        let decision = check_test_requirements(&req, None, &new_source, &new_tests);
+        assert_eq!(decision.verdict, PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn test_requirements_new_tests_required_without_coverage() {
+        let req = TestRequirements {
+            enabled: true,
+            require_passing: false,
+            test_command: "cargo test".to_string(),
+            require_new_tests: true,
+            on_failure: TestFailureAction::Block,
+        };
+        let new_source = vec!["src/auth.rs".to_string(), "src/db.rs".to_string()];
+        let new_tests = vec!["tests/auth_test.rs".to_string()];
+        let decision = check_test_requirements(&req, None, &new_source, &new_tests);
+        assert!(decision.is_blocked());
+        assert_eq!(decision.affected_files, vec!["src/db.rs"]);
+    }
+
+    #[test]
+    fn has_matching_test_file_patterns() {
+        assert!(has_matching_test_file(
+            "src/auth.rs",
+            &["tests/auth_test.rs".to_string()]
+        ));
+        assert!(has_matching_test_file(
+            "src/auth.rs",
+            &["tests/test_auth.rs".to_string()]
+        ));
+        assert!(has_matching_test_file(
+            "src/auth.rs",
+            &["tests/auth_spec.rs".to_string()]
+        ));
+        assert!(!has_matching_test_file(
+            "src/auth.rs",
+            &["tests/login_test.rs".to_string()]
+        ));
     }
 
     // --- PolicyDecision helpers ---
@@ -871,6 +1377,7 @@ mod tests {
             task_id: None,
             exploration_id: None,
             affected_files: Vec::new(),
+            escalation_context: None,
         };
         assert!(blocked.is_blocked());
         assert!(!blocked.is_gated());
@@ -887,6 +1394,7 @@ mod tests {
             task_id: None,
             exploration_id: None,
             affected_files: Vec::new(),
+            escalation_context: None,
         };
         assert!(!gated.is_blocked());
         assert!(gated.is_gated());

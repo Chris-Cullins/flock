@@ -3,7 +3,7 @@ use std::path::Path;
 
 use fl_policy::{
     BudgetExceedAction, BudgetLimits, RateLimitExceedAction, RateLimits, ScopeEnforceMode,
-    ScopeMode, ScopePolicy,
+    ScopeMode, ScopePolicy, TestFailureAction, TestRequirements,
 };
 
 /// Configuration for commit hygiene enforcement.
@@ -36,6 +36,7 @@ pub struct PoliciesConfig {
     pub budget: BudgetLimits,
     pub rate_limits: RateLimits,
     pub commit_hygiene: CommitHygieneConfig,
+    pub test_requirements: TestRequirements,
 }
 
 impl Default for PoliciesConfig {
@@ -45,6 +46,7 @@ impl Default for PoliciesConfig {
             budget: BudgetLimits::default(),
             rate_limits: RateLimits::default(),
             commit_hygiene: CommitHygieneConfig::default(),
+            test_requirements: TestRequirements::default(),
         }
     }
 }
@@ -69,6 +71,7 @@ enabled = false
 # max_files_per_task = 20
 # max_files_per_exploration = 10
 # max_lines_per_task = 1000
+# max_semantic_changes_per_exploration = 50
 # Action when budget is exceeded: "block", "warn", or "pause_and_flag"
 on_exceed = "block"
 
@@ -92,6 +95,15 @@ enabled = false
 # require_scope = true
 # require_confidence = true
 # max_time_between_checkpoints = 3600
+
+# --- Test requirements ---
+# Require tests to pass before exploration promotion.
+[test_requirements]
+enabled = false
+# require_passing = true
+# test_command = "cargo test"
+# require_new_tests = false
+# on_failure = "block"
 "#;
 
 /// Parse a `policies.toml` file into a `PoliciesConfig`.
@@ -123,6 +135,7 @@ pub fn parse_policies_config(content: &str) -> PoliciesConfig {
             "budget" => parse_budget_field(&mut config.budget, key, value),
             "rate_limits" => parse_rate_limit_field(&mut config.rate_limits, key, value),
             "commit_hygiene" => parse_commit_hygiene_field(&mut config.commit_hygiene, key, value),
+            "test_requirements" => parse_test_requirements_field(&mut config.test_requirements, key, value),
             _ => {}
         }
     }
@@ -157,6 +170,7 @@ fn parse_budget_field(budget: &mut BudgetLimits, key: &str, value: &str) {
         "max_files_per_task" => budget.max_files_per_task = value.parse().ok(),
         "max_files_per_exploration" => budget.max_files_per_exploration = value.parse().ok(),
         "max_lines_per_task" => budget.max_lines_per_task = value.parse().ok(),
+        "max_semantic_changes_per_exploration" => budget.max_semantic_changes_per_exploration = value.parse().ok(),
         "on_exceed" => {
             budget.on_exceed = match parse_toml_string(value).as_str() {
                 "warn" => BudgetExceedAction::Warn,
@@ -207,6 +221,23 @@ fn parse_commit_hygiene_field(config: &mut CommitHygieneConfig, key: &str, value
             } else if let Some(secs) = parse_duration_to_secs(value) {
                 config.max_time_between_checkpoints = Some(secs);
             }
+        }
+        _ => {}
+    }
+}
+
+fn parse_test_requirements_field(config: &mut TestRequirements, key: &str, value: &str) {
+    match key {
+        "enabled" => config.enabled = value == "true",
+        "require_passing" => config.require_passing = value == "true",
+        "test_command" => config.test_command = parse_toml_string(value),
+        "require_new_tests" => config.require_new_tests = value == "true",
+        "on_failure" => {
+            config.on_failure = match parse_toml_string(value).as_str() {
+                "warn" => TestFailureAction::Warn,
+                "gate" => TestFailureAction::Gate,
+                _ => TestFailureAction::Block,
+            };
         }
         _ => {}
     }
@@ -390,5 +421,46 @@ enabled = false
         assert_eq!(config.budget.max_files_per_task, Some(15));
         assert_eq!(config.budget.on_exceed, BudgetExceedAction::PauseAndFlag);
         assert!(!config.rate_limits.enabled);
+    }
+
+    #[test]
+    fn test_parse_test_requirements() {
+        let toml = r#"
+[test_requirements]
+enabled = true
+require_passing = true
+test_command = "npm test"
+require_new_tests = true
+on_failure = "gate"
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.test_requirements.enabled);
+        assert!(config.test_requirements.require_passing);
+        assert_eq!(config.test_requirements.test_command, "npm test");
+        assert!(config.test_requirements.require_new_tests);
+        assert_eq!(config.test_requirements.on_failure, TestFailureAction::Gate);
+    }
+
+    #[test]
+    fn test_parse_budget_with_semantic_limit() {
+        let toml = r#"
+[budget]
+enabled = true
+max_semantic_changes_per_exploration = 25
+on_exceed = "block"
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.budget.enabled);
+        assert_eq!(config.budget.max_semantic_changes_per_exploration, Some(25));
+    }
+
+    #[test]
+    fn test_default_test_requirements() {
+        let config = PoliciesConfig::default();
+        assert!(!config.test_requirements.enabled);
+        assert!(config.test_requirements.require_passing);
+        assert_eq!(config.test_requirements.test_command, "cargo test");
+        assert!(!config.test_requirements.require_new_tests);
+        assert_eq!(config.test_requirements.on_failure, TestFailureAction::Block);
     }
 }
