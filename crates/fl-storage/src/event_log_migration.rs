@@ -115,6 +115,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         };
         let e2 = Event {
@@ -133,6 +137,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         };
 

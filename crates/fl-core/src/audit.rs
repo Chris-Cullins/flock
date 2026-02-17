@@ -184,6 +184,10 @@ mod tests {
                 snapshot_merkle_root: Some("0".repeat(64)),
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         };
         if signed {

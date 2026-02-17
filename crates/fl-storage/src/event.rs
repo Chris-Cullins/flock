@@ -51,6 +51,34 @@ impl Event {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FileChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChangeSummary {
+    pub path: String,
+    pub change_kind: FileChangeKind,
+    #[serde(default)]
+    pub lines_added: u32,
+    #[serde(default)]
+    pub lines_removed: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CheckpointCategory {
+    Bugfix,
+    Feature,
+    Refactor,
+    Test,
+    Docs,
+    Style,
+    Chore,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointEvent {
     pub label: String,
@@ -64,6 +92,14 @@ pub struct CheckpointEvent {
     pub ai_intent: Option<String>,
     #[serde(default)]
     pub intent_confidence: Option<u32>,
+    #[serde(default)]
+    pub files_changed: Option<Vec<FileChangeSummary>>,
+    #[serde(default)]
+    pub category: Option<CheckpointCategory>,
+    #[serde(default)]
+    pub scope_label: Option<String>,
+    #[serde(default)]
+    pub structured_description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +219,8 @@ pub struct TaskEvent {
     pub linked_events: Vec<Uuid>,
     #[serde(default)]
     pub discovered_from: Option<Uuid>,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

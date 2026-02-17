@@ -15,10 +15,10 @@ pub mod semantic;
 pub mod ws_client;
 
 pub use event::{
-    CheckpointEvent, DecisionAction, DecisionEvent, Event, EventKind, ExplorationAction,
-    ExplorationEvent, GateAction, GateCondition, GateEvent, GatePolicy, GitBridgeAction,
-    GitBridgeEvent, HookEvent, LockAction, LockEvent, NotifyConfig, PresenceAction, PresenceEvent,
-    IntelligenceAction, IntelligenceEvent,
+    CheckpointCategory, CheckpointEvent, DecisionAction, DecisionEvent, Event, EventKind,
+    ExplorationAction, ExplorationEvent, FileChangeKind, FileChangeSummary, GateAction,
+    GateCondition, GateEvent, GatePolicy, GitBridgeAction, GitBridgeEvent, HookEvent, LockAction,
+    LockEvent, NotifyConfig, PresenceAction, PresenceEvent, IntelligenceAction, IntelligenceEvent,
     RemoteSyncAction, RemoteSyncEvent, ResourceUsageEvent, SessionAction, SessionEvent,
     SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
     UndoMode, PolicyEvent, PolicyVerdictKind,
@@ -27,14 +27,14 @@ pub use fl_storage::ApiCallRecord;
 pub use fl_storage::{CloneReport, PullReport, PushReport, RefKind, RemoteUrl, RepoRef, RoostEntry, WorkspaceRefConfig};
 pub use fl_storage::{WsClientMessage, WsServerMessage, WsSubscribeRequest};
 pub use repo::{
-    ConflictDetail, ConflictStatus, ConflictSummary, ConvertReport, DecisionSummary, ExplorationStatus, FileSummary,
-    ExplorationSummary, FsckReport, GateConditionKind, GatePolicyKind, GateStatus, GateSummary,
-    ImpactReport, IndexReport, LockStatus, LockSummary, PresenceSummary, ProvenanceInfo, RebaseResult,
-    RemoteCredentialInfo, RemoteLoginResult, StatusReport,
-    RebaseSummary, ReplayedState, Repo, ResourceUsageTotals, ReviewStats, ReviewSummary,
-    SessionReplay, SessionStatus, SessionSummary, ShadowSafetyCheck, ShadowSafetyReport,
-    SubscriptionNotify, SubscriptionStatus, SubscriptionSummary, TaskEdge, TaskGraph, TaskRelation,
-    TaskStatus, TaskSummary, UndoRequest, UndoResult, WorkspaceInfo,
+    CheckpointIntentMetadata, ConflictDetail, ConflictStatus, ConflictSummary, ConvertReport,
+    DecisionSummary, ExplorationStatus, FileSummary, ExplorationSummary, FsckReport,
+    GateConditionKind, GatePolicyKind, GateStatus, GateSummary, ImpactReport, IndexReport,
+    LockStatus, LockSummary, PresenceSummary, ProvenanceInfo, RebaseResult, RemoteCredentialInfo,
+    RemoteLoginResult, StatusReport, RebaseSummary, ReplayedState, Repo, ResourceUsageTotals,
+    ReviewStats, ReviewSummary, SessionReplay, SessionStatus, SessionSummary, ShadowSafetyCheck,
+    ShadowSafetyReport, SubscriptionNotify, SubscriptionStatus, SubscriptionSummary, TaskEdge,
+    TaskGraph, TaskRelation, TaskStatus, TaskSummary, UndoRequest, UndoResult, WorkspaceInfo,
 };
 pub use intelligence::{
     ConfidenceRecommendation, ConfidenceScore, ConflictSuggestionResult, IndexStats,

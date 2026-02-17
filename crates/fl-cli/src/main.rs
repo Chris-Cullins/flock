@@ -44,6 +44,18 @@ enum Command {
         /// Skip hook execution (recorded in audit log)
         #[arg(long)]
         skip_hooks: bool,
+        /// Change category (bugfix, feature, refactor, test, docs, style, chore)
+        #[arg(long)]
+        category: Option<String>,
+        /// Scope label for the change
+        #[arg(long)]
+        scope: Option<String>,
+        /// Confidence level (high, medium, low)
+        #[arg(long)]
+        confidence: Option<String>,
+        /// Structured description of the change
+        #[arg(long)]
+        description: Option<String>,
     },
     /// Show the event log
     Log,
@@ -702,6 +714,9 @@ enum TaskCommand {
         depends_on: Vec<String>,
         #[arg(long = "discovered-from")]
         discovered_from: Option<String>,
+        /// Allowed path patterns for scope enforcement (glob)
+        #[arg(long = "scope")]
+        scope: Vec<String>,
     },
     /// List tasks (open and claimed by default)
     List {
@@ -977,9 +992,35 @@ fn main() -> Result<()> {
             message,
             allow_secrets,
             skip_hooks,
+            category,
+            scope,
+            confidence,
+            description,
         } => {
             let repo = Repo::discover(cwd)?;
-            let event = repo.create_checkpoint_with_options(message, allow_secrets, skip_hooks)?;
+
+            let intent = if category.is_some() || scope.is_some() || confidence.is_some() || description.is_some() {
+                let parsed_category = category.as_deref().map(|c| match c {
+                    "bugfix" | "fix" => fl_core::CheckpointCategory::Bugfix,
+                    "feature" | "feat" => fl_core::CheckpointCategory::Feature,
+                    "refactor" => fl_core::CheckpointCategory::Refactor,
+                    "test" => fl_core::CheckpointCategory::Test,
+                    "docs" => fl_core::CheckpointCategory::Docs,
+                    "style" => fl_core::CheckpointCategory::Style,
+                    "chore" => fl_core::CheckpointCategory::Chore,
+                    _ => fl_core::CheckpointCategory::Chore,
+                });
+                Some(fl_core::CheckpointIntentMetadata {
+                    category: parsed_category,
+                    scope_label: scope,
+                    confidence,
+                    structured_description: description,
+                })
+            } else {
+                None
+            };
+
+            let event = repo.create_checkpoint_with_options(message, allow_secrets, skip_hooks, intent)?;
             let commit_id = event.id;
             let EventKind::Checkpoint(payload) = event.kind else {
                 bail!("unexpected event payload for commit")
@@ -2106,6 +2147,7 @@ fn main() -> Result<()> {
                     description,
                     depends_on,
                     discovered_from,
+                    scope,
                 } => {
                     let deps = depends_on
                         .iter()
@@ -2115,7 +2157,7 @@ fn main() -> Result<()> {
                         .as_deref()
                         .map(parse_uuid)
                         .transpose()?;
-                    let task = repo.create_task(title, description, deps, discovered)?;
+                    let task = repo.create_task(title, description, deps, discovered, scope)?;
                     println!("task {} created: {}", task.id, task.title);
                 }
                 TaskCommand::List { all, json, live } => {

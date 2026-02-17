@@ -334,22 +334,22 @@ Enforce quality, consistency, and safety at the point of creation. Policies are 
 ### 12.5b. Scope Enforcement
 - [x] Scope policy types and evaluation logic (fl-policy crate)
 - [x] Three enforcement modes: Block (reject out-of-scope), Gate (allow with justification), Split (auto-extract to discovery task)
-- [ ] Wire scope enforcement into repo operations (requires task-level scope metadata)
-- [ ] Auto-create discovery tasks for out-of-scope observations in split mode
+- [x] Wire scope enforcement into repo operations (requires task-level scope metadata)
+- [x] Auto-create discovery tasks for out-of-scope observations in split mode
 - [x] Configuration: `[scope] enforce = "split"`, `default_scope_mode = "path" | "semantic" | "module"`
 
 ### 12.5c. Change Budget Limits
-- [ ] Track files modified and lines changed per exploration and per task (requires file change metadata in checkpoint events)
+- [x] Track files modified and lines changed per exploration and per task (requires file change metadata in checkpoint events)
 - [ ] Track semantic changes per exploration
 - [x] Budget policy types and evaluation logic (fl-policy crate)
 - [x] Enforce configurable budgets with pause_and_flag / block / warn actions
 - [x] Configuration: `[budget] max_files_per_task`, `max_lines_per_task`, `max_semantic_changes_per_exploration`
 
 ### 12.5d. Commit Hygiene & Structured Intent Metadata
-- [ ] Extend checkpoint/commit events with structured intent fields: category (bugfix/feature/refactor/test/docs/style/chore), scope, confidence (high/medium/low), structured description
-- [ ] Enforce required intent metadata at checkpoint time (configurable per field)
-- [ ] Checkpoint frequency prompting — warn if agent works >N minutes without checkpointing
-- [ ] Configuration: `[commit_hygiene] require_category`, `require_scope`, `require_confidence`, `max_time_between_checkpoints`
+- [x] Extend checkpoint/commit events with structured intent fields: category (bugfix/feature/refactor/test/docs/style/chore), scope, confidence (high/medium/low), structured description
+- [x] Enforce required intent metadata at checkpoint time (configurable per field)
+- [x] Checkpoint frequency prompting — warn if agent works >N minutes without checkpointing
+- [x] Configuration: `[commit_hygiene] require_category`, `require_scope`, `require_confidence`, `max_time_between_checkpoints`
 
 ### 12.5e. DRY / Duplication Prevention
 - [ ] Layer 1: Signature matching — compare new methods against existing symbol table by return type, parameter types, name similarity

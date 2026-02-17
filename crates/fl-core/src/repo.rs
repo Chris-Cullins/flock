@@ -21,10 +21,11 @@ use walkdir::WalkDir;
 
 use crate::event::{
     CheckpointEvent, ConflictAction, ConflictResolutionEvent, DecisionAction, DecisionEvent, Event,
-    EventKind, ExplorationAction, ExplorationEvent, GateAction, GateCondition, GateEvent,
-    GatePolicy, GitBridgeAction, GitBridgeEvent, LockAction, LockEvent, NotifyConfig,
-    PresenceAction, PresenceEvent, RebaseEvent, ResourceUsageEvent, SessionAction, SessionEvent,
-    SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent,
+    EventKind, ExplorationAction, ExplorationEvent, FileChangeKind, FileChangeSummary, GateAction,
+    GateCondition, GateEvent, GatePolicy, GitBridgeAction, GitBridgeEvent, LockAction, LockEvent,
+    NotifyConfig, PresenceAction, PresenceEvent, RebaseEvent, ResourceUsageEvent, SessionAction,
+    SessionEvent, SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent,
+    UndoEvent,
 };
 use fl_collab::can_acquire_lock;
 use fl_storage::ApiCallRecord;
@@ -73,6 +74,15 @@ pub struct FileSummary {
     pub added: Vec<String>,
     pub modified: Vec<String>,
     pub deleted: Vec<String>,
+}
+
+/// Structured intent metadata for checkpoints (commit hygiene).
+#[derive(Debug, Clone)]
+pub struct CheckpointIntentMetadata {
+    pub category: Option<crate::event::CheckpointCategory>,
+    pub scope_label: Option<String>,
+    pub confidence: Option<String>,
+    pub structured_description: Option<String>,
 }
 
 /// Persisted dependency graph for incremental semantic indexing.
@@ -392,7 +402,7 @@ impl Repo {
     }
 
     pub fn create_checkpoint(&self, message: Option<String>) -> Result<Event> {
-        self.create_checkpoint_with_options(message, false, false)
+        self.create_checkpoint_with_options(message, false, false, None)
     }
 
     pub fn create_checkpoint_with_options(
@@ -400,6 +410,7 @@ impl Repo {
         message: Option<String>,
         allow_secrets: bool,
         skip_hooks: bool,
+        intent: Option<CheckpointIntentMetadata>,
     ) -> Result<Event> {
         self.assert_initialized()?;
 
@@ -415,11 +426,16 @@ impl Repo {
             self.scan_working_directory_for_secrets()?;
         }
 
-        // Enforce policy checks (budget + rate limits).
+        // Enforce policy checks (budget + rate limits + scope).
         let task_id = self.active_task_id();
         let exploration_id = self.active_exploration_id();
         self.enforce_budget_policy(task_id, exploration_id)?;
         self.enforce_rate_limit_policy(task_id, exploration_id)?;
+        self.enforce_scope_policy(task_id, exploration_id)?;
+
+        // Enforce commit hygiene.
+        self.enforce_commit_hygiene(&intent)?;
+        self.check_checkpoint_frequency();
 
         let label = message
             .as_deref()
@@ -427,7 +443,7 @@ impl Repo {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("checkpoint-{}", Uuid::new_v4().simple()));
 
-        let event = self.create_checkpoint_with_lineage(label, message, None)?;
+        let event = self.create_checkpoint_with_lineage(label, message, None, intent)?;
 
         // If secrets were explicitly allowed, record it in the event log as an
         // audit trail.
@@ -1437,6 +1453,7 @@ impl Repo {
             format!("promote-{}", normalize_label(&existing.title)),
             Some(message),
             None,
+            None,
         )?;
 
         self.append_event(EventKind::Exploration(ExplorationEvent {
@@ -1874,6 +1891,7 @@ impl Repo {
         description: Option<String>,
         dependencies: Vec<Uuid>,
         discovered_from: Option<Uuid>,
+        allowed_paths: Vec<String>,
     ) -> Result<TaskSummary> {
         self.assert_initialized()?;
 
@@ -1899,6 +1917,7 @@ impl Repo {
             result: None,
             linked_events: Vec::new(),
             discovered_from,
+            allowed_paths: allowed_paths.clone(),
         }))?;
 
         Ok(TaskSummary {
@@ -1915,6 +1934,7 @@ impl Repo {
             result: None,
             linked_events: Vec::new(),
             discovered_from,
+            allowed_paths,
         })
     }
 
@@ -1981,6 +2001,7 @@ impl Repo {
             result: None,
             linked_events: Vec::new(),
             discovered_from: None,
+            allowed_paths: Vec::new(),
         }))?;
 
         self.task_info(task_id)
@@ -2008,6 +2029,7 @@ impl Repo {
             result: None,
             linked_events: Vec::new(),
             discovered_from: None,
+            allowed_paths: Vec::new(),
         }))?;
 
         self.task_info(task_id)
@@ -2035,6 +2057,7 @@ impl Repo {
             result: result.clone(),
             linked_events: Vec::new(),
             discovered_from: None,
+            allowed_paths: Vec::new(),
         }))?;
 
         self.task_info(task_id)
@@ -2062,6 +2085,7 @@ impl Repo {
             result: Some(reason),
             linked_events: Vec::new(),
             discovered_from: None,
+            allowed_paths: Vec::new(),
         }))?;
 
         self.task_info(task_id)
@@ -2089,6 +2113,7 @@ impl Repo {
             result: None,
             linked_events: event_ids,
             discovered_from: None,
+            allowed_paths: Vec::new(),
         }))?;
 
         Ok(())
@@ -2282,7 +2307,7 @@ impl Repo {
     pub fn quick_save(&self, tag: Option<String>) -> Result<Event> {
         self.assert_initialized()?;
         let label = tag.unwrap_or_else(|| format!("quick-{}", Uuid::new_v4().simple()));
-        self.create_checkpoint_with_lineage(label, Some("quick save".to_string()), None)
+        self.create_checkpoint_with_lineage(label, Some("quick save".to_string()), None, None)
     }
 
     /// Quick restore: undo to the last checkpoint, optimized for agent use.
@@ -2326,6 +2351,7 @@ impl Repo {
                 format!("undo-{}", target.id.simple()),
                 Some(format!("undo target {}", target.id)),
                 Some(previous_checkpoint.id),
+                None,
             )?;
             restored_checkpoint_event = Some(checkpoint_event.id);
         }
@@ -2388,6 +2414,7 @@ impl Repo {
                 "undo file {} from checkpoint {}",
                 scoped_file_display, target.id
             )),
+            None,
             None,
         )?;
         let restored_checkpoint_event = Some(checkpoint_event.id);
@@ -3459,6 +3486,296 @@ impl Repo {
         Ok(())
     }
 
+    /// Enforce scope policy for the current task. Called before checkpoints.
+    fn enforce_scope_policy(
+        &self,
+        task_id: Option<Uuid>,
+        _exploration_id: Option<Uuid>,
+    ) -> Result<()> {
+        let config = self.policies_config();
+        if !config.scope.enabled {
+            return Ok(());
+        }
+        let Some(tid) = task_id else {
+            return Ok(());
+        };
+
+        let state = self.replay_state()?;
+        let task = match state.tasks.get(&tid) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        if task.allowed_paths.is_empty() {
+            return Ok(());
+        }
+
+        // Compute changed files: working directory vs latest snapshot.
+        let changed_files = self.working_dir_changed_files();
+        if changed_files.is_empty() {
+            return Ok(());
+        }
+
+        let task_scope = fl_policy::TaskScope {
+            task_id: tid,
+            allowed_paths: task.allowed_paths.clone(),
+        };
+        let decision = fl_policy::check_scope_policy(&config.scope, &task_scope, &changed_files);
+
+        if decision.is_blocked() || decision.is_gated() {
+            self.record_policy_decision(&decision)?;
+        }
+
+        if config.scope.enforce_mode == fl_policy::ScopeEnforceMode::Split && !decision.affected_files.is_empty() {
+            // Split mode: create discovery tasks for out-of-scope files.
+            self.auto_create_discovery_tasks(tid, &decision.affected_files)?;
+            eprintln!(
+                "warning: {} out-of-scope file(s) recorded as discovery tasks",
+                decision.affected_files.len()
+            );
+            return Ok(());
+        }
+
+        if decision.is_blocked() {
+            if let fl_policy::PolicyVerdict::Block { reason, fix_suggestion } = &decision.verdict {
+                let msg = if let Some(fix) = fix_suggestion {
+                    format!("Policy blocked: {}\nSuggestion: {}", reason, fix)
+                } else {
+                    format!("Policy blocked: {}", reason)
+                };
+                bail!("{}", msg);
+            }
+        }
+        if decision.is_gated() {
+            if let fl_policy::PolicyVerdict::Gate { reason, .. } = &decision.verdict {
+                eprintln!("warning: policy scope gate triggered — {}", reason);
+            }
+        }
+        Ok(())
+    }
+
+    /// Create discovery tasks for out-of-scope files (Split mode).
+    fn auto_create_discovery_tasks(
+        &self,
+        source_task_id: Uuid,
+        out_of_scope_files: &[String],
+    ) -> Result<()> {
+        let file_list = out_of_scope_files.join(", ");
+        let title = format!(
+            "discovered out-of-scope changes: {}",
+            if file_list.len() > 80 {
+                format!("{}...", &file_list[..80])
+            } else {
+                file_list
+            }
+        );
+        self.create_task(
+            title,
+            Some(format!(
+                "Auto-created from task {} — files: {}",
+                source_task_id,
+                out_of_scope_files.join(", ")
+            )),
+            vec![],
+            Some(source_task_id),
+            out_of_scope_files.to_vec(),
+        )?;
+        Ok(())
+    }
+
+    /// Compute changed files in working directory vs latest snapshot.
+    fn working_dir_changed_files(&self) -> Vec<String> {
+        let latest = match self.latest_checkpoint() {
+            Some(event) => event,
+            None => return Vec::new(),
+        };
+        let EventKind::Checkpoint(payload) = latest.kind else {
+            return Vec::new();
+        };
+        let snapshot_root = self.snapshot_path(payload.snapshot_id);
+        let snapshot_files = collect_source_files(&snapshot_root, false).unwrap_or_default();
+        let current_files = collect_source_files(self.root(), true).unwrap_or_default();
+
+        let mut changed = Vec::new();
+        for path in &current_files {
+            if !snapshot_files.contains(path) {
+                changed.push(path.display().to_string());
+            } else {
+                let old = fs::read(snapshot_root.join(path)).unwrap_or_default();
+                let new = fs::read(self.root.join(path)).unwrap_or_default();
+                if old != new {
+                    changed.push(path.display().to_string());
+                }
+            }
+        }
+        for path in &snapshot_files {
+            if !current_files.contains(path) {
+                changed.push(path.display().to_string());
+            }
+        }
+        changed
+    }
+
+    /// Compute file change summaries between the new snapshot and the parent
+    /// checkpoint's snapshot. Returns `None` on any error (best-effort).
+    fn compute_file_changes(
+        &self,
+        new_snapshot_id: Uuid,
+        parent_checkpoint_event: Option<Uuid>,
+    ) -> Option<Vec<FileChangeSummary>> {
+        let parent_event_id = parent_checkpoint_event?;
+
+        // Find parent checkpoint's snapshot ID.
+        let events = self.list_events().ok()?;
+        let parent_snapshot_id = events.iter().find_map(|e| {
+            if e.id == parent_event_id {
+                if let EventKind::Checkpoint(cp) = &e.kind {
+                    return Some(cp.snapshot_id);
+                }
+            }
+            None
+        })?;
+
+        let old_root = self.snapshot_path(parent_snapshot_id);
+        let new_root = self.snapshot_path(new_snapshot_id);
+
+        if !old_root.is_dir() || !new_root.is_dir() {
+            return None;
+        }
+
+        let old_files = collect_source_files(&old_root, false).ok()?;
+        let new_files = collect_source_files(&new_root, false).ok()?;
+
+        let mut changes = Vec::new();
+
+        for path in &new_files {
+            let path_str = path.display().to_string();
+            if !old_files.contains(path) {
+                // Added file
+                let line_count = fs::read_to_string(new_root.join(path))
+                    .map(|s| s.lines().count() as u32)
+                    .unwrap_or(0);
+                changes.push(FileChangeSummary {
+                    path: path_str,
+                    change_kind: FileChangeKind::Added,
+                    lines_added: line_count,
+                    lines_removed: 0,
+                });
+            } else {
+                let old_content = fs::read(old_root.join(path)).unwrap_or_default();
+                let new_content = fs::read(new_root.join(path)).unwrap_or_default();
+                if old_content != new_content {
+                    let old_lines = String::from_utf8_lossy(&old_content).lines().count() as u32;
+                    let new_lines = String::from_utf8_lossy(&new_content).lines().count() as u32;
+                    changes.push(FileChangeSummary {
+                        path: path_str,
+                        change_kind: FileChangeKind::Modified,
+                        lines_added: new_lines.saturating_sub(old_lines),
+                        lines_removed: old_lines.saturating_sub(new_lines),
+                    });
+                }
+            }
+        }
+
+        for path in &old_files {
+            if !new_files.contains(path) {
+                let line_count = fs::read_to_string(old_root.join(path))
+                    .map(|s| s.lines().count() as u32)
+                    .unwrap_or(0);
+                changes.push(FileChangeSummary {
+                    path: path.display().to_string(),
+                    change_kind: FileChangeKind::Deleted,
+                    lines_added: 0,
+                    lines_removed: line_count,
+                });
+            }
+        }
+
+        if changes.is_empty() {
+            None
+        } else {
+            Some(changes)
+        }
+    }
+
+    /// Enforce commit hygiene policy. Checks that required metadata fields are present.
+    fn enforce_commit_hygiene(
+        &self,
+        intent: &Option<CheckpointIntentMetadata>,
+    ) -> Result<()> {
+        let config = self.policies_config();
+        if !config.commit_hygiene.enabled {
+            return Ok(());
+        }
+
+        let intent = match intent {
+            Some(i) => i,
+            None => {
+                let mut missing = Vec::new();
+                if config.commit_hygiene.require_category {
+                    missing.push("--category");
+                }
+                if config.commit_hygiene.require_scope {
+                    missing.push("--scope");
+                }
+                if config.commit_hygiene.require_confidence {
+                    missing.push("--confidence");
+                }
+                if !missing.is_empty() {
+                    bail!(
+                        "Commit hygiene requires: {}. Provide these flags or disable commit_hygiene in policies.toml",
+                        missing.join(", ")
+                    );
+                }
+                return Ok(());
+            }
+        };
+
+        if config.commit_hygiene.require_category && intent.category.is_none() {
+            bail!("Commit hygiene requires --category (bugfix, feature, refactor, test, docs, style, chore)");
+        }
+        if config.commit_hygiene.require_scope && intent.scope_label.is_none() {
+            bail!("Commit hygiene requires --scope <label>");
+        }
+        if config.commit_hygiene.require_confidence && intent.confidence.is_none() {
+            bail!("Commit hygiene requires --confidence (high, medium, low)");
+        }
+
+        Ok(())
+    }
+
+    /// Check checkpoint frequency and warn if too much time has elapsed.
+    fn check_checkpoint_frequency(&self) {
+        let config = self.policies_config();
+        let max_secs = match config.commit_hygiene.max_time_between_checkpoints {
+            Some(s) if config.commit_hygiene.enabled => s,
+            _ => return,
+        };
+
+        let latest = match self.latest_checkpoint() {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Parse the latest checkpoint timestamp (nanosecond string).
+        let last_nanos: u128 = match latest.timestamp.parse() {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        let last_secs = (last_nanos / 1_000_000_000) as u64;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let elapsed = now_secs.saturating_sub(last_secs);
+        if elapsed > max_secs {
+            eprintln!(
+                "warning: {}s since last checkpoint (max_time_between_checkpoints: {}s)",
+                elapsed, max_secs
+            );
+        }
+    }
+
     /// Find the active task ID from replayed state (if any task is claimed by current actor).
     fn active_task_id(&self) -> Option<Uuid> {
         let state = self.replay_state().ok()?;
@@ -3615,6 +3932,7 @@ impl Repo {
         label: String,
         message: Option<String>,
         parent_checkpoint_event: Option<Uuid>,
+        intent: Option<CheckpointIntentMetadata>,
     ) -> Result<Event> {
         let git_commit_mapping = if self.repo_mode()? == RepoMode::GitColocated {
             Some(self.commit_checkpoint_to_git(message.as_deref(), &label)?)
@@ -3629,6 +3947,7 @@ impl Repo {
             message,
             parent_checkpoint_event,
             git_commit_mapping,
+            intent,
         )
     }
 
@@ -3655,6 +3974,7 @@ impl Repo {
             message,
             parent_checkpoint_event,
             Some(git_commit.to_string()),
+            None,
         )
     }
 
@@ -3666,6 +3986,7 @@ impl Repo {
         message: Option<String>,
         parent_checkpoint_event: Option<Uuid>,
         git_commit_mapping: Option<String>,
+        intent: Option<CheckpointIntentMetadata>,
     ) -> Result<Event> {
         let snapshot_id = Uuid::new_v4();
 
@@ -3678,6 +3999,7 @@ impl Repo {
                 message,
                 parent_checkpoint_event,
                 git_commit_mapping,
+                intent,
             )
         } else {
             let snapshot_path = self.snapshot_path(snapshot_id);
@@ -3697,6 +4019,7 @@ impl Repo {
                 message,
                 parent_checkpoint_event,
                 git_commit_mapping,
+                intent,
             )
         }
     }
@@ -3708,11 +4031,22 @@ impl Repo {
         message: Option<String>,
         parent_checkpoint_event: Option<Uuid>,
         git_commit_mapping: Option<String>,
+        intent: Option<CheckpointIntentMetadata>,
     ) -> Result<Event> {
         let snapshot_path = self.snapshot_path(snapshot_id);
         let snapshot_merkle_root = compute_snapshot_merkle_root(&snapshot_path)?;
         let parent_checkpoint_event =
             parent_checkpoint_event.or_else(|| self.latest_checkpoint().map(|event| event.id));
+
+        // Compute file changes (best-effort, non-fatal).
+        let files_changed = self.compute_file_changes(snapshot_id, parent_checkpoint_event);
+
+        let (category, scope_label, structured_description) = if let Some(ref i) = intent {
+            (i.category, i.scope_label.clone(), i.structured_description.clone())
+        } else {
+            (None, None, None)
+        };
+
         let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
             label,
             message: message.clone(),
@@ -3721,6 +4055,10 @@ impl Repo {
             snapshot_merkle_root: Some(snapshot_merkle_root),
             ai_intent: None,
             intent_confidence: None,
+            files_changed,
+            category,
+            scope_label,
+            structured_description,
         }))?;
 
         if let Some(git_commit_sha) = git_commit_mapping {
@@ -3901,6 +4239,7 @@ impl Repo {
         message: Option<String>,
         parent_checkpoint_event: Option<Uuid>,
         git_commit_mapping: Option<String>,
+        intent: Option<CheckpointIntentMetadata>,
     ) -> Result<Event> {
         let file_index = FileIndex::for_root(self.root());
         let index = file_index.read(snapshot_id)?;
@@ -3911,6 +4250,16 @@ impl Repo {
 
         let parent_checkpoint_event =
             parent_checkpoint_event.or_else(|| self.latest_checkpoint().map(|event| event.id));
+
+        // Compute file changes (best-effort, non-fatal).
+        let files_changed = self.compute_file_changes(snapshot_id, parent_checkpoint_event);
+
+        let (category, scope_label, structured_description) = if let Some(ref i) = intent {
+            (i.category, i.scope_label.clone(), i.structured_description.clone())
+        } else {
+            (None, None, None)
+        };
+
         let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
             label,
             message: message.clone(),
@@ -3919,6 +4268,10 @@ impl Repo {
             snapshot_merkle_root: Some(snapshot_merkle_root),
             ai_intent: None,
             intent_confidence: None,
+            files_changed,
+            category,
+            scope_label,
+            structured_description,
         }))?;
 
         if let Some(git_commit_sha) = git_commit_mapping {
@@ -10014,7 +10367,7 @@ mod tests {
         repo.init().expect("init");
 
         let task = repo
-            .create_task("test task".to_string(), None, vec![], None)
+            .create_task("test task".to_string(), None, vec![], None, vec![])
             .expect("create task");
         let full_id = task.id.to_string();
         let prefix = &full_id[..8];

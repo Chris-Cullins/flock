@@ -165,6 +165,10 @@ mod tests {
             snapshot_merkle_root: None,
             ai_intent: None,
             intent_confidence: None,
+            files_changed: None,
+            category: None,
+            scope_label: None,
+            structured_description: None,
         }));
         let session = make_event(2, Some(cp.id), "1000000000000000001", EventKind::Session(SessionEvent {
             session_id: Uuid::from_u128(200),
@@ -204,6 +208,10 @@ mod tests {
             snapshot_merkle_root: None,
             ai_intent: None,
             intent_confidence: None,
+            files_changed: None,
+            category: None,
+            scope_label: None,
+            structured_description: None,
         }));
 
         write_events_to_log(dir.path(), &[old_cp]);

@@ -6,12 +6,36 @@ use fl_policy::{
     ScopeMode, ScopePolicy,
 };
 
+/// Configuration for commit hygiene enforcement.
+#[derive(Debug, Clone)]
+pub struct CommitHygieneConfig {
+    pub enabled: bool,
+    pub require_category: bool,
+    pub require_scope: bool,
+    pub require_confidence: bool,
+    /// Maximum seconds between checkpoints before a warning is emitted.
+    pub max_time_between_checkpoints: Option<u64>,
+}
+
+impl Default for CommitHygieneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_category: false,
+            require_scope: false,
+            require_confidence: false,
+            max_time_between_checkpoints: None,
+        }
+    }
+}
+
 /// Aggregated policy configuration loaded from `.flock/policies.toml`.
 #[derive(Debug, Clone)]
 pub struct PoliciesConfig {
     pub scope: ScopePolicy,
     pub budget: BudgetLimits,
     pub rate_limits: RateLimits,
+    pub commit_hygiene: CommitHygieneConfig,
 }
 
 impl Default for PoliciesConfig {
@@ -20,6 +44,7 @@ impl Default for PoliciesConfig {
             scope: ScopePolicy::default(),
             budget: BudgetLimits::default(),
             rate_limits: RateLimits::default(),
+            commit_hygiene: CommitHygieneConfig::default(),
         }
     }
 }
@@ -58,6 +83,15 @@ enabled = false
 # window_secs = 3600
 # Action when rate limit is exceeded: "block", "warn", or "pause_and_escalate"
 on_exceed = "block"
+
+# --- Commit hygiene ---
+# Require structured metadata on checkpoints for agent governance.
+[commit_hygiene]
+enabled = false
+# require_category = true
+# require_scope = true
+# require_confidence = true
+# max_time_between_checkpoints = 3600
 "#;
 
 /// Parse a `policies.toml` file into a `PoliciesConfig`.
@@ -88,6 +122,7 @@ pub fn parse_policies_config(content: &str) -> PoliciesConfig {
             "scope" => parse_scope_field(&mut config.scope, key, value),
             "budget" => parse_budget_field(&mut config.budget, key, value),
             "rate_limits" => parse_rate_limit_field(&mut config.rate_limits, key, value),
+            "commit_hygiene" => parse_commit_hygiene_field(&mut config.commit_hygiene, key, value),
             _ => {}
         }
     }
@@ -155,6 +190,23 @@ fn parse_rate_limit_field(limits: &mut RateLimits, key: &str, value: &str) {
                 "pause_and_escalate" => RateLimitExceedAction::PauseAndEscalate,
                 _ => RateLimitExceedAction::Block,
             };
+        }
+        _ => {}
+    }
+}
+
+fn parse_commit_hygiene_field(config: &mut CommitHygieneConfig, key: &str, value: &str) {
+    match key {
+        "enabled" => config.enabled = value == "true",
+        "require_category" => config.require_category = value == "true",
+        "require_scope" => config.require_scope = value == "true",
+        "require_confidence" => config.require_confidence = value == "true",
+        "max_time_between_checkpoints" => {
+            if let Ok(secs) = value.parse::<u64>() {
+                config.max_time_between_checkpoints = Some(secs);
+            } else if let Some(secs) = parse_duration_to_secs(value) {
+                config.max_time_between_checkpoints = Some(secs);
+            }
         }
         _ => {}
     }
@@ -296,6 +348,24 @@ on_exceed = "pause_and_escalate"
         assert_eq!(parse_duration_to_secs("60s"), Some(60));
         assert_eq!(parse_duration_to_secs("3600"), Some(3600));
         assert_eq!(parse_duration_to_secs(""), None);
+    }
+
+    #[test]
+    fn test_parse_commit_hygiene() {
+        let toml = r#"
+[commit_hygiene]
+enabled = true
+require_category = true
+require_scope = true
+require_confidence = false
+max_time_between_checkpoints = 1800
+"#;
+        let config = parse_policies_config(toml);
+        assert!(config.commit_hygiene.enabled);
+        assert!(config.commit_hygiene.require_category);
+        assert!(config.commit_hygiene.require_scope);
+        assert!(!config.commit_hygiene.require_confidence);
+        assert_eq!(config.commit_hygiene.max_time_between_checkpoints, Some(1800));
     }
 
     #[test]

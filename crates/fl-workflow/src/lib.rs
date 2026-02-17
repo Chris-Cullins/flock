@@ -142,6 +142,8 @@ pub struct TaskSummary {
     pub result: Option<String>,
     pub linked_events: Vec<Uuid>,
     pub discovered_from: Option<Uuid>,
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
 }
 
 impl TaskSummary {
@@ -339,8 +341,25 @@ impl ReplayAccumulator {
                     if let Some(tracker) = self.policy_rate_limits.get_mut(&tid) {
                         tracker.checkpoint_timestamps.push(event.timestamp.clone());
                     }
-                    // Budget file/line tracking requires file change metadata
-                    // in checkpoint events (not yet available). Tracked in TODO 12.5c.
+                    // Budget file/line tracking from file change metadata.
+                    if let Some(files_changed) = &checkpoint.files_changed {
+                        if let Some(tracker) = self.policy_budgets.get_mut(&tid) {
+                            for fc in files_changed {
+                                tracker.files_modified.insert(fc.path.clone());
+                                tracker.lines_changed += fc.lines_added + fc.lines_removed;
+                            }
+                            // Track per-exploration files.
+                            let active_exploration = self.explorations.values()
+                                .find(|e| e.status == ExplorationStatus::Active)
+                                .map(|e| e.id);
+                            if let Some(exp_id) = active_exploration {
+                                let exp_files = tracker.exploration_files.entry(exp_id).or_default();
+                                for fc in files_changed {
+                                    exp_files.insert(fc.path.clone());
+                                }
+                            }
+                        }
+                    }
                 }
             }
             EventKind::Exploration(exploration) => match exploration.action {
@@ -728,6 +747,7 @@ impl ReplayAccumulator {
                             result: None,
                             linked_events: task.linked_events.clone(),
                             discovered_from: task.discovered_from,
+                            allowed_paths: task.allowed_paths.clone(),
                         },
                     );
                 }
@@ -1056,6 +1076,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let exploration_start = make_event(
@@ -1105,6 +1129,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let cp2 = make_event(
@@ -1118,6 +1146,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let restored = make_event(
@@ -1131,6 +1163,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let undo = make_event(
@@ -1165,6 +1201,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let cp2 = make_event(
@@ -1178,6 +1218,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
 
@@ -1200,6 +1244,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let cp2 = make_event(
@@ -1213,6 +1261,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let exploration_start = make_event(
@@ -1236,6 +1288,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let undo = make_event(
@@ -1473,6 +1529,7 @@ mod tests {
             result: None,
             linked_events: Vec::new(),
             discovered_from: None,
+            allowed_paths: Vec::new(),
         }
     }
 
@@ -2063,6 +2120,10 @@ mod tests {
                 snapshot_merkle_root: None,
                 ai_intent: None,
                 intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
             }),
         );
         let exploration_start = make_event(
