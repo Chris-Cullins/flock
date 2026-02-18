@@ -9859,12 +9859,10 @@ fn build_reverse_dependency_index(
 
     for importer in current_files {
         let source_path = repo_root.join(importer);
-        let source = fs::read_to_string(&source_path).with_context(|| {
-            format!(
-                "failed to read source file while building semantic impact graph: {}",
-                source_path.display()
-            )
-        })?;
+        let source = match fs::read_to_string(&source_path) {
+            Ok(s) => s,
+            Err(_) => continue, // skip binary / non-UTF-8 files
+        };
 
         for specifier in extract_local_import_specifiers(&source, importer) {
             for target in resolve_import_targets(importer, &specifier, current_files) {
