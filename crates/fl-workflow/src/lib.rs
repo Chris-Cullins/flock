@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1081,6 +1081,48 @@ pub fn previous_checkpoint_before(events: &[Event], target_event_id: Uuid) -> Op
     }
 
     previous
+}
+
+/// Walk the `parent_checkpoint_event` chain starting from `start_id`,
+/// following `steps` parent links. Returns the ancestor checkpoint event.
+pub fn walk_checkpoint_ancestor(events: &[Event], start_id: Uuid, steps: usize) -> Result<Event> {
+    if steps == 0 {
+        bail!("steps must be >= 1");
+    }
+
+    let event_map: HashMap<Uuid, &Event> = events.iter().map(|e| (e.id, e)).collect();
+
+    let start = event_map
+        .get(&start_id)
+        .ok_or_else(|| anyhow!("start event {} not found", start_id))?;
+
+    let mut current = *start;
+    for step in 0..steps {
+        let EventKind::Checkpoint(ref cp) = current.kind else {
+            bail!(
+                "event {} is not a checkpoint; cannot follow parent chain",
+                current.id
+            );
+        };
+
+        let parent_id = cp.parent_checkpoint_event.ok_or_else(|| {
+            anyhow!(
+                "only {} checkpoint(s) exist before HEAD",
+                step
+            )
+        })?;
+
+        current = event_map
+            .get(&parent_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "parent checkpoint event {} not found in event log",
+                    parent_id
+                )
+            })?;
+    }
+
+    Ok(current.clone())
 }
 
 pub fn parse_duration_spec(input: &str) -> Result<Duration> {
@@ -2242,6 +2284,82 @@ mod tests {
         // Verify the exploration was promoted
         let exploration = incremental_state.explorations.get(&Uuid::from_u128(20)).unwrap();
         assert_eq!(exploration.status, ExplorationStatus::Promoted);
+    }
+
+    #[test]
+    fn walk_checkpoint_ancestor_chains_correctly() {
+        let cp1 = make_event(
+            1,
+            None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(101),
+                parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
+                git_commit_sha: None,
+            }),
+        );
+        let cp2 = make_event(
+            2,
+            Some(cp1.id),
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp2".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(102),
+                parent_checkpoint_event: Some(cp1.id),
+                snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
+                git_commit_sha: None,
+            }),
+        );
+        let cp3 = make_event(
+            3,
+            Some(cp2.id),
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp3".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(103),
+                parent_checkpoint_event: Some(cp2.id),
+                snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
+                git_commit_sha: None,
+            }),
+        );
+
+        let events = vec![cp1.clone(), cp2.clone(), cp3.clone()];
+
+        // 1 step from cp3 -> cp2
+        let result = walk_checkpoint_ancestor(&events, cp3.id, 1).unwrap();
+        assert_eq!(result.id, cp2.id);
+
+        // 2 steps from cp3 -> cp1
+        let result = walk_checkpoint_ancestor(&events, cp3.id, 2).unwrap();
+        assert_eq!(result.id, cp1.id);
+
+        // 3 steps from cp3 -> error (cp1 has no parent)
+        let err = walk_checkpoint_ancestor(&events, cp3.id, 3).unwrap_err();
+        assert!(
+            err.to_string().contains("checkpoint(s) exist before HEAD"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     fn make_event(id: u128, parent_id: Option<Uuid>, kind: EventKind) -> Event {

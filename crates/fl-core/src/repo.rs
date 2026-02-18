@@ -36,7 +36,7 @@ use crate::semantic::{
 };
 use fl_workflow::{
     build_task_graph, previous_checkpoint_before, replay_state, replay_state_incremental,
-    resolve_target_event, to_undo_mode,
+    resolve_target_event, to_undo_mode, walk_checkpoint_ancestor,
 };
 
 pub use fl_collab::{
@@ -2494,8 +2494,81 @@ impl Repo {
             bail!("cannot undo: event log is empty")
         }
 
-        let target = resolve_target_event(&events, &request)?;
-        let mode = to_undo_mode(&request, target.id);
+        match &request {
+            UndoRequest::Last | UndoRequest::N(_) => {
+                // Chain-walk requires at least one checkpoint.  If no checkpoint
+                // exists (e.g. undoing a non-checkpoint event like an exploration
+                // start), fall back to the raw event-target path.
+                if self.latest_checkpoint().is_some() {
+                    self.undo_by_chain_walk(&events, &request)
+                } else {
+                    self.undo_by_event_target(&events, &request)
+                }
+            }
+            UndoRequest::To(_) | UndoRequest::Since(_) => {
+                self.undo_by_event_target(&events, &request)
+            }
+        }
+    }
+
+    fn undo_by_chain_walk(
+        &self,
+        events: &[Event],
+        request: &UndoRequest,
+    ) -> Result<UndoResult> {
+        let steps = match request {
+            UndoRequest::Last => 1,
+            UndoRequest::N(n) => *n,
+            _ => unreachable!(),
+        };
+
+        let head = self
+            .latest_checkpoint()
+            .ok_or_else(|| anyhow!("cannot undo: no checkpoint exists"))?;
+
+        let ancestor = walk_checkpoint_ancestor(events, head.id, steps)?;
+
+        let EventKind::Checkpoint(ref ancestor_payload) = ancestor.kind else {
+            bail!("expected checkpoint payload");
+        };
+
+        self.restore_workspace_from_snapshot(ancestor_payload.snapshot_id)?;
+
+        // The restore checkpoint's parent is the ancestor's own parent, not the
+        // ancestor itself.  This is because the restore checkpoint has the same
+        // content as the ancestor, so "undo one more step" should walk to the
+        // ancestor's parent — not back to the ancestor (which would be a no-op).
+        // We use create_checkpoint_with_exact_lineage to prevent auto-fill of a
+        // None parent (which would incorrectly point to the latest checkpoint).
+        let checkpoint_event = self.create_checkpoint_with_exact_lineage(
+            format!("undo-restore-{}", ancestor.id.simple()),
+            Some(format!("undo: restore to checkpoint {}", ancestor.id)),
+            ancestor_payload.parent_checkpoint_event,
+        )?;
+        let restored_checkpoint_event = Some(checkpoint_event.id);
+
+        let mode = to_undo_mode(request, head.id);
+
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id: head.id,
+            mode,
+            restored_checkpoint_event,
+            file_scope: None,
+        }))?;
+
+        Ok(UndoResult {
+            target_event_id: head.id,
+            restored_checkpoint_event,
+        })
+    }
+
+    fn undo_by_event_target(
+        &self,
+        events: &[Event],
+        request: &UndoRequest,
+    ) -> Result<UndoResult> {
+        let target = resolve_target_event(events, request)?;
+        let mode = to_undo_mode(request, target.id);
 
         let mut restored_checkpoint_event = None;
 
@@ -2512,14 +2585,17 @@ impl Repo {
 
                 let checkpoint_event = self.create_checkpoint_with_lineage(
                     format!("redo-{}", original_target_id.simple()),
-                    Some(format!("redo: restore undone checkpoint {}", original_target_id)),
+                    Some(format!(
+                        "redo: restore undone checkpoint {}",
+                        original_target_id
+                    )),
                     Some(original_target_id),
                     None,
                 )?;
                 restored_checkpoint_event = Some(checkpoint_event.id);
             }
         } else if matches!(target.kind, EventKind::Checkpoint(_)) {
-            let Some(previous_checkpoint) = previous_checkpoint_before(&events, target.id) else {
+            let Some(previous_checkpoint) = previous_checkpoint_before(events, target.id) else {
                 bail!(
                     "cannot undo checkpoint {}: no earlier checkpoint exists",
                     target.id
@@ -2569,8 +2645,80 @@ impl Repo {
             bail!("cannot undo: event log is empty")
         }
 
-        let target = resolve_target_event(&events, &request)?;
-        let mode = to_undo_mode(&request, target.id);
+        match &request {
+            UndoRequest::Last | UndoRequest::N(_) => {
+                self.undo_file_by_chain_walk(&events, &request, &scoped_file, &scoped_file_display)
+            }
+            UndoRequest::To(_) | UndoRequest::Since(_) => {
+                self.undo_file_by_event_target(
+                    &events,
+                    &request,
+                    &scoped_file,
+                    &scoped_file_display,
+                )
+            }
+        }
+    }
+
+    fn undo_file_by_chain_walk(
+        &self,
+        events: &[Event],
+        request: &UndoRequest,
+        scoped_file: &Path,
+        scoped_file_display: &str,
+    ) -> Result<UndoResult> {
+        let steps = match request {
+            UndoRequest::Last => 1,
+            UndoRequest::N(n) => *n,
+            _ => unreachable!(),
+        };
+
+        let head = self
+            .latest_checkpoint()
+            .ok_or_else(|| anyhow!("cannot undo: no checkpoint exists"))?;
+
+        let ancestor = walk_checkpoint_ancestor(events, head.id, steps)?;
+
+        let EventKind::Checkpoint(ref ancestor_payload) = ancestor.kind else {
+            bail!("expected checkpoint payload");
+        };
+
+        self.restore_workspace_file_from_snapshot(ancestor_payload.snapshot_id, scoped_file)?;
+
+        let checkpoint_event = self.create_checkpoint_with_exact_lineage(
+            format!("undo-file-{}", normalize_label(scoped_file_display)),
+            Some(format!(
+                "undo file {}: restore to checkpoint {}",
+                scoped_file_display, ancestor.id
+            )),
+            ancestor_payload.parent_checkpoint_event,
+        )?;
+        let restored_checkpoint_event = Some(checkpoint_event.id);
+
+        let mode = to_undo_mode(request, head.id);
+
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id: head.id,
+            mode,
+            restored_checkpoint_event,
+            file_scope: Some(scoped_file_display.to_string()),
+        }))?;
+
+        Ok(UndoResult {
+            target_event_id: head.id,
+            restored_checkpoint_event,
+        })
+    }
+
+    fn undo_file_by_event_target(
+        &self,
+        events: &[Event],
+        request: &UndoRequest,
+        scoped_file: &Path,
+        scoped_file_display: &str,
+    ) -> Result<UndoResult> {
+        let target = resolve_target_event(events, request)?;
+        let mode = to_undo_mode(request, target.id);
 
         if !matches!(&target.kind, EventKind::Checkpoint(_)) {
             bail!(
@@ -2588,12 +2736,12 @@ impl Repo {
 
         // Check if the file actually exists in the target checkpoint before
         // looking for the previous one — give a clear error if it doesn't.
-        if !self.snapshot_contains_file(target_cp.snapshot_id, &scoped_file)? {
+        if !self.snapshot_contains_file(target_cp.snapshot_id, scoped_file)? {
             // Also check the previous checkpoint
-            let in_previous = previous_checkpoint_before(&events, target.id)
+            let in_previous = previous_checkpoint_before(events, target.id)
                 .and_then(|prev| {
                     if let EventKind::Checkpoint(cp) = prev.kind {
-                        self.snapshot_contains_file(cp.snapshot_id, &scoped_file).ok()
+                        self.snapshot_contains_file(cp.snapshot_id, scoped_file).ok()
                     } else {
                         None
                     }
@@ -2607,7 +2755,7 @@ impl Repo {
             }
         }
 
-        let Some(previous_checkpoint) = previous_checkpoint_before(&events, target.id) else {
+        let Some(previous_checkpoint) = previous_checkpoint_before(events, target.id) else {
             bail!(
                 "cannot undo checkpoint {} for file {}: no earlier checkpoint exists",
                 target.id,
@@ -2619,10 +2767,10 @@ impl Repo {
             bail!("expected checkpoint payload")
         };
 
-        self.restore_workspace_file_from_snapshot(payload.snapshot_id, &scoped_file)?;
+        self.restore_workspace_file_from_snapshot(payload.snapshot_id, scoped_file)?;
 
         let checkpoint_event = self.create_checkpoint_with_lineage(
-            format!("undo-file-{}", normalize_label(&scoped_file_display)),
+            format!("undo-file-{}", normalize_label(scoped_file_display)),
             Some(format!(
                 "undo file {} from checkpoint {}",
                 scoped_file_display, target.id
@@ -2636,7 +2784,7 @@ impl Repo {
             target_event_id: target.id,
             mode,
             restored_checkpoint_event,
-            file_scope: Some(scoped_file_display),
+            file_scope: Some(scoped_file_display.to_string()),
         }))?;
 
         Ok(UndoResult {
@@ -4957,6 +5105,137 @@ impl Repo {
             git_commit_mapping,
             intent,
         )
+    }
+
+    /// Like `create_checkpoint_with_lineage` but the parent is used exactly as
+    /// provided — `None` remains `None` instead of being auto-filled from
+    /// `latest_checkpoint()`.  Used by undo chain-walk so the restore
+    /// checkpoint's parent accurately reflects the ancestor's predecessor.
+    fn create_checkpoint_with_exact_lineage(
+        &self,
+        label: String,
+        message: Option<String>,
+        parent_checkpoint_event: Option<Uuid>,
+    ) -> Result<Event> {
+        let git_commit_mapping = if self.repo_mode()? == RepoMode::GitColocated {
+            Some(self.commit_checkpoint_to_git(message.as_deref(), &label)?)
+        } else {
+            None
+        };
+
+        // Use a sentinel parent to prevent auto-fill: if the real parent is
+        // None we still need to go through the normal creation pipeline
+        // (snapshot, merkle root, etc.) but skip the or_else auto-fill.
+        // We achieve this by passing the explicit parent directly into the
+        // event, bypassing the auto-fill helpers.
+        let snapshot_id = Uuid::new_v4();
+
+        if self.repo_mode()? == RepoMode::Native {
+            self.create_native_snapshot(&self.root, true, snapshot_id)?;
+
+            let file_index = FileIndex::for_root(self.root());
+            let index = file_index.read(snapshot_id)?;
+            let snapshot_merkle_root = compute_native_merkle_root(&index)?;
+            let files_changed =
+                self.compute_file_changes(snapshot_id, parent_checkpoint_event);
+
+            let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
+                label,
+                message: message.clone(),
+                snapshot_id,
+                parent_checkpoint_event,
+                snapshot_merkle_root: Some(snapshot_merkle_root),
+                ai_intent: None,
+                intent_confidence: None,
+                files_changed,
+                category: None,
+                scope_label: None,
+                structured_description: None,
+                git_commit_sha: git_commit_mapping.clone(),
+            }))?;
+
+            if let Some(git_commit_sha) = git_commit_mapping {
+                self.append_event(EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Commit,
+                    success: true,
+                    detail: format!("checkpoint={} git_commit={}", event.id, git_commit_sha),
+                }))?;
+            }
+
+            self.advance_main_ref(event.id)?;
+            Ok(event)
+        } else if self.repo_mode()? == RepoMode::GitColocated && git_commit_mapping.is_some() {
+            let snapshot_merkle_root = compute_merkle_root_filtered(&self.root, true)?;
+            let files_changed = self
+                .compute_file_changes_for_virtual_snapshot(&self.root, parent_checkpoint_event);
+
+            let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
+                label,
+                message: message.clone(),
+                snapshot_id,
+                parent_checkpoint_event,
+                snapshot_merkle_root: Some(snapshot_merkle_root),
+                ai_intent: None,
+                intent_confidence: None,
+                files_changed,
+                category: None,
+                scope_label: None,
+                structured_description: None,
+                git_commit_sha: git_commit_mapping.clone(),
+            }))?;
+
+            if let Some(git_commit_sha) = git_commit_mapping {
+                self.append_event(EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Commit,
+                    success: true,
+                    detail: format!("checkpoint={} git_commit={}", event.id, git_commit_sha),
+                }))?;
+            }
+
+            self.advance_main_ref(event.id)?;
+            Ok(event)
+        } else {
+            let snapshot_path = self.snapshot_path(snapshot_id);
+            fs::create_dir_all(&snapshot_path).with_context(|| {
+                format!(
+                    "failed to create snapshot directory {}",
+                    snapshot_path.display()
+                )
+            })?;
+
+            let colocated = self.repo_mode()? == RepoMode::GitColocated;
+            copy_tree_with_mode(&self.root, &snapshot_path, true, colocated)?;
+
+            let snapshot_merkle_root = compute_snapshot_merkle_root(&snapshot_path)?;
+            let files_changed =
+                self.compute_file_changes(snapshot_id, parent_checkpoint_event);
+
+            let event = self.append_event(EventKind::Checkpoint(CheckpointEvent {
+                label,
+                message: message.clone(),
+                snapshot_id,
+                parent_checkpoint_event,
+                snapshot_merkle_root: Some(snapshot_merkle_root),
+                ai_intent: None,
+                intent_confidence: None,
+                files_changed,
+                category: None,
+                scope_label: None,
+                structured_description: None,
+                git_commit_sha: git_commit_mapping.clone(),
+            }))?;
+
+            if let Some(git_commit_sha) = git_commit_mapping {
+                self.append_event(EventKind::GitBridge(GitBridgeEvent {
+                    action: GitBridgeAction::Commit,
+                    success: true,
+                    detail: format!("checkpoint={} git_commit={}", event.id, git_commit_sha),
+                }))?;
+            }
+
+            self.advance_main_ref(event.id)?;
+            Ok(event)
+        }
     }
 
     fn create_checkpoint_from_git_commit(
@@ -10462,8 +10741,7 @@ mod tests {
 
         let file = dir.path().join("undo-lineage.ts");
         fs::write(&file, "const value = 1;").expect("write should succeed");
-        let cp1 = repo
-            .create_checkpoint(Some("cp1".to_string()))
+        repo.create_checkpoint(Some("cp1".to_string()))
             .expect("checkpoint should succeed");
 
         fs::write(&file, "const value = 2;").expect("write should succeed");
@@ -10484,7 +10762,10 @@ mod tests {
             panic!("restored event should be checkpoint");
         };
 
-        assert_eq!(restored_payload.parent_checkpoint_event, Some(cp1.id));
+        // The restore checkpoint's parent is cp1's own parent (None), since
+        // the restore checkpoint has cp1's content and the chain should
+        // continue from cp1's predecessor.
+        assert_eq!(restored_payload.parent_checkpoint_event, None);
     }
 
     #[test]
@@ -10525,6 +10806,113 @@ mod tests {
             replayed.latest_checkpoint_event_id,
             result.restored_checkpoint_event
         );
+    }
+
+    #[test]
+    fn repeated_undo_walks_checkpoint_chain() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("chain.ts");
+        fs::write(&file, "v1").expect("write");
+        repo.create_checkpoint(Some("cp1".to_string())).expect("cp1");
+
+        fs::write(&file, "v2").expect("write");
+        repo.create_checkpoint(Some("cp2".to_string())).expect("cp2");
+
+        fs::write(&file, "v3").expect("write");
+        repo.create_checkpoint(Some("cp3".to_string())).expect("cp3");
+
+        // First undo: v3 -> v2
+        repo.undo(UndoRequest::Last).expect("undo 1");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v2");
+
+        // Second undo: v2 -> v1 (NOT back to v3)
+        repo.undo(UndoRequest::Last).expect("undo 2");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
+    }
+
+    #[test]
+    fn undo_n_walks_n_steps_up_chain() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("jump.ts");
+        fs::write(&file, "v1").expect("write");
+        repo.create_checkpoint(Some("cp1".to_string())).expect("cp1");
+
+        fs::write(&file, "v2").expect("write");
+        repo.create_checkpoint(Some("cp2".to_string())).expect("cp2");
+
+        fs::write(&file, "v3").expect("write");
+        repo.create_checkpoint(Some("cp3".to_string())).expect("cp3");
+
+        // undo --n 2: v3 -> v1
+        repo.undo(UndoRequest::N(2)).expect("undo n=2");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
+    }
+
+    #[test]
+    fn undo_past_beginning_of_chain_errors() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("shallow.ts");
+        fs::write(&file, "v1").expect("write");
+        repo.create_checkpoint(Some("cp1".to_string())).expect("cp1");
+
+        fs::write(&file, "v2").expect("write");
+        repo.create_checkpoint(Some("cp2".to_string())).expect("cp2");
+
+        // Trying to undo 3 steps with only 2 checkpoints should error
+        let err = repo.undo(UndoRequest::N(3)).unwrap_err();
+        assert!(
+            err.to_string().contains("checkpoint(s) exist before HEAD"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn undo_after_undo_chain_is_correct_parent() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let file = dir.path().join("lineage.ts");
+        fs::write(&file, "v1").expect("write");
+        let cp1 = repo.create_checkpoint(Some("cp1".to_string())).expect("cp1");
+
+        fs::write(&file, "v2").expect("write");
+        repo.create_checkpoint(Some("cp2".to_string())).expect("cp2");
+
+        fs::write(&file, "v3").expect("write");
+        repo.create_checkpoint(Some("cp3".to_string())).expect("cp3");
+
+        // First undo: restores cp2's content. The restore checkpoint's parent
+        // is cp2's parent (cp1), so that a subsequent undo can walk further back.
+        let r1 = repo.undo(UndoRequest::Last).expect("undo 1");
+        let r1_cp_id = r1.restored_checkpoint_event.unwrap();
+        let events = repo.list_events().unwrap();
+        let r1_cp = events.iter().find(|e| e.id == r1_cp_id).unwrap();
+        let EventKind::Checkpoint(ref r1_payload) = r1_cp.kind else {
+            panic!("expected checkpoint");
+        };
+        assert_eq!(r1_payload.parent_checkpoint_event, Some(cp1.id));
+
+        // Second undo: restores cp1's content. The restore checkpoint's parent
+        // is cp1's parent (None), so further undo is impossible.
+        let r2 = repo.undo(UndoRequest::Last).expect("undo 2");
+        let r2_cp_id = r2.restored_checkpoint_event.unwrap();
+        let events = repo.list_events().unwrap();
+        let r2_cp = events.iter().find(|e| e.id == r2_cp_id).unwrap();
+        let EventKind::Checkpoint(ref r2_payload) = r2_cp.kind else {
+            panic!("expected checkpoint");
+        };
+        assert_eq!(r2_payload.parent_checkpoint_event, None);
     }
 
     #[test]
