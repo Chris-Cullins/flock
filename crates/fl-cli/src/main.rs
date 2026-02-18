@@ -21,7 +21,12 @@ const WORKFLOWS_MD: &str = include_str!("../../../.claude/skills/flock/WORKFLOWS
 const COLLABORATION_MD: &str = include_str!("../../../.claude/skills/flock/COLLABORATION.md");
 
 #[derive(Debug, Parser)]
-#[command(name = "fl", about = "Flock — version control for AI agents", version)]
+#[command(
+    name = "fl",
+    about = "Flock — version control for AI agents",
+    long_about = "Flock — version control for AI agents\n\nShowing common commands only. Run `fl help <command>` for any command.\nAll commands: init, commit, log, status, diff, blame, stash, explore, undo,\n  merge, review, impact, record, refs, git, workspace, push, pull, clone, fetch,\n  session, task, ready, who, directive, preview, quick-save, quick-restore,\n  confidence, presence, lock, subscribe, unsubscribe, subscriptions, gate,\n  rebase, auto-rebase, conflict, remote, roost, sparse, pin, watch,\n  editor-server, query, intel, migrate, index, materialize, migrate-event-log,\n  compact, convert, backup, key, audit, policy, install-skill, completions, fsck",
+    version,
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -29,7 +34,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    // ── Core Commands ────────────────────────────────────────────────
     /// Initialize a new Flock repository
+    
     Init {
         /// Use git-colocated mode (.git + .flock sidecar)
         #[arg(long)]
@@ -69,6 +76,7 @@ enum Command {
         description: Option<String>,
     },
     /// Show the event log
+    
     Log {
         /// Maximum number of entries to show
         #[arg(short = 'n', long)]
@@ -81,14 +89,17 @@ enum Command {
         raw: bool,
     },
     /// Verify repository integrity
+    
     Fsck,
     /// Show working directory status vs last commit
+    
     Status {
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Show semantic diff between commits or against working directory
+    
     Diff {
         /// Enable semantic diff output
         #[arg(long)]
@@ -128,6 +139,7 @@ enum Command {
         to: Option<String>,
     },
     /// Analyze impact of changes to a path or symbol
+    
     Impact {
         path: String,
         /// Output as JSON
@@ -135,6 +147,7 @@ enum Command {
         json: bool,
     },
     /// Preview semantic merge of three files
+    
     Merge {
         #[arg(long)]
         dry_run: bool,
@@ -148,6 +161,7 @@ enum Command {
         json: bool,
     },
     /// Review an exploration's changes
+    
     Review {
         id: String,
         /// Expand detail for change #n
@@ -161,11 +175,13 @@ enum Command {
         since: Option<String>,
     },
     /// Manage explorations (branching workflows)
+    
     Explore {
         #[command(subcommand)]
         command: ExploreCommand,
     },
     /// Undo events on the timeline
+    
     Undo {
         /// Undo last N events
         #[arg(long)]
@@ -184,36 +200,62 @@ enum Command {
         to_checkpoint: bool,
     },
     /// Record specific file changes to the event log (native mode)
+    
     Record {
         /// Files to record (if empty, records all changes)
         paths: Vec<String>,
     },
+    /// Show per-line attribution (who changed each line and when)
+    
+    Blame {
+        /// File path to annotate
+        path: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Temporarily stash working directory changes
+    
+    Stash {
+        #[command(subcommand)]
+        command: Option<StashCommand>,
+    },
+
+    // ── Branching & Refs ─────────────────────────────────────────────
     /// Git bridge operations (colocated mode)
+    
     Git {
         #[command(subcommand)]
         command: GitCommand,
     },
     /// Manage refs (branches, tags, workspaces)
+    
     Refs {
         #[command(subcommand)]
         command: RefsCommand,
     },
     /// Manage workspaces
+    
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+
+    // ── Agent Workflow ────────────────────────────────────────────────
     /// Agent session tracking and provenance
+    #[command(hide = true)]
     Session {
         #[command(subcommand)]
         command: SessionCommand,
     },
     /// Task graph management
+    #[command(hide = true)]
     Task {
         #[command(subcommand)]
         command: TaskCommand,
     },
     /// Show tasks ready to be claimed
+    #[command(hide = true)]
     Ready {
         /// Output as JSON
         #[arg(long)]
@@ -223,17 +265,20 @@ enum Command {
         live: bool,
     },
     /// Show active actors and what they're working on
+    #[command(hide = true)]
     Who {
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Agent directive management (pause, resume, redirect, abort)
+    #[command(hide = true)]
     Directive {
         #[command(subcommand)]
         command: DirectiveCommand,
     },
     /// Stream workspace diffs for ghost text preview
+    #[command(hide = true)]
     Preview {
         /// Workspace name
         #[arg(long)]
@@ -249,6 +294,7 @@ enum Command {
         json: bool,
     },
     /// Quick commit for agents
+    #[command(hide = true)]
     QuickSave {
         #[arg(long)]
         tag: Option<String>,
@@ -257,18 +303,34 @@ enum Command {
         show_diff: bool,
     },
     /// Restore to last quick-save
+    #[command(hide = true)]
     QuickRestore,
+    /// Show session confidence score
+    #[command(hide = true)]
+    Confidence {
+        /// Show detailed factor breakdown
+        #[arg(long)]
+        verbose: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    // ── Collaboration ────────────────────────────────────────────────
     /// Multi-agent presence tracking
+    #[command(hide = true)]
     Presence {
         #[command(subcommand)]
         command: PresenceCommand,
     },
     /// Advisory resource locking
+    #[command(hide = true)]
     Lock {
         #[command(subcommand)]
         command: LockCommand,
     },
     /// Subscribe to changes on paths, symbols, or modules
+    #[command(hide = true)]
     Subscribe {
         #[arg(long)]
         path: Vec<String>,
@@ -281,66 +343,49 @@ enum Command {
         notify: Option<String>,
     },
     /// Cancel a subscription
+    #[command(hide = true)]
     Unsubscribe {
         id: String,
     },
     /// List active subscriptions
+    #[command(hide = true)]
     Subscriptions {
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Human-in-the-loop quality gates
+    #[command(hide = true)]
     Gate {
         #[command(subcommand)]
         command: GateCommand,
     },
     /// Rebase a workspace onto the latest checkpoint
+    #[command(hide = true)]
     Rebase {
         /// Workspace to rebase
         #[arg(long)]
         workspace: String,
     },
     /// Auto-rebase all workspaces with auto_rebase enabled
+    #[command(hide = true)]
     AutoRebase,
     /// Conflict resolution workflow
+    #[command(hide = true)]
     Conflict {
         #[command(subcommand)]
         command: ConflictCommand,
     },
-    /// Migrate repository storage backend
-    Migrate {
-        /// Migrate to native block-level storage
-        #[arg(long)]
-        native: bool,
-    },
-    /// Rebuild or clear the semantic index (AST cache + dependency graph)
-    Index {
-        /// Clear all cached semantic data instead of rebuilding
-        #[arg(long)]
-        clear: bool,
-    },
-    /// Materialize replay state for faster future operations
-    Materialize,
-    /// Migrate event log to segmented format
-    MigrateEventLog,
-    /// Compact the event log by archiving old events
-    Compact {
-        /// Archive events older than this duration (e.g. 180d, 30d, 1y)
-        #[arg(long, default_value = "180d")]
-        older_than: String,
-    },
-    /// Convert a repository to/from Flock format
-    Convert {
-        #[command(subcommand)]
-        command: ConvertCommand,
-    },
+
+    // ── Remote ───────────────────────────────────────────────────────
     /// Manage remote authentication
+    #[command(hide = true)]
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
     },
     /// Manage roosts (Flock remotes)
+    #[command(hide = true)]
     Roost {
         #[command(subcommand)]
         command: RoostCommand,
@@ -379,12 +424,8 @@ enum Command {
         #[arg(long)]
         lazy: bool,
     },
-    /// Manage sparse checkout patterns
-    Sparse {
-        #[command(subcommand)]
-        command: SparseCommand,
-    },
     /// Fetch additional history or resolve missing blocks
+    #[command(hide = true)]
     Fetch {
         /// Extend shallow history by N additional checkpoints
         #[arg(long)]
@@ -396,24 +437,8 @@ enum Command {
         #[arg(long)]
         roost: Option<String>,
     },
-    /// Pin files for offline access (eagerly fetch blocks)
-    Pin {
-        /// Glob pattern to pin (e.g. "src/**")
-        pattern: Option<String>,
-        /// Pin all files (convert to full clone)
-        #[arg(long)]
-        all: bool,
-        /// List pinned patterns
-        #[arg(long)]
-        list: bool,
-        /// Remove a pin pattern
-        #[arg(long)]
-        unpin: Option<String>,
-        /// Roost name (defaults to "origin")
-        #[arg(long)]
-        roost: Option<String>,
-    },
     /// Stream live events from a remote via WebSocket
+    #[command(hide = true)]
     Watch {
         /// Roost name (defaults to "origin")
         #[arg(long)]
@@ -434,13 +459,74 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    // ── Admin ────────────────────────────────────────────────────────
+    /// Migrate repository storage backend
+    #[command(hide = true)]
+    Migrate {
+        /// Migrate to native block-level storage
+        #[arg(long)]
+        native: bool,
+    },
+    /// Rebuild or clear the semantic index (AST cache + dependency graph)
+    #[command(hide = true)]
+    Index {
+        /// Clear all cached semantic data instead of rebuilding
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Materialize replay state for faster future operations
+    #[command(hide = true)]
+    Materialize,
+    /// Migrate event log to segmented format
+    #[command(hide = true)]
+    MigrateEventLog,
+    /// Compact the event log by archiving old events
+    #[command(hide = true)]
+    Compact {
+        /// Archive events older than this duration (e.g. 180d, 30d, 1y)
+        #[arg(long, default_value = "180d")]
+        older_than: String,
+    },
+    /// Convert a repository to/from Flock format
+    #[command(hide = true)]
+    Convert {
+        #[command(subcommand)]
+        command: ConvertCommand,
+    },
+    /// Manage sparse checkout patterns
+    #[command(hide = true)]
+    Sparse {
+        #[command(subcommand)]
+        command: SparseCommand,
+    },
+    /// Pin files for offline access (eagerly fetch blocks)
+    #[command(hide = true)]
+    Pin {
+        /// Glob pattern to pin (e.g. "src/**")
+        pattern: Option<String>,
+        /// Pin all files (convert to full clone)
+        #[arg(long)]
+        all: bool,
+        /// List pinned patterns
+        #[arg(long)]
+        list: bool,
+        /// Remove a pin pattern
+        #[arg(long)]
+        unpin: Option<String>,
+        /// Roost name (defaults to "origin")
+        #[arg(long)]
+        roost: Option<String>,
+    },
     /// Start editor plugin protocol server (JSON-lines over stdin/stdout)
+    #[command(hide = true)]
     EditorServer {
         /// Roost name for WebSocket connection (defaults to "origin")
         #[arg(long)]
         remote: Option<String>,
     },
     /// Search event history using natural language
+    #[command(hide = true)]
     Query {
         /// Search text
         text: String,
@@ -455,42 +541,38 @@ enum Command {
         json: bool,
     },
     /// Manage the intelligence search index
-    #[command(name = "intel")]
+    #[command(name = "intel", hide = true)]
     Intel {
         #[command(subcommand)]
         command: IntelCommand,
     },
-    /// Show session confidence score
-    Confidence {
-        /// Show detailed factor breakdown
-        #[arg(long)]
-        verbose: bool,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Backup and restore .flock data
+    #[command(hide = true)]
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
     },
     /// Manage signing key encryption
+    #[command(hide = true)]
     Key {
         #[command(subcommand)]
         command: KeyCommand,
     },
     /// Audit the event log for security anomalies
+    #[command(hide = true)]
     Audit {
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Agent governance policy management
+    #[command(hide = true)]
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
     },
     /// Install the Flock skill for Claude Code
+    #[command(hide = true)]
     InstallSkill {
         /// Install to ~/.claude/skills/ (default)
         #[arg(long)]
@@ -503,6 +585,7 @@ enum Command {
         dir: Option<String>,
     },
     /// Generate shell completions for bash, zsh, fish, or powershell
+    #[command(hide = true)]
     Completions {
         /// Shell to generate completions for
         shell: Shell,
@@ -666,9 +749,34 @@ enum ExploreCommand {
     Prune {
         #[arg(long, default_value = "0s")]
         older_than: String,
+        /// Skip confirmation prompt and prune immediately
+        #[arg(long)]
+        force: bool,
     },
     /// Show visual exploration tree grouped by base checkpoint
     Tree,
+}
+
+#[derive(Debug, Subcommand)]
+enum StashCommand {
+    /// Save working directory changes and revert to last commit
+    Push {
+        /// Optional description for the stash entry
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+    },
+    /// Restore the most recent stash (or a specific one)
+    Pop {
+        /// Stash index to restore (default: 0, the most recent)
+        index: Option<usize>,
+    },
+    /// List all stash entries
+    List,
+    /// Remove a stash entry without applying it
+    Drop {
+        /// Stash index to drop (default: 0, the most recent)
+        index: Option<usize>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1999,10 +2107,19 @@ fn main() -> Result<()> {
                         return Ok(());
                     }
 
-                    for exploration in explorations {
+                    for exploration in &explorations {
+                        let age = format_nanos_age(&exploration.updated_at);
+                        let status_colored = match exploration.status {
+                            ExplorationStatus::Active => "active".green().to_string(),
+                            ExplorationStatus::Promoted => "promoted".blue().to_string(),
+                            ExplorationStatus::Abandoned => "abandoned".red().to_string(),
+                        };
                         println!(
-                            "{}  {}  {}",
-                            exploration.id, exploration.status, exploration.title
+                            "{}  {}  {}  ({})",
+                            &exploration.id.to_string()[..8],
+                            status_colored,
+                            exploration.title,
+                            age.dimmed(),
                         );
                     }
                 }
@@ -2048,8 +2165,38 @@ fn main() -> Result<()> {
                         print_semantic_file_diff(diff, false);
                     }
                 }
-                ExploreCommand::Prune { older_than } => {
+                ExploreCommand::Prune { older_than, force } => {
                     let duration = parse_duration_spec(&older_than)?;
+
+                    if !force {
+                        // Preview what would be pruned
+                        let candidates = repo.prune_candidates(duration)?;
+                        if candidates.is_empty() {
+                            println!("No abandoned explorations match the criteria.");
+                            return Ok(());
+                        }
+                        println!(
+                            "{} The following {} abandoned exploration{} will be pruned:",
+                            "warning:".yellow().bold(),
+                            candidates.len(),
+                            if candidates.len() == 1 { "" } else { "s" }
+                        );
+                        for exp in &candidates {
+                            let age = format_nanos_age(&exp.updated_at);
+                            println!(
+                                "  {}  {} (abandoned {})",
+                                &exp.id.to_string()[..8],
+                                exp.title,
+                                age,
+                            );
+                        }
+                        println!(
+                            "\nUse {} to proceed.",
+                            "--force".bold()
+                        );
+                        return Ok(());
+                    }
+
                     let pruned = repo.prune_explorations(duration)?;
                     println!(
                         "pruned {} abandoned exploration{}",
@@ -2098,6 +2245,94 @@ fn main() -> Result<()> {
                 println!("no changes to record");
             } else {
                 println!("recorded {} file change(s)", count);
+            }
+        }
+        Command::Blame { path, json } => {
+            let repo = Repo::discover(cwd)?;
+            let annotations = repo.blame(&path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!(
+                    annotations.iter().map(|a| serde_json::json!({
+                        "line_number": a.line_number,
+                        "content": a.content,
+                        "commit_id": a.commit_id.map(|id| id.to_string()),
+                        "author": a.author,
+                        "timestamp": a.timestamp,
+                        "message": a.message,
+                    })).collect::<Vec<_>>()
+                ))?);
+            } else {
+                if annotations.is_empty() {
+                    println!("{}", "File has no history (not committed yet).".dimmed());
+                    return Ok(());
+                }
+                for ann in &annotations {
+                    let commit_short = ann.commit_id
+                        .map(|id| id.to_string()[..8].to_string())
+                        .unwrap_or_else(|| "--------".to_string());
+                    let author = ann.author.as_deref().unwrap_or("unknown");
+                    let ts = ann.timestamp.as_deref()
+                        .map(|t| format_timestamp(t))
+                        .unwrap_or_else(|| "          ".to_string());
+                    // Truncate author to 12 chars for alignment
+                    let author_display = if author.len() > 12 {
+                        &author[..12]
+                    } else {
+                        author
+                    };
+                    println!(
+                        "{} {} {:>12} {:>4} | {}",
+                        commit_short.yellow(),
+                        ts.dimmed(),
+                        author_display.cyan(),
+                        ann.line_number,
+                        ann.content
+                    );
+                }
+            }
+        }
+        Command::Stash { command } => {
+            let repo = Repo::discover(cwd)?;
+            let stash_cmd = command.unwrap_or(StashCommand::Push { message: None });
+            match stash_cmd {
+                StashCommand::Push { message } => {
+                    repo.snapshot_working_directory()?;
+                    let st = repo.status()?;
+                    let total = st.new_files.len() + st.modified_files.len() + st.deleted_files.len();
+                    if st.checkpoint_id.is_some() && total == 0 {
+                        println!("{}", "No changes to stash.".dimmed());
+                        return Ok(());
+                    }
+                    let index = repo.stash_push(message)?;
+                    println!("Saved working directory to stash@{{{}}}", index);
+                }
+                StashCommand::Pop { index } => {
+                    let idx = index.unwrap_or(0);
+                    repo.stash_pop(idx)?;
+                    println!("Restored stash@{{{}}} and removed it from the stash list", idx);
+                }
+                StashCommand::List => {
+                    let entries = repo.stash_list()?;
+                    if entries.is_empty() {
+                        println!("{}", "No stash entries.".dimmed());
+                        return Ok(());
+                    }
+                    for (i, entry) in entries.iter().enumerate() {
+                        let msg = entry.message.as_deref().unwrap_or("(no message)");
+                        let ts = format_timestamp(&entry.timestamp);
+                        println!(
+                            "stash@{{{}}}  {}  {}",
+                            i,
+                            ts.dimmed(),
+                            msg,
+                        );
+                    }
+                }
+                StashCommand::Drop { index } => {
+                    let idx = index.unwrap_or(0);
+                    repo.stash_drop(idx)?;
+                    println!("Dropped stash@{{{}}}", idx);
+                }
             }
         }
         Command::Git { command } => {
@@ -4231,6 +4466,28 @@ fn format_timestamp(ts: &str) -> String {
         tm.tm_min,
         tm.tm_sec,
     )
+}
+
+/// Format a nanosecond-epoch timestamp string as a human-readable relative age.
+fn format_nanos_age(ts: &str) -> String {
+    let nanos: u128 = match ts.parse() {
+        Ok(n) => n,
+        Err(_) => return "unknown".to_string(),
+    };
+    let now_nanos: u128 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let age_secs = now_nanos.saturating_sub(nanos) / 1_000_000_000;
+    if age_secs < 60 {
+        format!("{}s ago", age_secs)
+    } else if age_secs < 3600 {
+        format!("{}m ago", age_secs / 60)
+    } else if age_secs < 86400 {
+        format!("{}h ago", age_secs / 3600)
+    } else {
+        format!("{}d ago", age_secs / 86400)
+    }
 }
 
 /// Classify an EventKind into a short type label for filtering.

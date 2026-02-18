@@ -94,6 +94,25 @@ pub struct CheckpointIntentMetadata {
     pub structured_description: Option<String>,
 }
 
+/// Per-line blame attribution.
+#[derive(Debug, Clone)]
+pub struct BlameAnnotation {
+    pub line_number: usize,
+    pub content: String,
+    pub commit_id: Option<Uuid>,
+    pub author: Option<String>,
+    pub timestamp: Option<String>,
+    pub message: Option<String>,
+}
+
+/// A stash entry preserving working directory state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StashEntry {
+    pub snapshot_id: Uuid,
+    pub message: Option<String>,
+    pub timestamp: String,
+}
+
 /// Report from `fl who` combining presence, sessions, and tasks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoReport {
@@ -1920,6 +1939,357 @@ impl Repo {
         }
 
         Ok(pruned)
+    }
+
+    /// Return explorations that *would* be pruned (dry-run preview).
+    pub fn prune_candidates(&self, max_age: std::time::Duration) -> Result<Vec<ExplorationSummary>> {
+        self.assert_initialized()?;
+
+        let now_nanos: u128 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before unix epoch")?
+            .as_nanos();
+
+        let explorations = self.list_explorations()?;
+        let mut candidates = Vec::new();
+
+        for exploration in explorations {
+            if exploration.status != ExplorationStatus::Abandoned {
+                continue;
+            }
+            let updated_nanos: u128 = exploration.updated_at.parse().unwrap_or(0);
+            let age_nanos = now_nanos.saturating_sub(updated_nanos);
+            if age_nanos >= max_age.as_nanos() {
+                candidates.push(exploration);
+            }
+        }
+
+        Ok(candidates)
+    }
+
+    // ── Blame ────────────────────────────────────────────────────────
+
+    /// Annotate each line of a file with the commit that last changed it.
+    pub fn blame(&self, path: &str) -> Result<Vec<BlameAnnotation>> {
+        self.assert_initialized()?;
+
+        // Collect all checkpoint events in order.
+        let events = self.list_events()?;
+        let mut checkpoints: Vec<(Uuid, &str, Option<&str>, Uuid)> = Vec::new();
+        for event in &events {
+            if let EventKind::Checkpoint(ref cp) = event.kind {
+                checkpoints.push((
+                    event.id,
+                    // We'll access actor/timestamp from the event directly
+                    // store event index for later
+                    &event.actor,
+                    Some(event.timestamp.as_str()),
+                    cp.snapshot_id,
+                ));
+            }
+        }
+
+        if checkpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Walk checkpoints in reverse to build attribution.
+        // For each checkpoint, load the file content. If the file changed
+        // compared to the next checkpoint's version, attribute changed lines.
+        // Read the file at the latest checkpoint.
+        let (_latest_id, _latest_actor, _latest_ts, latest_snap) = checkpoints.last().unwrap();
+        let latest_root = self.ensure_snapshot_available(*latest_snap)?;
+        let latest_file = latest_root.join(path);
+        if !latest_file.exists() {
+            // File doesn't exist in latest checkpoint - try working directory
+            let working_file = self.root().join(path);
+            if !working_file.exists() {
+                bail!("file {} not found in latest commit or working directory", path);
+            }
+            // File only exists in working dir, not committed yet
+            let content = fs::read_to_string(&working_file)
+                .with_context(|| format!("failed to read {}", path))?;
+            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            return Ok(lines.iter().enumerate().map(|(i, line)| BlameAnnotation {
+                line_number: i + 1,
+                content: line.clone(),
+                commit_id: None,
+                author: None,
+                timestamp: None,
+                message: Some("uncommitted".to_string()),
+            }).collect());
+        }
+
+        let content = fs::read_to_string(&latest_file)
+            .with_context(|| format!("failed to read {} from snapshot", path))?;
+        let current_lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        let mut annotations: Vec<Option<(Uuid, String, String, Option<String>)>> = vec![None; current_lines.len()];
+
+        // Walk checkpoints in reverse: for each pair (older, newer), find lines
+        // that changed and attribute them to the newer checkpoint.
+        for i in (0..checkpoints.len()).rev() {
+            let (cp_id, cp_actor, cp_ts, cp_snap) = &checkpoints[i];
+
+            // Get message from events
+            let cp_message = events.iter().find(|e| e.id == *cp_id).and_then(|e| {
+                if let EventKind::Checkpoint(ref cp) = e.kind {
+                    cp.message.clone()
+                } else {
+                    None
+                }
+            });
+
+            let cp_root = self.ensure_snapshot_available(*cp_snap)?;
+            let cp_file = cp_root.join(path);
+
+            let cp_lines: Vec<String> = if cp_file.exists() {
+                fs::read_to_string(&cp_file)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|l| l.to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // Get previous checkpoint's file content
+            let prev_lines: Vec<String> = if i > 0 {
+                let (_, _, _, prev_snap) = &checkpoints[i - 1];
+                let prev_root = self.ensure_snapshot_available(*prev_snap)?;
+                let prev_file = prev_root.join(path);
+                if prev_file.exists() {
+                    fs::read_to_string(&prev_file)
+                        .unwrap_or_default()
+                        .lines()
+                        .map(|l| l.to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                // First checkpoint - all lines are new
+                Vec::new()
+            };
+
+            // For lines present in current version that match this checkpoint's
+            // version but differ from previous: attribute to this checkpoint.
+            for (line_idx, line) in current_lines.iter().enumerate() {
+                if annotations[line_idx].is_some() {
+                    continue; // Already attributed
+                }
+
+                // Check if this line exists in this checkpoint's file
+                let in_this = cp_lines.iter().any(|l| l == line);
+                let in_prev = prev_lines.iter().any(|l| l == line);
+
+                if in_this && !in_prev {
+                    annotations[line_idx] = Some((
+                        *cp_id,
+                        cp_actor.to_string(),
+                        cp_ts.unwrap_or("").to_string(),
+                        cp_message.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Any remaining unattributed lines: attribute to the first checkpoint
+        // that contains them.
+        if let Some((first_id, first_actor, first_ts, _)) = checkpoints.first() {
+            let first_msg = events.iter().find(|e| e.id == *first_id).and_then(|e| {
+                if let EventKind::Checkpoint(ref cp) = e.kind {
+                    cp.message.clone()
+                } else {
+                    None
+                }
+            });
+            for ann in annotations.iter_mut() {
+                if ann.is_none() {
+                    *ann = Some((
+                        *first_id,
+                        first_actor.to_string(),
+                        first_ts.unwrap_or("").to_string(),
+                        first_msg.clone(),
+                    ));
+                }
+            }
+        }
+
+        Ok(current_lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let (commit_id, author, timestamp, message) = annotations[i]
+                    .clone()
+                    .unwrap_or_default();
+                BlameAnnotation {
+                    line_number: i + 1,
+                    content: line.clone(),
+                    commit_id: if commit_id == Uuid::nil() { None } else { Some(commit_id) },
+                    author: if author.is_empty() { None } else { Some(author) },
+                    timestamp: if timestamp.is_empty() { None } else { Some(timestamp) },
+                    message,
+                }
+            })
+            .collect())
+    }
+
+    // ── Stash ────────────────────────────────────────────────────────
+
+    /// Save working directory changes to a stash entry and revert to last commit.
+    pub fn stash_push(&self, message: Option<String>) -> Result<usize> {
+        self.assert_initialized()?;
+
+        // Create a snapshot of the current working directory state
+        let snapshot_id = Uuid::new_v4();
+        let snapshot_dir = self.stash_dir();
+        fs::create_dir_all(&snapshot_dir)?;
+
+        // Read the stash list
+        let mut entries = self.stash_read_entries()?;
+        let index = entries.len();
+
+        // Snapshot the working directory into a stash-specific location
+        let stash_snap_dir = snapshot_dir.join(snapshot_id.to_string());
+        fs::create_dir_all(&stash_snap_dir)?;
+
+        let colocated = self.repo_mode()? == RepoMode::GitColocated;
+        let (files, _) = collect_all_files_with_mode(self.root(), true, colocated)?;
+        for file in &files {
+            let src = self.root().join(file);
+            let dst = stash_snap_dir.join(file);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&src, &dst)?;
+        }
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_nanos()
+            .to_string();
+
+        entries.push(StashEntry {
+            snapshot_id,
+            message,
+            timestamp: ts,
+        });
+
+        self.stash_write_entries(&entries)?;
+
+        // Restore working directory to last checkpoint
+        let checkpoint = self.latest_checkpoint();
+        if let Some(cp) = checkpoint {
+            let EventKind::Checkpoint(payload) = cp.kind else {
+                bail!("unexpected event kind for latest checkpoint");
+            };
+            let snap_root = self.ensure_snapshot_available(payload.snapshot_id)?;
+            self.restore_working_directory(&snap_root)?;
+        }
+
+        Ok(index)
+    }
+
+    /// Restore a stash entry and remove it from the list.
+    pub fn stash_pop(&self, index: usize) -> Result<()> {
+        self.assert_initialized()?;
+
+        let mut entries = self.stash_read_entries()?;
+        if index >= entries.len() {
+            bail!("stash@{{{}}} does not exist (only {} entries)", index, entries.len());
+        }
+
+        let entry = entries.remove(index);
+        let stash_snap_dir = self.stash_dir().join(entry.snapshot_id.to_string());
+
+        if !stash_snap_dir.exists() {
+            bail!("stash snapshot {} is missing", entry.snapshot_id);
+        }
+
+        // Restore the stashed files to working directory
+        self.restore_working_directory(&stash_snap_dir)?;
+
+        // Clean up the stash snapshot
+        fs::remove_dir_all(&stash_snap_dir)?;
+        self.stash_write_entries(&entries)?;
+
+        Ok(())
+    }
+
+    /// List all stash entries.
+    pub fn stash_list(&self) -> Result<Vec<StashEntry>> {
+        self.assert_initialized()?;
+        self.stash_read_entries()
+    }
+
+    /// Remove a stash entry without applying it.
+    pub fn stash_drop(&self, index: usize) -> Result<()> {
+        self.assert_initialized()?;
+
+        let mut entries = self.stash_read_entries()?;
+        if index >= entries.len() {
+            bail!("stash@{{{}}} does not exist (only {} entries)", index, entries.len());
+        }
+
+        let entry = entries.remove(index);
+        let stash_snap_dir = self.stash_dir().join(entry.snapshot_id.to_string());
+        if stash_snap_dir.exists() {
+            fs::remove_dir_all(&stash_snap_dir)?;
+        }
+        self.stash_write_entries(&entries)?;
+
+        Ok(())
+    }
+
+    fn stash_dir(&self) -> PathBuf {
+        self.flock_dir().join("stash")
+    }
+
+    fn stash_read_entries(&self) -> Result<Vec<StashEntry>> {
+        let path = self.stash_dir().join("stash.json");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&path)?;
+        let entries: Vec<StashEntry> = serde_json::from_str(&content)
+            .context("failed to parse stash.json")?;
+        Ok(entries)
+    }
+
+    fn stash_write_entries(&self, entries: &[StashEntry]) -> Result<()> {
+        let dir = self.stash_dir();
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("stash.json");
+        let content = serde_json::to_string_pretty(entries)?;
+        fs::write(&path, content)?;
+        Ok(())
+    }
+
+    /// Restore working directory from a snapshot directory.
+    fn restore_working_directory(&self, snapshot_root: &Path) -> Result<()> {
+        let colocated = self.repo_mode()? == RepoMode::GitColocated;
+        let (current_files, _) = collect_all_files_with_mode(self.root(), true, colocated)?;
+        let (snap_files, _) = collect_all_files_with_mode(snapshot_root, false, false)?;
+
+        // Delete files not in snapshot
+        for file in &current_files {
+            if !snap_files.contains(file) {
+                let path = self.root().join(file);
+                fs::remove_file(&path).ok();
+            }
+        }
+
+        // Copy/overwrite files from snapshot
+        for file in &snap_files {
+            let src = snapshot_root.join(file);
+            let dst = self.root().join(file);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&src, &dst)?;
+        }
+
+        Ok(())
     }
 
     // ── Session methods ───────────────────────────────────────────────
