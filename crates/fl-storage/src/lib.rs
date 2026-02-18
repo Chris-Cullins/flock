@@ -32,6 +32,7 @@ pub use event::{
     ResourceUsageEvent, SessionAction, SessionEvent, SubscriptionAction, SubscriptionEvent,
     SubscriptionFilter, TaskAction, TaskEvent, UndoEvent, UndoMode, PolicyEvent,
     PolicyVerdictKind, EscalationContextEvent, DirectiveEvent, DirectiveKind,
+    FileWriteEvent, FileDeleteEvent, FileRenameEvent,
     compute_event_hash, event_signing_payload,
 };
 pub use event_log::EventLog;

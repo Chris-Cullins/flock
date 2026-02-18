@@ -391,6 +391,9 @@ pub fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::Intelligence(_) => "Intelligence",
         EventKind::Policy(_) => "Policy",
         EventKind::Directive(_) => "Directive",
+        EventKind::FileWrite(_) => "FileWrite",
+        EventKind::FileDelete(_) => "FileDelete",
+        EventKind::FileRename(_) => "FileRename",
     }
 }
 

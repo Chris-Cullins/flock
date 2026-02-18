@@ -7,4 +7,5 @@ pub use fl_storage::{
     RemoteSyncEvent, ResourceUsageEvent, SessionAction, SessionEvent, SubscriptionAction,
     SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent, UndoMode,
     PolicyEvent, PolicyVerdictKind, DirectiveEvent, DirectiveKind,
+    FileWriteEvent, FileDeleteEvent, FileRenameEvent,
 };

@@ -160,6 +160,9 @@ fn event_kind_label(kind: &EventKind) -> &'static str {
         EventKind::Intelligence(_) => "Intelligence",
         EventKind::Policy(_) => "Policy",
         EventKind::Directive(_) => "Directive",
+        EventKind::FileWrite(_) => "FileWrite",
+        EventKind::FileDelete(_) => "FileDelete",
+        EventKind::FileRename(_) => "FileRename",
     }
 }
 

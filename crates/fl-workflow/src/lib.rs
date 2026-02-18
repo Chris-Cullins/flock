@@ -10,8 +10,8 @@ use fl_collab::{
     SubscriptionStatus, SubscriptionSummary,
 };
 use fl_storage::{
-    ApiCallRecord, ConflictAction, DecisionAction, Event, EventKind, ExplorationAction, GateAction,
-    GateCondition, GatePolicy, LockAction, NotifyConfig, PresenceAction, SessionAction,
+    ApiCallRecord, BlockRef, ConflictAction, DecisionAction, Event, EventKind, ExplorationAction,
+    GateAction, GateCondition, GatePolicy, LockAction, NotifyConfig, PresenceAction, SessionAction,
     SubscriptionAction, TaskAction, UndoMode,
 };
 use uuid::Uuid;
@@ -221,6 +221,15 @@ pub struct PolicyDecisionRecord {
     pub timestamp: String,
 }
 
+/// Per-file state tracked from FileWrite/FileDelete/FileRename events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileState {
+    pub event_id: Uuid,
+    pub content_hash: String,
+    pub blocks: Vec<BlockRef>,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayedState {
     pub latest_checkpoint_event_id: Option<Uuid>,
@@ -243,6 +252,8 @@ pub struct ReplayedState {
     pub policy_rate_limits: BTreeMap<Uuid, PolicyRateLimitTracker>,
     #[serde(default)]
     pub policy_decisions: Vec<PolicyDecisionRecord>,
+    #[serde(default)]
+    pub file_states: BTreeMap<String, FileState>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -263,6 +274,7 @@ struct ReplayAccumulator {
     policy_budgets: BTreeMap<Uuid, PolicyBudgetTracker>,
     policy_rate_limits: BTreeMap<Uuid, PolicyRateLimitTracker>,
     policy_decisions: Vec<PolicyDecisionRecord>,
+    file_states: BTreeMap<String, FileState>,
 }
 
 impl From<ReplayedState> for ReplayAccumulator {
@@ -284,6 +296,7 @@ impl From<ReplayedState> for ReplayAccumulator {
             policy_budgets: state.policy_budgets,
             policy_rate_limits: state.policy_rate_limits,
             policy_decisions: state.policy_decisions,
+            file_states: state.file_states,
         }
     }
 }
@@ -321,6 +334,7 @@ impl ReplayAccumulator {
             policy_budgets: self.policy_budgets,
             policy_rate_limits: self.policy_rate_limits,
             policy_decisions: self.policy_decisions,
+            file_states: self.file_states,
         }
     }
 
@@ -477,6 +491,32 @@ impl ReplayAccumulator {
             EventKind::Hook(_) => {}
             EventKind::RemoteSync(_) => {}
             EventKind::Intelligence(_) => {}
+            EventKind::FileWrite(fw) => {
+                self.file_states.insert(
+                    fw.path.clone(),
+                    FileState {
+                        event_id: event.id,
+                        content_hash: fw.content_hash.clone(),
+                        blocks: fw.blocks.clone(),
+                        size: fw.size,
+                    },
+                );
+            }
+            EventKind::FileDelete(fd) => {
+                self.file_states.remove(&fd.path);
+            }
+            EventKind::FileRename(fr) => {
+                self.file_states.remove(&fr.old_path);
+                self.file_states.insert(
+                    fr.new_path.clone(),
+                    FileState {
+                        event_id: event.id,
+                        content_hash: fr.content_hash.clone(),
+                        blocks: fr.blocks.clone(),
+                        size: fr.size,
+                    },
+                );
+            }
             EventKind::Policy(policy) => {
                 let verdict_str = match policy.verdict {
                     fl_storage::PolicyVerdictKind::Allow => "Allow",

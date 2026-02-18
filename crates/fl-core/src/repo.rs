@@ -21,11 +21,11 @@ use walkdir::WalkDir;
 
 use crate::event::{
     CheckpointEvent, ConflictAction, ConflictResolutionEvent, DecisionAction, DecisionEvent, Event,
-    EventKind, ExplorationAction, ExplorationEvent, FileChangeKind, FileChangeSummary, GateAction,
-    GateCondition, GateEvent, GatePolicy, GitBridgeAction, GitBridgeEvent, LockAction, LockEvent,
-    NotifyConfig, PresenceAction, PresenceEvent, RebaseEvent, ResourceUsageEvent, SessionAction,
-    SessionEvent, SubscriptionAction, SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent,
-    UndoEvent, UndoMode,
+    EventKind, ExplorationAction, ExplorationEvent, FileChangeKind, FileChangeSummary,
+    FileDeleteEvent, FileWriteEvent, GateAction, GateCondition, GateEvent, GatePolicy,
+    GitBridgeAction, GitBridgeEvent, LockAction, LockEvent, NotifyConfig, PresenceAction,
+    PresenceEvent, RebaseEvent, ResourceUsageEvent, SessionAction, SessionEvent, SubscriptionAction,
+    SubscriptionEvent, SubscriptionFilter, TaskAction, TaskEvent, UndoEvent, UndoMode,
 };
 use fl_collab::can_acquire_lock;
 use fl_storage::ApiCallRecord;
@@ -46,9 +46,9 @@ pub use fl_collab::{
 };
 pub use fl_workflow::parse_duration_spec;
 pub use fl_workflow::{
-    DecisionSummary, ExplorationStatus, ExplorationSummary, ReplayedState, ResourceUsageTotals,
-    SessionStatus, SessionSummary, TaskEdge, TaskGraph, TaskRelation, TaskStatus, TaskSummary,
-    UndoRequest, UndoResult,
+    DecisionSummary, ExplorationStatus, ExplorationSummary, FileState, ReplayedState,
+    ResourceUsageTotals, SessionStatus, SessionSummary, TaskEdge, TaskGraph, TaskRelation,
+    TaskStatus, TaskSummary, UndoRequest, UndoResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,6 +790,9 @@ impl Repo {
                 EventKind::Policy(_) => {}
                 EventKind::Directive(_) => {}
                 EventKind::Init(_) => {}
+                EventKind::FileWrite(_) => {}
+                EventKind::FileDelete(_) => {}
+                EventKind::FileRename(_) => {}
             }
         }
 
@@ -2482,6 +2485,16 @@ impl Repo {
     }
 
     pub fn undo(&self, request: UndoRequest) -> Result<UndoResult> {
+        self.undo_inner(request, false)
+    }
+
+    /// Undo to the previous checkpoint boundary (coarse granularity),
+    /// bypassing file-level undo even in native mode.
+    pub fn undo_to_checkpoint(&self, request: UndoRequest) -> Result<UndoResult> {
+        self.undo_inner(request, true)
+    }
+
+    fn undo_inner(&self, request: UndoRequest, force_checkpoint: bool) -> Result<UndoResult> {
         self.assert_initialized()?;
 
         // Enforce rate limit policy (undos per exploration).
@@ -2492,6 +2505,38 @@ impl Repo {
         let events = self.list_events()?;
         if events.is_empty() {
             bail!("cannot undo: event log is empty")
+        }
+
+        // In native mode, use file-level undo if the most recent undoable events
+        // (after the latest checkpoint) are file events. If the last meaningful event
+        // is a checkpoint, fall through to checkpoint-level undo.
+        if !force_checkpoint && self.repo_mode().unwrap_or(RepoMode::GitCompatible) == RepoMode::Native {
+            // Find the index of the latest checkpoint
+            let latest_checkpoint_idx = events.iter().rposition(|e| {
+                matches!(e.kind, EventKind::Checkpoint(_))
+            });
+
+            // Check if there are file events AFTER the latest checkpoint
+            let has_trailing_file_events = if let Some(cp_idx) = latest_checkpoint_idx {
+                events[cp_idx + 1..].iter().any(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::FileWrite(_) | EventKind::FileDelete(_) | EventKind::FileRename(_)
+                    )
+                })
+            } else {
+                // No checkpoint at all — check if there are any file events
+                events.iter().any(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::FileWrite(_) | EventKind::FileDelete(_) | EventKind::FileRename(_)
+                    )
+                })
+            };
+
+            if has_trailing_file_events {
+                return self.undo_file_events(&events, &request);
+            }
         }
 
         match &request {
@@ -2627,6 +2672,215 @@ impl Repo {
         Ok(UndoResult {
             target_event_id: target.id,
             restored_checkpoint_event,
+        })
+    }
+
+    /// O(1) undo of file-level events (FileWrite/FileDelete/FileRename).
+    /// Reverts only the affected file(s), not the whole workspace.
+    fn undo_file_events(
+        &self,
+        events: &[Event],
+        request: &UndoRequest,
+    ) -> Result<UndoResult> {
+        // Collect file events in order
+        let file_events: Vec<&Event> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::FileWrite(_) | EventKind::FileDelete(_) | EventKind::FileRename(_)
+                )
+            })
+            .collect();
+
+        if file_events.is_empty() {
+            bail!("cannot undo: no file events found");
+        }
+
+        let count = match request {
+            UndoRequest::Last => 1,
+            UndoRequest::N(n) => *n,
+            UndoRequest::Since(duration) => {
+                let cutoff = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .checked_sub(*duration)
+                    .unwrap_or_default();
+                let cutoff_nanos = cutoff.as_nanos();
+                file_events
+                    .iter()
+                    .rev()
+                    .take_while(|e| {
+                        e.timestamp
+                            .parse::<u128>()
+                            .map(|t| t > cutoff_nanos)
+                            .unwrap_or(false)
+                    })
+                    .count()
+            }
+            UndoRequest::To(id_prefix) => {
+                // Find the target event and undo everything after it
+                let target_idx = file_events
+                    .iter()
+                    .position(|e| e.id.to_string().starts_with(id_prefix.as_str()))
+                    .ok_or_else(|| anyhow!("file event with prefix {} not found", id_prefix))?;
+                file_events.len() - target_idx - 1
+            }
+        };
+
+        if count == 0 {
+            bail!("no file events to undo");
+        }
+
+        // Build event-by-id lookup
+        let events_by_id: HashMap<Uuid, &Event> =
+            events.iter().map(|e| (e.id, e)).collect();
+
+        // Undo the last N file events in reverse order
+        let to_undo: Vec<&Event> = file_events
+            .iter()
+            .rev()
+            .take(count)
+            .copied()
+            .collect();
+
+        let first_target = to_undo
+            .first()
+            .ok_or_else(|| anyhow!("no file events to undo"))?;
+        let target_event_id = first_target.id;
+
+        for file_event in &to_undo {
+            match &file_event.kind {
+                EventKind::FileWrite(fw) => {
+                    if let Some(prev_id) = fw.previous_file_event {
+                        // Restore previous version
+                        if let Some(prev_event) = events_by_id.get(&prev_id) {
+                            match &prev_event.kind {
+                                EventKind::FileWrite(prev_fw) => {
+                                    self.restore_file_from_blocks(&fw.path, &prev_fw.blocks)?;
+                                    // Emit counterbalancing FileWrite
+                                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                                        path: fw.path.clone(),
+                                        content_hash: prev_fw.content_hash.clone(),
+                                        blocks: prev_fw.blocks.clone(),
+                                        size: prev_fw.size,
+                                        previous_file_event: Some(file_event.id),
+                                    }))?;
+                                }
+                                EventKind::FileRename(prev_fr) => {
+                                    self.restore_file_from_blocks(&fw.path, &prev_fr.blocks)?;
+                                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                                        path: fw.path.clone(),
+                                        content_hash: prev_fr.content_hash.clone(),
+                                        blocks: prev_fr.blocks.clone(),
+                                        size: prev_fr.size,
+                                        previous_file_event: Some(file_event.id),
+                                    }))?;
+                                }
+                                _ => {
+                                    bail!(
+                                        "previous file event {} is not a FileWrite or FileRename",
+                                        prev_id
+                                    );
+                                }
+                            }
+                        } else {
+                            bail!("previous file event {} not found", prev_id);
+                        }
+                    } else {
+                        // No previous event — file was newly added, delete it
+                        let target = self.root.join(&fw.path);
+                        if target.exists() {
+                            fs::remove_file(&target).with_context(|| {
+                                format!("failed to delete {}", target.display())
+                            })?;
+                        }
+                        self.append_event(EventKind::FileDelete(FileDeleteEvent {
+                            path: fw.path.clone(),
+                            previous_file_event: Some(file_event.id),
+                        }))?;
+                    }
+                }
+                EventKind::FileDelete(fd) => {
+                    // Restore the deleted file from its previous event
+                    if let Some(prev_id) = fd.previous_file_event {
+                        if let Some(prev_event) = events_by_id.get(&prev_id) {
+                            match &prev_event.kind {
+                                EventKind::FileWrite(prev_fw) => {
+                                    self.restore_file_from_blocks(&fd.path, &prev_fw.blocks)?;
+                                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                                        path: fd.path.clone(),
+                                        content_hash: prev_fw.content_hash.clone(),
+                                        blocks: prev_fw.blocks.clone(),
+                                        size: prev_fw.size,
+                                        previous_file_event: Some(file_event.id),
+                                    }))?;
+                                }
+                                EventKind::FileRename(prev_fr) => {
+                                    self.restore_file_from_blocks(&fd.path, &prev_fr.blocks)?;
+                                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                                        path: fd.path.clone(),
+                                        content_hash: prev_fr.content_hash.clone(),
+                                        blocks: prev_fr.blocks.clone(),
+                                        size: prev_fr.size,
+                                        previous_file_event: Some(file_event.id),
+                                    }))?;
+                                }
+                                _ => {
+                                    bail!(
+                                        "previous file event {} is not a FileWrite or FileRename",
+                                        prev_id
+                                    );
+                                }
+                            }
+                        } else {
+                            bail!("previous file event {} not found", prev_id);
+                        }
+                    } else {
+                        bail!("cannot undo file delete: no previous file event recorded");
+                    }
+                }
+                EventKind::FileRename(fr) => {
+                    // Rename back
+                    let new_loc = self.root.join(&fr.new_path);
+                    let old_loc = self.root.join(&fr.old_path);
+                    if new_loc.exists() {
+                        if let Some(parent) = old_loc.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::rename(&new_loc, &old_loc).with_context(|| {
+                            format!("failed to rename {} back to {}", fr.new_path, fr.old_path)
+                        })?;
+                    }
+                    // Emit counterbalancing FileWrite at the old path
+                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                        path: fr.old_path.clone(),
+                        content_hash: fr.content_hash.clone(),
+                        blocks: fr.blocks.clone(),
+                        size: fr.size,
+                        previous_file_event: Some(file_event.id),
+                    }))?;
+                    // Delete the new path entry
+                    self.append_event(EventKind::FileDelete(FileDeleteEvent {
+                        path: fr.new_path.clone(),
+                        previous_file_event: Some(file_event.id),
+                    }))?;
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // Emit a single Undo event referencing the first target
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id: target_event_id,
+            mode: to_undo_mode(request, target_event_id),
+            restored_checkpoint_event: None,
+            file_scope: Some(format!("{} file event(s)", to_undo.len())),
+        }))?;
+
+        Ok(UndoResult {
+            target_event_id,
+            restored_checkpoint_event: None,
         })
     }
 
@@ -5278,8 +5532,32 @@ impl Repo {
         let snapshot_id = Uuid::new_v4();
 
         if self.repo_mode()? == RepoMode::Native {
-            // Native mode: store file contents as blocks, no directory copy
-            self.create_native_snapshot(source_root, apply_skip, snapshot_id)?;
+            // Native mode: ensure working directory is captured as file events first
+            self.snapshot_working_directory()?;
+
+            // Try to build SnapshotIndex from file_states (O(1) — blocks already stored)
+            let state = self.replay_state()?;
+            if !state.file_states.is_empty() {
+                let file_index = FileIndex::for_root(self.root());
+                file_index.ensure_exists()?;
+
+                let mut index = SnapshotIndex::new(snapshot_id);
+                for (path, fs) in &state.file_states {
+                    index.insert(
+                        path.clone(),
+                        FileEntry {
+                            blocks: fs.blocks.clone(),
+                            size: fs.size,
+                            file_hash: fs.content_hash.clone(),
+                        },
+                    );
+                }
+                file_index.write(&index)?;
+            } else {
+                // Fallback: no file_states yet, do a full scan
+                self.create_native_snapshot(source_root, apply_skip, snapshot_id)?;
+            }
+
             self.create_checkpoint_event_with_native_merkle(
                 snapshot_id,
                 label,
@@ -5626,6 +5904,161 @@ impl Repo {
 
         self.advance_main_ref(event.id)?;
         Ok(event)
+    }
+
+    /// Snapshot the working directory, emitting FileWrite/FileDelete events
+    /// for any changes since the last snapshot. Native mode only.
+    ///
+    /// Returns the number of file events emitted.
+    pub fn snapshot_working_directory(&self) -> Result<usize> {
+        self.assert_initialized()?;
+
+        if self.repo_mode()? != RepoMode::Native {
+            return Ok(0);
+        }
+
+        let store = ContentStore::for_root(self.root());
+        store.ensure_exists()?;
+        let chunk_config = ChunkConfig::default();
+
+        // Load mtime cache for fast skip
+        let mtime_cache_path = self.root.join(FLOCK_DIR).join("cache").join("snapshot-mtimes.json");
+        let mtime_cache: HashMap<String, u128> = if mtime_cache_path.is_file() {
+            let raw = fs::read_to_string(&mtime_cache_path).unwrap_or_default();
+            serde_json::from_str(&raw).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        // Replay to get current file_states
+        let state = self.replay_state()?;
+        let mut current_file_states = state.file_states;
+
+        // Walk working directory
+        let colocated = false; // Native mode is never colocated
+        let file_paths: Vec<PathBuf> = build_repo_walker(&self.root, colocated)
+            .build()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+            .map(|e| e.into_path())
+            .collect();
+
+        let mut events_emitted = 0usize;
+        let mut new_mtime_cache: HashMap<String, u128> = HashMap::new();
+
+        // Check each file on disk
+        for path in &file_paths {
+            let rel_path = path
+                .strip_prefix(&self.root)
+                .context("failed to compute relative path for snapshot")?;
+            let rel_key = rel_path_to_key(rel_path);
+
+            // Mtime-based skip: if file mtime hasn't changed since last snapshot
+            // and we already have it in file_states, skip expensive hashing.
+            let file_mtime = fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos());
+
+            if let (Some(mtime), Some(cached_mtime)) = (file_mtime, mtime_cache.get(&rel_key)) {
+                if mtime == *cached_mtime && current_file_states.contains_key(&rel_key) {
+                    // File unchanged — skip
+                    new_mtime_cache.insert(rel_key.clone(), mtime);
+                    current_file_states.remove(&rel_key);
+                    continue;
+                }
+            }
+
+            let contents = fs::read(path).with_context(|| {
+                format!("failed to read {} for snapshot", path.display())
+            })?;
+            let file_hash = blake3::hash(&contents).to_hex().to_string();
+
+            // Record mtime for future cache
+            if let Some(mtime) = file_mtime {
+                new_mtime_cache.insert(rel_key.clone(), mtime);
+            }
+
+            // Check if unchanged by hash
+            if let Some(existing) = current_file_states.get(&rel_key) {
+                if existing.content_hash == file_hash {
+                    current_file_states.remove(&rel_key);
+                    continue;
+                }
+            }
+
+            // File is new or modified — chunk, store, and emit FileWrite
+            let chunks = chunk_data(&contents, &chunk_config);
+            let mut block_refs = Vec::with_capacity(chunks.len());
+            for chunk in &chunks {
+                let chunk_bytes = &contents[chunk.offset..chunk.offset + chunk.length];
+                let hash = store.put(chunk_bytes)?;
+                block_refs.push(BlockRef {
+                    hash,
+                    offset: chunk.offset,
+                    length: chunk.length,
+                });
+            }
+
+            let previous_file_event = current_file_states
+                .get(&rel_key)
+                .map(|fs| fs.event_id);
+
+            current_file_states.remove(&rel_key);
+
+            self.append_event(EventKind::FileWrite(FileWriteEvent {
+                path: rel_key,
+                content_hash: file_hash,
+                blocks: block_refs,
+                size: contents.len() as u64,
+                previous_file_event,
+            }))?;
+
+            events_emitted += 1;
+        }
+
+        // Remaining entries in current_file_states are files that were deleted
+        for (path, file_state) in &current_file_states {
+            self.append_event(EventKind::FileDelete(FileDeleteEvent {
+                path: path.clone(),
+                previous_file_event: Some(file_state.event_id),
+            }))?;
+            events_emitted += 1;
+        }
+
+        // Save mtime cache
+        if let Some(parent) = mtime_cache_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string(&new_mtime_cache) {
+            let _ = fs::write(&mtime_cache_path, json);
+        }
+
+        Ok(events_emitted)
+    }
+
+    /// Restore a single file from its content blocks.
+    pub fn restore_file_from_blocks(&self, rel_path: &str, blocks: &[BlockRef]) -> Result<()> {
+        let store = ContentStore::for_root(self.root());
+        let target = self.root.join(rel_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create directory {}", parent.display())
+            })?;
+        }
+
+        let mut contents = Vec::new();
+        for block_ref in blocks {
+            let block_data = store.get(&block_ref.hash)?;
+            contents.extend_from_slice(&block_data);
+        }
+
+        fs::write(&target, &contents).with_context(|| {
+            format!("failed to write {}", target.display())
+        })?;
+
+        Ok(())
     }
 
     /// Store a snapshot using the native block-level content store.
@@ -7863,10 +8296,20 @@ impl Repo {
         use crate::remote::transport_for_url;
 
         // Build a temporary transport to the host for authentication.
+        // Parse host:port if a port is included.
+        let (parsed_host, parsed_port) = if let Some(idx) = host.rfind(':') {
+            if let Ok(p) = host[idx + 1..].parse::<u16>() {
+                (host[..idx].to_string(), Some(p))
+            } else {
+                (host.to_string(), None)
+            }
+        } else {
+            (host.to_string(), None)
+        };
         let url = fl_storage::RemoteUrl {
             scheme: fl_storage::RemoteScheme::Flock,
-            host: Some(host.to_string()),
-            port: None,
+            host: Some(parsed_host),
+            port: parsed_port,
             path: String::new(),
         };
         let transport = transport_for_url(&url, None)?;
@@ -7925,10 +8368,20 @@ impl Repo {
         let pub_key_hex = hex::encode(verifying_key.as_bytes());
 
         // Build transport.
+        // Parse host:port if a port is included.
+        let (parsed_host, parsed_port) = if let Some(idx) = host.rfind(':') {
+            if let Ok(p) = host[idx + 1..].parse::<u16>() {
+                (host[..idx].to_string(), Some(p))
+            } else {
+                (host.to_string(), None)
+            }
+        } else {
+            (host.to_string(), None)
+        };
         let url = fl_storage::RemoteUrl {
             scheme: fl_storage::RemoteScheme::Flock,
-            host: Some(host.to_string()),
-            port: None,
+            host: Some(parsed_host),
+            port: parsed_port,
             path: String::new(),
         };
         let transport = transport_for_url(&url, None)?;

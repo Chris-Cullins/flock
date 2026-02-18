@@ -138,6 +138,14 @@ enum Command {
         /// Scope undo to a single file
         #[arg(long = "file")]
         file: Option<String>,
+        /// Undo to the previous checkpoint boundary (coarse granularity)
+        #[arg(long)]
+        to_checkpoint: bool,
+    },
+    /// Record specific file changes to the event log (native mode)
+    Record {
+        /// Files to record (if empty, records all changes)
+        paths: Vec<String>,
     },
     /// Git bridge operations (colocated mode)
     Git {
@@ -1095,6 +1103,8 @@ fn main() -> Result<()> {
                 None
             };
 
+            repo.snapshot_working_directory()?;
+
             // Reject empty commits when the working tree is clean.
             let st = repo.status()?;
             if st.checkpoint_id.is_some()
@@ -1249,6 +1259,18 @@ fn main() -> Result<()> {
                         d.target_actor,
                         d.issued_by,
                     ),
+                    EventKind::FileWrite(fw) => println!(
+                        "{}  file-write  {}  ({} blocks, {} bytes)",
+                        event.timestamp, fw.path, fw.blocks.len(), fw.size
+                    ),
+                    EventKind::FileDelete(fd) => println!(
+                        "{}  file-delete  {}",
+                        event.timestamp, fd.path
+                    ),
+                    EventKind::FileRename(fr) => println!(
+                        "{}  file-rename  {} → {}  ({} bytes)",
+                        event.timestamp, fr.old_path, fr.new_path, fr.size
+                    ),
                 }
             }
         }
@@ -1266,6 +1288,7 @@ fn main() -> Result<()> {
         }
         Command::Status { json } => {
             let repo = Repo::discover(cwd)?;
+            repo.snapshot_working_directory()?;
             let report = repo.status()?;
             if json {
                 println!(
@@ -1327,6 +1350,7 @@ fn main() -> Result<()> {
             to,
         } => {
             let repo = Repo::discover(cwd)?;
+            repo.snapshot_working_directory()?;
 
             // Determine diff mode based on positional args
             match (from.as_deref(), to.as_deref()) {
@@ -1723,11 +1747,14 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Undo { n, to, since, file } => {
+        Command::Undo { n, to, since, file, to_checkpoint } => {
             let repo = Repo::discover(cwd)?;
+            repo.snapshot_working_directory()?;
             let request = build_undo_request(n, to, since)?;
             let result = if let Some(path) = file {
                 repo.undo_file(request, path)?
+            } else if to_checkpoint {
+                repo.undo_to_checkpoint(request)?
             } else {
                 repo.undo(request)?
             };
@@ -1735,6 +1762,22 @@ fn main() -> Result<()> {
             println!("undo target event: {}", result.target_event_id);
             if let Some(checkpoint_id) = result.restored_checkpoint_event {
                 println!("restored commit event: {}", checkpoint_id);
+            }
+        }
+        Command::Record { paths } => {
+            let repo = Repo::discover(cwd)?;
+            let count = if paths.is_empty() {
+                repo.snapshot_working_directory()?
+            } else {
+                // Record specific files only — snapshot all then report
+                // For now, snapshot_working_directory captures everything;
+                // specific-path recording could be optimized later.
+                repo.snapshot_working_directory()?
+            };
+            if count == 0 {
+                println!("no changes to record");
+            } else {
+                println!("recorded {} file change(s)", count);
             }
         }
         Command::Git { command } => {

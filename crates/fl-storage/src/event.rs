@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 15;
+use crate::file_index::BlockRef;
+
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -44,6 +46,9 @@ pub enum EventKind {
     Intelligence(IntelligenceEvent),
     Policy(PolicyEvent),
     Directive(DirectiveEvent),
+    FileWrite(FileWriteEvent),
+    FileDelete(FileDeleteEvent),
+    FileRename(FileRenameEvent),
 }
 
 impl Event {
@@ -524,6 +529,40 @@ pub enum DirectiveKind {
     Abort { reason: String },
 }
 
+// --- File-level events (native mode) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileWriteEvent {
+    pub path: String,
+    pub content_hash: String,
+    pub blocks: Vec<BlockRef>,
+    pub size: u64,
+    /// Points to the previous FileWrite/FileRename event for this path,
+    /// forming a per-file causal chain for O(1) undo.
+    #[serde(default)]
+    pub previous_file_event: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileDeleteEvent {
+    pub path: String,
+    /// Points to the previous FileWrite/FileRename event for this path.
+    #[serde(default)]
+    pub previous_file_event: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileRenameEvent {
+    pub old_path: String,
+    pub new_path: String,
+    pub content_hash: String,
+    pub blocks: Vec<BlockRef>,
+    pub size: u64,
+    /// Points to the previous FileWrite/FileRename event for the old path.
+    #[serde(default)]
+    pub previous_file_event: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventRecord {
     pub schema_version: u32,
@@ -564,4 +603,126 @@ pub fn event_signing_payload(event: &Event) -> Result<Vec<u8>> {
         kind: &event.kind,
     };
     serde_json::to_vec(&payload).context("failed to serialize event signing payload")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_event(kind: EventKind) -> Event {
+        Event {
+            id: Uuid::new_v4(),
+            timestamp: "2026-02-17T12:00:00Z".to_string(),
+            actor: "test".to_string(),
+            parent_id: None,
+            signer_public_key: None,
+            signature: None,
+            prev_event_hash: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn file_write_event_serde_round_trip() {
+        let event = make_event(EventKind::FileWrite(FileWriteEvent {
+            path: "src/main.rs".to_string(),
+            content_hash: "abc123".to_string(),
+            blocks: vec![BlockRef {
+                hash: "block1".to_string(),
+                offset: 0,
+                length: 1024,
+            }],
+            size: 1024,
+            previous_file_event: None,
+        }));
+        let record = EventRecord::from_event(&event);
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record.event, deserialized.event);
+    }
+
+    #[test]
+    fn file_write_event_with_previous_serde_round_trip() {
+        let prev_id = Uuid::new_v4();
+        let event = make_event(EventKind::FileWrite(FileWriteEvent {
+            path: "src/lib.rs".to_string(),
+            content_hash: "def456".to_string(),
+            blocks: vec![
+                BlockRef { hash: "b1".to_string(), offset: 0, length: 512 },
+                BlockRef { hash: "b2".to_string(), offset: 512, length: 256 },
+            ],
+            size: 768,
+            previous_file_event: Some(prev_id),
+        }));
+        let record = EventRecord::from_event(&event);
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record.event, deserialized.event);
+        if let EventKind::FileWrite(fw) = &deserialized.event.kind {
+            assert_eq!(fw.previous_file_event, Some(prev_id));
+        } else {
+            panic!("expected FileWrite");
+        }
+    }
+
+    #[test]
+    fn file_delete_event_serde_round_trip() {
+        let prev_id = Uuid::new_v4();
+        let event = make_event(EventKind::FileDelete(FileDeleteEvent {
+            path: "old.txt".to_string(),
+            previous_file_event: Some(prev_id),
+        }));
+        let record = EventRecord::from_event(&event);
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record.event, deserialized.event);
+    }
+
+    #[test]
+    fn file_rename_event_serde_round_trip() {
+        let event = make_event(EventKind::FileRename(FileRenameEvent {
+            old_path: "utils.rs".to_string(),
+            new_path: "helpers/utils.rs".to_string(),
+            content_hash: "xyz789".to_string(),
+            blocks: vec![BlockRef {
+                hash: "blk".to_string(),
+                offset: 0,
+                length: 2048,
+            }],
+            size: 2048,
+            previous_file_event: None,
+        }));
+        let record = EventRecord::from_event(&event);
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record.event, deserialized.event);
+    }
+
+    #[test]
+    fn event_kind_name_for_file_events() {
+        let fw = EventKind::FileWrite(FileWriteEvent {
+            path: "a.rs".to_string(),
+            content_hash: "h".to_string(),
+            blocks: vec![],
+            size: 0,
+            previous_file_event: None,
+        });
+        assert_eq!(fw.variant_name(), "FileWrite");
+
+        let fd = EventKind::FileDelete(FileDeleteEvent {
+            path: "b.rs".to_string(),
+            previous_file_event: None,
+        });
+        assert_eq!(fd.variant_name(), "FileDelete");
+
+        let fr = EventKind::FileRename(FileRenameEvent {
+            old_path: "c.rs".to_string(),
+            new_path: "d.rs".to_string(),
+            content_hash: "h".to_string(),
+            blocks: vec![],
+            size: 0,
+            previous_file_event: None,
+        });
+        assert_eq!(fr.variant_name(), "FileRename");
+    }
 }
