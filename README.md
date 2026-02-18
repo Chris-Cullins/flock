@@ -20,6 +20,8 @@
 
 ---
 
+# WARNING: This is a W.I.P. VCS System. Obviously use at your own risk until I move it to a 1.0 and it's ready. Here be dragons.
+
 Git was built for humans emailing patches. Flock is built for 10 AI agents refactoring your codebase at 3 AM.
 
 Flock preserves git's brilliant foundations &mdash; content-addressable storage, Merkle trees, distributed operation &mdash; while rethinking everything else for high-frequency, multi-agent, semantically-aware development.
