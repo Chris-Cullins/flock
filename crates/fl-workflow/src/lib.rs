@@ -607,7 +607,7 @@ impl ReplayAccumulator {
                 if let Some(entry) = self.sessions.get_mut(&decision.session_id) {
                     entry.decisions.push(DecisionSummary {
                         exploration_id: decision.exploration_id,
-                        action: decision.action,
+                        action: decision.action.clone(),
                         reason: decision.reason.clone(),
                         confidence: decision.confidence,
                         timestamp: event.timestamp.clone(),

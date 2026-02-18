@@ -209,10 +209,11 @@ pub struct DecisionEvent {
 
 impl Eq for DecisionEvent {}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DecisionAction {
     Kept,
     Discarded,
+    Custom(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

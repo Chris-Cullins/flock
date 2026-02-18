@@ -740,8 +740,9 @@ enum SessionCommand {
     Decision {
         session_id: String,
         exploration_id: String,
+        /// Action taken: kept, discarded, or any freeform string
         #[arg(long)]
-        action: DecisionActionArg,
+        action: String,
         #[arg(long)]
         reason: String,
         #[arg(long, default_value = "0.9")]
@@ -1042,20 +1043,6 @@ enum GatePolicyArg {
     QueueAndContinue,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
-enum DecisionActionArg {
-    Kept,
-    Discarded,
-}
-
-impl From<DecisionActionArg> for DecisionAction {
-    fn from(value: DecisionActionArg) -> Self {
-        match value {
-            DecisionActionArg::Kept => DecisionAction::Kept,
-            DecisionActionArg::Discarded => DecisionAction::Discarded,
-        }
-    }
-}
 
 #[derive(Debug, Clone, ValueEnum)]
 enum RefKindArg {
@@ -2134,16 +2121,34 @@ fn main() -> Result<()> {
                     max_events,
                 } => {
                     if max_snapshots.is_none() && max_events.is_none() {
-                        bail!("specify at least one of --max-snapshots or --max-events");
-                    }
-                    let ws = repo.set_workspace_limits(&name, max_snapshots, max_events)?;
-                    let config = ws.workspace.as_ref().unwrap();
-                    println!("workspace {} limits updated:", ws.name);
-                    if let Some(max) = config.max_snapshots {
-                        println!("  max-snapshots: {}", max);
-                    }
-                    if let Some(max) = config.max_events {
-                        println!("  max-events: {}", max);
+                        // No flags: show current limits
+                        let info = repo.workspace_info(&name)?;
+                        let config = info.workspace.workspace.as_ref().unwrap();
+                        println!("workspace {} limits:", info.workspace.name);
+                        println!(
+                            "  max-snapshots: {}",
+                            config
+                                .max_snapshots
+                                .map(|m| m.to_string())
+                                .unwrap_or_else(|| "unlimited".to_string())
+                        );
+                        println!(
+                            "  max-events: {}",
+                            config
+                                .max_events
+                                .map(|m| m.to_string())
+                                .unwrap_or_else(|| "unlimited".to_string())
+                        );
+                    } else {
+                        let ws = repo.set_workspace_limits(&name, max_snapshots, max_events)?;
+                        let config = ws.workspace.as_ref().unwrap();
+                        println!("workspace {} limits updated:", ws.name);
+                        if let Some(max) = config.max_snapshots {
+                            println!("  max-snapshots: {}", max);
+                        }
+                        if let Some(max) = config.max_events {
+                            println!("  max-events: {}", max);
+                        }
                     }
                 }
             }
@@ -2301,7 +2306,12 @@ fn main() -> Result<()> {
                 } => {
                     let sid = parse_uuid(&session_id)?;
                     let eid = parse_uuid(&exploration_id)?;
-                    repo.record_decision(sid, eid, action.into(), reason, confidence)?;
+                    let decision_action = match action.to_lowercase().as_str() {
+                        "kept" => DecisionAction::Kept,
+                        "discarded" => DecisionAction::Discarded,
+                        _ => DecisionAction::Custom(action),
+                    };
+                    repo.record_decision(sid, eid, decision_action, reason, confidence)?;
                     println!("decision recorded for session {}", sid);
                 }
                 SessionCommand::Usage {
@@ -2338,12 +2348,16 @@ fn main() -> Result<()> {
                     println!("resource usage recorded for session {}", sid);
                 }
                 SessionCommand::Complete { id, result } => {
-                    let session_id = parse_uuid(&id)?;
+                    let sessions = repo.list_sessions()?;
+                    let session_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+                    let session_id = resolve_uuid_prefix(&id, &session_ids)?;
                     let session = repo.complete_session(session_id, result)?;
                     println!("session {} completed", session.id);
                 }
                 SessionCommand::Fail { id, reason } => {
-                    let session_id = parse_uuid(&id)?;
+                    let sessions = repo.list_sessions()?;
+                    let session_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+                    let session_id = resolve_uuid_prefix(&id, &session_ids)?;
                     let session = repo.fail_session(session_id, reason)?;
                     println!("session {} failed", session.id);
                 }
@@ -2454,11 +2468,13 @@ fn main() -> Result<()> {
                 } => {
                     let deps = depends_on
                         .iter()
-                        .map(|id| parse_uuid(id))
+                        .filter(|id| !id.is_empty())
+                        .map(|id| Ok(repo.find_task_by_prefix(id)?.id))
                         .collect::<Result<Vec<_>>>()?;
                     let discovered = discovered_from
                         .as_deref()
-                        .map(parse_uuid)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| -> Result<Uuid> { Ok(repo.find_task_by_prefix(s)?.id) })
                         .transpose()?;
                     let task = repo.create_task(title, description, deps, discovered, scope)?;
                     println!("task {} created: {}", task.id, task.title);
