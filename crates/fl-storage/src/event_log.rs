@@ -66,23 +66,39 @@ impl EventLog {
         Ok(events)
     }
 
+    /// Read only the last event from the log (O(1) seek from end).
+    /// Returns `None` if the log is empty.
+    fn read_tail(&self) -> Result<Option<Event>> {
+        let content = fs::read_to_string(&self.path)
+            .with_context(|| format!("failed to read {}", self.path.display()))?;
+        let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
+        match last_line {
+            None => Ok(None),
+            Some(line) => {
+                let parsed = parse_event_line(line.trim())
+                    .context("failed to parse last event in log")?;
+                Ok(Some(parsed.event))
+            }
+        }
+    }
+
     /// Return the ID of the last event in the log, or `None` if empty.
     /// Used by `AutoEventLog` to resolve `parent_id` under the lock.
     pub fn latest_event_id(&self) -> Result<Option<Uuid>> {
-        Ok(self.read_all()?.last().map(|e| e.id))
+        Ok(self.read_tail()?.map(|e| e.id))
     }
 
     pub fn append(&self, event: &Event) -> Result<()> {
         self.ensure_exists()?;
-        let existing = self.read_all()?;
-        let expected_parent = existing.last().map(|entry| entry.id);
+        let tail = self.read_tail()?;
+        let expected_parent = tail.as_ref().map(|e| e.id);
         validate_next_parent(event, expected_parent)?;
         verify_event_signature(event, true)?;
         verify_checkpoint_merkle_root(event, true)?;
 
-        // Compute hash chain link
+        // Compute hash chain link from the tail event only
         let mut event = event.clone();
-        event.prev_event_hash = existing.last().map(|prev| compute_event_hash(prev));
+        event.prev_event_hash = tail.as_ref().map(|prev| compute_event_hash(prev));
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -104,8 +120,8 @@ impl EventLog {
         }
         self.ensure_exists()?;
 
-        let existing = self.read_all()?;
-        let mut expected_parent = existing.last().map(|e| e.id);
+        let tail = self.read_tail()?;
+        let mut expected_parent = tail.as_ref().map(|e| e.id);
 
         // Pre-validate the full batch before writing anything.
         for event in events {
@@ -122,7 +138,7 @@ impl EventLog {
             .open(&self.path)
             .with_context(|| format!("failed to open {} for batch append", self.path.display()))?;
 
-        let mut prev_hash: Option<String> = existing.last().map(|e| compute_event_hash(e));
+        let mut prev_hash: Option<String> = tail.as_ref().map(|e| compute_event_hash(e));
         for event in events {
             let mut event = event.clone();
             event.prev_event_hash = prev_hash;
@@ -148,7 +164,7 @@ impl EventLog {
         }
         self.ensure_exists()?;
 
-        let existing = self.read_all()?;
+        let tail = self.read_tail()?;
 
         // Validate internal chain of pulled events (skip first event's parent
         // check against local tail — it may diverge due to local-only events).
@@ -169,7 +185,7 @@ impl EventLog {
             .open(&self.path)
             .with_context(|| format!("failed to open {} for batch append", self.path.display()))?;
 
-        let mut prev_hash: Option<String> = existing.last().map(|e| compute_event_hash(e));
+        let mut prev_hash: Option<String> = tail.as_ref().map(|e| compute_event_hash(e));
         for event in events {
             let mut event = event.clone();
             event.prev_event_hash = prev_hash;

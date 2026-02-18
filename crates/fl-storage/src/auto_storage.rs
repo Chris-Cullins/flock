@@ -541,8 +541,8 @@ mod tests {
         let mono = RefStore::for_root(dir.path());
         mono.ensure_exists().unwrap();
 
-        // Write enough refs to exceed 64 KB threshold
-        for i in 0..500u128 {
+        // Write enough refs to exceed 64 KB threshold (compact JSON)
+        for i in 0..600u128 {
             mono.upsert(RepoRef {
                 kind: RefKind::Branch,
                 name: format!("branch-{:04}", i),
@@ -573,7 +573,7 @@ mod tests {
 
         // Verify all refs are readable
         let refs = auto_refs.read_all().unwrap();
-        assert_eq!(refs.len(), 501);
+        assert_eq!(refs.len(), 601);
     }
 
     #[test]

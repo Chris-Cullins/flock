@@ -87,7 +87,7 @@ impl SegmentedRefStore {
 
         // Write to temp file then rename for atomicity
         let tmp_path = path.with_extension("json.tmp");
-        let json = serde_json::to_string_pretty(&reference)
+        let json = serde_json::to_string(&reference)
             .context("failed to serialize ref")?;
         fs::write(&tmp_path, &json)
             .with_context(|| format!("failed to write temp ref {}", tmp_path.display()))?;

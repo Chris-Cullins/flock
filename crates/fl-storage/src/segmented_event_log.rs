@@ -396,7 +396,7 @@ impl SegmentedEventLog {
     }
 
     fn write_index(&self, index: &EventLogIndex) -> Result<()> {
-        let json = serde_json::to_string_pretty(index)
+        let json = serde_json::to_string(index)
             .context("failed to serialize event log index")?;
         // Write to temp file then rename for atomicity
         let tmp_path = self.index_path.with_extension("json.tmp");

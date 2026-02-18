@@ -1547,9 +1547,11 @@ fn score_risk(kind: SemanticChangeKind, symbol: &str) -> SemanticRisk {
             Some(
                 SymbolKind::Interface
                 | SymbolKind::TypeAlias
-                | SymbolKind::Enum
-                | SymbolKind::Export,
+                | SymbolKind::Enum,
             ) => SemanticRisk::High,
+            // Export body changes (e.g. modifying an exported component) are Medium;
+            // only removing/renaming exports is High risk.
+            Some(SymbolKind::Export) => SemanticRisk::Medium,
             Some(SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor) => {
                 SemanticRisk::Medium
             }
@@ -1772,9 +1774,23 @@ pub fn cache_root_for(root: &Path) -> PathBuf {
     root.join(".flock/semantic-cache")
 }
 
+/// Maximum file size (1 MB) for tree-sitter parsing; larger files fall back to text diff.
+const MAX_PARSE_SIZE: usize = 1_048_576;
+
+/// Tree-sitter parsing timeout in microseconds (5 seconds).
+const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
+
 fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolInfo>> {
     if source.is_empty() {
         return Ok(Vec::new());
+    }
+
+    if source.len() > MAX_PARSE_SIZE {
+        bail!(
+            "file too large for semantic analysis ({} bytes, limit {})",
+            source.len(),
+            MAX_PARSE_SIZE
+        );
     }
 
     let cache_key = blake3::hash(source).to_hex().to_string();
@@ -1800,6 +1816,7 @@ fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolIn
     }
 
     let mut parser = Parser::new();
+    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
     match language {
         SourceLanguage::JavaScript => parser
             .set_language(&tree_sitter_javascript::LANGUAGE.into())
@@ -1829,7 +1846,7 @@ fn parse_symbols(language: SourceLanguage, source: &[u8]) -> Result<Vec<SymbolIn
 
     let tree = parser
         .parse(source, None)
-        .context("tree-sitter parse returned no tree")?;
+        .context("tree-sitter parse timed out or failed")?;
 
     let root = tree.root_node();
     if root.has_error() {

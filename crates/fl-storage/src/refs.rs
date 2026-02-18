@@ -117,7 +117,7 @@ impl RefStore {
         let mut normalized: Vec<RepoRef> = refs.to_vec();
         normalized.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
 
-        let contents = serde_json::to_string_pretty(&RefRecord::new(normalized))
+        let contents = serde_json::to_string(&RefRecord::new(normalized))
             .context("failed to serialize refs record")?;
         // Write to temp file then rename for atomicity
         let tmp_path = self.path.with_extension("json.tmp");

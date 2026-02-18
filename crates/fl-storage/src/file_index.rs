@@ -110,7 +110,7 @@ impl FileIndex {
     /// Save a snapshot index to disk.
     pub fn write(&self, index: &SnapshotIndex) -> Result<()> {
         let path = self.index_path(index.snapshot_id);
-        let json = serde_json::to_string_pretty(index)
+        let json = serde_json::to_string(index)
             .context("failed to serialize snapshot index")?;
         fs::write(&path, json)
             .with_context(|| format!("failed to write index {}", path.display()))

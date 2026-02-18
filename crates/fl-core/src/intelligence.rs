@@ -383,7 +383,7 @@ impl SearchIndex {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(self)
+        let json = serde_json::to_string(self)
             .context("failed to serialize search index")?;
         fs::write(&path, json).context("failed to write search index")?;
         Ok(())

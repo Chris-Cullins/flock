@@ -117,6 +117,9 @@ enum Command {
         /// Show source body of each change (patch mode)
         #[arg(long)]
         patch: bool,
+        /// Show traditional unified text diff instead of semantic output
+        #[arg(long)]
+        text: bool,
         /// First commit ID/prefix (compare against working dir if only one given)
         #[arg(name = "FROM")]
         from: Option<String>,
@@ -695,7 +698,9 @@ enum GitCommand {
 
 #[derive(Debug, Subcommand)]
 enum RefsCommand {
+    /// List all refs (branches, tags, workspaces)
     List,
+    /// Create or update a ref to point at a target event
     Set {
         kind: RefKindArg,
         name: String,
@@ -703,6 +708,7 @@ enum RefsCommand {
         #[arg(long)]
         auto_rebase: bool,
     },
+    /// Delete a ref
     Delete {
         kind: RefKindArg,
         name: String,
@@ -711,15 +717,19 @@ enum RefsCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorkspaceCommand {
+    /// Create a new workspace
     Create {
         name: String,
         #[arg(long)]
         auto_rebase: bool,
     },
+    /// List all workspaces
     List,
+    /// Show workspace details
     Info {
         name: String,
     },
+    /// View or set workspace resource limits
     Limits {
         name: String,
         #[arg(long)]
@@ -731,6 +741,7 @@ enum WorkspaceCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Start a new agent session
     Start {
         #[arg(long)]
         task: String,
@@ -739,21 +750,25 @@ enum SessionCommand {
         #[arg(long)]
         initiator: Option<String>,
     },
+    /// List sessions
     List {
         #[arg(long)]
         active: bool,
         #[arg(long)]
         json: bool,
     },
+    /// Show session details
     Show {
         id: String,
         #[arg(long)]
         json: bool,
     },
+    /// Link a session to an exploration
     Link {
         session_id: String,
         exploration_id: String,
     },
+    /// Record a decision about an exploration
     Decision {
         session_id: String,
         exploration_id: String,
@@ -765,6 +780,7 @@ enum SessionCommand {
         #[arg(long, default_value = "0.9")]
         confidence: f64,
     },
+    /// Record resource usage for a session
     Usage {
         session_id: String,
         #[arg(long)]
@@ -774,21 +790,25 @@ enum SessionCommand {
         #[arg(long = "api-call")]
         api_call: Vec<String>,
     },
+    /// Mark a session as completed
     Complete {
         id: String,
         #[arg(long)]
         result: Option<String>,
     },
+    /// Mark a session as failed
     Fail {
         id: String,
         #[arg(long)]
         reason: String,
     },
+    /// Show provenance chain for an exploration
     Provenance {
         exploration_id: String,
         #[arg(long)]
         json: bool,
     },
+    /// Replay session events
     Replay {
         id: String,
         #[arg(long)]
@@ -868,6 +888,7 @@ enum TaskCommand {
 
 #[derive(Debug, Subcommand)]
 enum PresenceCommand {
+    /// Send a heartbeat to announce active presence
     Heartbeat {
         #[arg(long)]
         workspace: String,
@@ -881,10 +902,12 @@ enum PresenceCommand {
         #[arg(long)]
         ttl: Option<u64>,
     },
+    /// Signal departure from a workspace
     Depart {
         #[arg(long)]
         workspace: String,
     },
+    /// List active agents and their presence info
     List,
 }
 
@@ -919,12 +942,15 @@ enum DirectiveCommand {
 
 #[derive(Debug, Subcommand)]
 enum LockCommand {
+    /// Acquire a lock on a resource
     Acquire {
         resource: String,
         #[arg(long)]
         ttl: Option<u64>,
     },
+    /// List active locks
     List,
+    /// Release a held lock
     Release {
         id: String,
     },
@@ -932,6 +958,7 @@ enum LockCommand {
 
 #[derive(Debug, Subcommand)]
 enum GateCommand {
+    /// Create a new review gate
     Create {
         #[arg(long)]
         condition: GateConditionArg,
@@ -942,23 +969,28 @@ enum GateCommand {
         #[arg(long, default_value = "block")]
         policy: GatePolicyArg,
     },
+    /// List review gates
     List {
         #[arg(long)]
         json: bool,
     },
+    /// Check if a path is gated
     Check {
         path: String,
     },
+    /// Approve a gated change
     Approve {
         id: String,
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Reject a gated change
     Reject {
         id: String,
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Delete a review gate
     Delete {
         id: String,
     },
@@ -1492,11 +1524,39 @@ fn main() -> Result<()> {
             breaking_only,
             summary,
             patch,
+            text,
             from,
             to,
         } => {
             let repo = Repo::discover(cwd)?;
             repo.snapshot_working_directory()?;
+
+            // --text mode: show traditional unified diff and exit early
+            if text {
+                let text_diffs = if let Some(ref since_str) = since {
+                    if from.is_some() || to.is_some() {
+                        bail!("cannot use --since with positional FROM/TO arguments");
+                    }
+                    let duration = parse_duration_spec(since_str)?;
+                    let (event, _) = repo.find_checkpoint_before_duration(duration)?;
+                    repo.text_diff_checkpoint_vs_working(&event.id.to_string())?
+                } else {
+                    match (from.as_deref(), to.as_deref()) {
+                        (Some(from_prefix), Some(to_prefix)) => {
+                            repo.text_diff_between_checkpoints(from_prefix, to_prefix)?
+                        }
+                        (Some(checkpoint_prefix), None) => {
+                            repo.text_diff_checkpoint_vs_working(checkpoint_prefix)?
+                        }
+                        (None, None) => repo.text_diff_from_latest_checkpoint()?,
+                        (None, Some(_)) => {
+                            bail!("cannot specify TO without FROM; use `fl diff <from> <to>`");
+                        }
+                    }
+                };
+                print_unified_text_diffs(&text_diffs);
+                return Ok(());
+            }
 
             let has_filters = risk.is_some() || kind.is_some() || breaking_only;
 
@@ -4226,6 +4286,45 @@ fn compatibility_label(status: SemanticCompatibilityStatus) -> &'static str {
         SemanticCompatibilityStatus::Compatible => "compatible",
         SemanticCompatibilityStatus::PotentiallyBreaking => "potentially-breaking",
         SemanticCompatibilityStatus::Breaking => "breaking",
+    }
+}
+
+fn print_unified_text_diffs(diffs: &[fl_core::TextFileDiff]) {
+    use colored::Colorize;
+    for file_diff in diffs {
+        let patch = diffy::create_patch(&file_diff.old_content, &file_diff.new_content);
+        println!(
+            "{}",
+            format!("--- a/{}", file_diff.path).red()
+        );
+        println!(
+            "{}",
+            format!("+++ b/{}", file_diff.path).green()
+        );
+        for hunk in patch.hunks() {
+            println!(
+                "{}",
+                format!(
+                    "@@ -{},{} +{},{} @@",
+                    hunk.old_range().start(),
+                    hunk.old_range().end() - hunk.old_range().start(),
+                    hunk.new_range().start(),
+                    hunk.new_range().end() - hunk.new_range().start(),
+                )
+                .cyan()
+            );
+            for line in hunk.lines() {
+                match line {
+                    diffy::Line::Context(text) => print!(" {}", text),
+                    diffy::Line::Delete(text) => {
+                        print!("{}", format!("-{}", text).red());
+                    }
+                    diffy::Line::Insert(text) => {
+                        print!("{}", format!("+{}", text).green());
+                    }
+                }
+            }
+        }
     }
 }
 

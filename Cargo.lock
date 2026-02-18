@@ -666,6 +666,7 @@ dependencies = [
  "clap_complete",
  "colored",
  "ctrlc",
+ "diffy",
  "fl-core",
  "libc",
  "serde_json",

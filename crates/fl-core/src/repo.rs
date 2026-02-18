@@ -77,6 +77,14 @@ pub struct FileSummary {
     pub deleted: Vec<String>,
 }
 
+/// A single file's unified text diff.
+#[derive(Debug, Clone)]
+pub struct TextFileDiff {
+    pub path: String,
+    pub old_content: String,
+    pub new_content: String,
+}
+
 /// Structured intent metadata for checkpoints (commit hygiene).
 #[derive(Debug, Clone)]
 pub struct CheckpointIntentMetadata {
@@ -1356,6 +1364,86 @@ impl Repo {
             modified,
             deleted,
         })
+    }
+
+    /// Returns raw file content pairs for text diffing (latest checkpoint vs working dir).
+    pub fn text_diff_from_latest_checkpoint(&self) -> Result<Vec<TextFileDiff>> {
+        self.assert_initialized()?;
+        let checkpoint = self
+            .latest_checkpoint()
+            .ok_or_else(|| anyhow!("no checkpoint found; run `fl commit -m \"...\"` first"))?;
+        let EventKind::Checkpoint(payload) = checkpoint.kind else {
+            bail!("latest checkpoint event had unexpected kind")
+        };
+        let snapshot_root = self.ensure_snapshot_available(payload.snapshot_id)?;
+        Self::collect_text_diffs(&snapshot_root, self.root(), true)
+    }
+
+    /// Returns raw file content pairs for text diffing (checkpoint vs working dir).
+    pub fn text_diff_checkpoint_vs_working(&self, checkpoint_prefix: &str) -> Result<Vec<TextFileDiff>> {
+        self.assert_initialized()?;
+        let (_, payload) = self.find_checkpoint_by_prefix(checkpoint_prefix)?;
+        let snapshot_root = self.ensure_snapshot_available(payload.snapshot_id)?;
+        Self::collect_text_diffs(&snapshot_root, self.root(), true)
+    }
+
+    /// Returns raw file content pairs for text diffing (checkpoint to checkpoint).
+    pub fn text_diff_between_checkpoints(
+        &self,
+        from_prefix: &str,
+        to_prefix: &str,
+    ) -> Result<Vec<TextFileDiff>> {
+        self.assert_initialized()?;
+        let (_, from_payload) = self.find_checkpoint_by_prefix(from_prefix)?;
+        let (_, to_payload) = self.find_checkpoint_by_prefix(to_prefix)?;
+        let from_root = self.ensure_snapshot_available(from_payload.snapshot_id)?;
+        let to_root = self.ensure_snapshot_available(to_payload.snapshot_id)?;
+        Self::collect_text_diffs(&from_root, &to_root, false)
+    }
+
+    /// Collect file content pairs that differ between two directory roots.
+    fn collect_text_diffs(
+        old_root: &Path,
+        new_root: &Path,
+        skip_flock: bool,
+    ) -> Result<Vec<TextFileDiff>> {
+        let old_files = collect_all_repo_files(old_root, false)?;
+        let new_files = collect_all_repo_files(new_root, skip_flock)?;
+        let mut diffs = Vec::new();
+
+        for path in &new_files {
+            let old_content = if old_files.contains(path) {
+                String::from_utf8_lossy(&fs::read(old_root.join(path)).unwrap_or_default())
+                    .into_owned()
+            } else {
+                String::new()
+            };
+            let new_content =
+                String::from_utf8_lossy(&fs::read(new_root.join(path)).unwrap_or_default())
+                    .into_owned();
+            if old_content != new_content {
+                diffs.push(TextFileDiff {
+                    path: path.display().to_string(),
+                    old_content,
+                    new_content,
+                });
+            }
+        }
+
+        for path in &old_files {
+            if !new_files.contains(path) {
+                let old_content =
+                    String::from_utf8_lossy(&fs::read(old_root.join(path)).unwrap_or_default())
+                        .into_owned();
+                diffs.push(TextFileDiff {
+                    path: path.display().to_string(),
+                    old_content,
+                    new_content: String::new(),
+                });
+            }
+        }
+
+        Ok(diffs)
     }
 
     /// Computes transitive impact of a file path within the repository.
