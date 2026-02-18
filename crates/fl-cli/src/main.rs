@@ -82,6 +82,24 @@ enum Command {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Show changes since a duration ago (e.g. 1h, 2d, 1w)
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by minimum risk level (low, medium, high)
+        #[arg(long)]
+        risk: Option<String>,
+        /// Filter by change kind (added, removed, modified, renamed, moved, style_only)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Show only breaking changes
+        #[arg(long)]
+        breaking_only: bool,
+        /// One-line summary output
+        #[arg(long)]
+        summary: bool,
+        /// Show source body of each change (patch mode)
+        #[arg(long)]
+        patch: bool,
         /// First commit ID/prefix (compare against working dir if only one given)
         #[arg(name = "FROM")]
         from: Option<String>,
@@ -118,6 +136,9 @@ enum Command {
         /// Show full line-level diff
         #[arg(long)]
         full: bool,
+        /// Only show changes from checkpoints within this time window (e.g. 1h, 2d)
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Manage explorations (branching workflows)
     Explore {
@@ -211,6 +232,9 @@ enum Command {
     QuickSave {
         #[arg(long)]
         tag: Option<String>,
+        /// Show semantic diff of the saved changes
+        #[arg(long)]
+        show_diff: bool,
     },
     /// Restore to last quick-save
     QuickRestore,
@@ -1346,70 +1370,131 @@ fn main() -> Result<()> {
             semantic,
             intent,
             json,
+            since,
+            risk,
+            kind,
+            breaking_only,
+            summary,
+            patch,
             from,
             to,
         } => {
             let repo = Repo::discover(cwd)?;
             repo.snapshot_working_directory()?;
 
-            // Determine diff mode based on positional args
-            match (from.as_deref(), to.as_deref()) {
-                // fl diff <from> <to> — checkpoint-to-checkpoint diff
-                (Some(from_prefix), Some(to_prefix)) => {
-                    if intent {
-                        let groups = repo.semantic_diff_between_checkpoints_with_intents(
-                            from_prefix,
-                            to_prefix,
-                        )?;
-                        print_intent_diff(&groups, json)?;
-                    } else if semantic {
-                        let diffs =
-                            repo.semantic_diff_between_checkpoints(from_prefix, to_prefix)?;
-                        print_semantic_diffs(&diffs, json)?;
+            let has_filters = risk.is_some() || kind.is_some() || breaking_only;
+
+            // Helper closure to apply filters, summary, and patch to semantic diffs
+            let apply_post_processing =
+                |mut diffs: Vec<fl_core::SemanticFileDiff>| -> Result<()> {
+                    if has_filters {
+                        filter_diffs(&mut diffs, risk.as_deref(), kind.as_deref(), breaking_only);
+                    }
+                    if summary {
+                        print_summary_line(&diffs);
+                        return Ok(());
+                    }
+                    print_semantic_diffs_with_patch(&diffs, json, patch)?;
+                    Ok(())
+                };
+
+            // If --since is provided and no positional args, use duration-based diff
+            if let Some(ref since_str) = since {
+                if from.is_some() || to.is_some() {
+                    bail!("cannot use --since with positional FROM/TO arguments");
+                }
+                let duration = parse_duration_spec(since_str)?;
+                let (event, _) = repo.find_checkpoint_before_duration(duration)?;
+                let prefix = event.id.to_string();
+
+                if intent {
+                    let groups =
+                        repo.semantic_diff_checkpoint_vs_working_with_intents(&prefix)?;
+                    print_intent_diff(&groups, json)?;
+                } else {
+                    let diffs = repo.semantic_diff_checkpoint_vs_working(&prefix)?;
+                    if !has_filters && !summary && !patch {
+                        let file_summary =
+                            repo.file_summary_checkpoint_vs_working(&prefix)?;
+                        print_full_diff_summary(&file_summary, &diffs, json)?;
                     } else {
-                        // File-level summary + semantic changes
-                        let summary =
-                            repo.file_summary_between_checkpoints(from_prefix, to_prefix)?;
-                        let diffs =
-                            repo.semantic_diff_between_checkpoints(from_prefix, to_prefix)?;
-                        print_full_diff_summary(&summary, &diffs, json)?;
+                        apply_post_processing(diffs)?;
                     }
                 }
-                // fl diff <checkpoint> — checkpoint vs working directory
-                (Some(checkpoint_prefix), None) => {
-                    if intent {
-                        let groups = repo
-                            .semantic_diff_checkpoint_vs_working_with_intents(checkpoint_prefix)?;
-                        print_intent_diff(&groups, json)?;
-                    } else if semantic {
-                        let diffs =
-                            repo.semantic_diff_checkpoint_vs_working(checkpoint_prefix)?;
-                        print_semantic_diffs(&diffs, json)?;
-                    } else {
-                        let summary =
-                            repo.file_summary_checkpoint_vs_working(checkpoint_prefix)?;
-                        let diffs =
-                            repo.semantic_diff_checkpoint_vs_working(checkpoint_prefix)?;
-                        print_full_diff_summary(&summary, &diffs, json)?;
+            } else {
+                // Determine diff mode based on positional args
+                match (from.as_deref(), to.as_deref()) {
+                    // fl diff <from> <to> — checkpoint-to-checkpoint diff
+                    (Some(from_prefix), Some(to_prefix)) => {
+                        if intent {
+                            let groups = repo.semantic_diff_between_checkpoints_with_intents(
+                                from_prefix,
+                                to_prefix,
+                            )?;
+                            print_intent_diff(&groups, json)?;
+                        } else {
+                            let diffs = repo
+                                .semantic_diff_between_checkpoints(from_prefix, to_prefix)?;
+                            if !has_filters && !summary && !patch {
+                                let file_summary = repo
+                                    .file_summary_between_checkpoints(from_prefix, to_prefix)?;
+                                if semantic {
+                                    print_semantic_diffs_with_patch(&diffs, json, patch)?;
+                                } else {
+                                    print_full_diff_summary(&file_summary, &diffs, json)?;
+                                }
+                            } else {
+                                apply_post_processing(diffs)?;
+                            }
+                        }
                     }
-                }
-                // fl diff — latest checkpoint vs working directory
-                (None, None) => {
-                    if intent {
-                        let groups = repo.semantic_diff_with_intents()?;
-                        print_intent_diff(&groups, json)?;
-                    } else if semantic {
-                        let diffs = repo.semantic_diff_from_latest_checkpoint()?;
-                        print_semantic_diffs(&diffs, json)?;
-                    } else {
-                        // Basic diff: file-level summary + semantic changes
-                        let summary = repo.file_summary_from_latest_checkpoint()?;
-                        let diffs = repo.semantic_diff_from_latest_checkpoint()?;
-                        print_full_diff_summary(&summary, &diffs, json)?;
+                    // fl diff <checkpoint> — checkpoint vs working directory
+                    (Some(checkpoint_prefix), None) => {
+                        if intent {
+                            let groups = repo
+                                .semantic_diff_checkpoint_vs_working_with_intents(
+                                    checkpoint_prefix,
+                                )?;
+                            print_intent_diff(&groups, json)?;
+                        } else {
+                            let diffs =
+                                repo.semantic_diff_checkpoint_vs_working(checkpoint_prefix)?;
+                            if !has_filters && !summary && !patch {
+                                if semantic {
+                                    print_semantic_diffs_with_patch(&diffs, json, patch)?;
+                                } else {
+                                    let file_summary = repo
+                                        .file_summary_checkpoint_vs_working(checkpoint_prefix)?;
+                                    print_full_diff_summary(&file_summary, &diffs, json)?;
+                                }
+                            } else {
+                                apply_post_processing(diffs)?;
+                            }
+                        }
                     }
-                }
-                (None, Some(_)) => {
-                    bail!("cannot specify TO without FROM; use `fl diff <from> <to>`");
+                    // fl diff — latest checkpoint vs working directory
+                    (None, None) => {
+                        if intent {
+                            let groups = repo.semantic_diff_with_intents()?;
+                            print_intent_diff(&groups, json)?;
+                        } else {
+                            let diffs = repo.semantic_diff_from_latest_checkpoint()?;
+                            if !has_filters && !summary && !patch {
+                                if semantic {
+                                    print_semantic_diffs_with_patch(&diffs, json, patch)?;
+                                } else {
+                                    let file_summary =
+                                        repo.file_summary_from_latest_checkpoint()?;
+                                    print_full_diff_summary(&file_summary, &diffs, json)?;
+                                }
+                            } else {
+                                apply_post_processing(diffs)?;
+                            }
+                        }
+                    }
+                    (None, Some(_)) => {
+                        bail!("cannot specify TO without FROM; use `fl diff <from> <to>`");
+                    }
                 }
             }
         }
@@ -1539,10 +1624,25 @@ fn main() -> Result<()> {
                 println!("  ... ({} more lines)", line_count - 20);
             }
         }
-        Command::Review { id, expand, full } => {
+        Command::Review { id, expand, full, since } => {
             let repo = Repo::discover(cwd)?;
             let exploration_id = resolve_exploration(&id, &repo)?;
-            let summary = repo.review_exploration(exploration_id)?;
+            let mut summary = repo.review_exploration(exploration_id)?;
+
+            // If --since is provided, filter diffs to only show changes from
+            // checkpoints within the time window
+            if let Some(ref since_str) = since {
+                let duration = parse_duration_spec(since_str)?;
+                let (cutoff_event, _) = repo.find_checkpoint_before_duration(duration)?;
+                let cutoff_prefix = cutoff_event.id.to_string();
+                // Re-diff from the cutoff checkpoint vs working dir, then
+                // intersect with the exploration's file set
+                let since_diffs =
+                    repo.semantic_diff_checkpoint_vs_working(&cutoff_prefix)?;
+                let since_paths: std::collections::HashSet<_> =
+                    since_diffs.iter().map(|d| d.path.clone()).collect();
+                summary.diffs.retain(|d| since_paths.contains(&d.path));
+            }
 
             println!(
                 "Review: {} [{}]",
@@ -1769,7 +1869,7 @@ fn main() -> Result<()> {
                     }
 
                     for diff in &diffs {
-                        print_semantic_file_diff(diff);
+                        print_semantic_file_diff(diff, false);
                     }
                 }
                 ExploreCommand::Prune { older_than } => {
@@ -2759,13 +2859,27 @@ fn main() -> Result<()> {
                 ws.disconnect();
             }
         }
-        Command::QuickSave { tag } => {
+        Command::QuickSave { tag, show_diff } => {
             let repo = Repo::discover(cwd)?;
             let event = repo.quick_save(tag)?;
+            let event_id = event.id;
             let EventKind::Checkpoint(payload) = event.kind else {
                 bail!("unexpected event type")
             };
-            println!("quick-save {} ({})", payload.label, event.id);
+            println!("quick-save {} ({})", payload.label, event_id);
+
+            if show_diff {
+                let diffs = repo.semantic_diff_for_checkpoint(event_id)?;
+                if diffs.is_empty() {
+                    println!("No semantic changes.");
+                } else {
+                    println!();
+                    println!("=== Semantic Changes ===");
+                    for diff in &diffs {
+                        print_semantic_file_diff(diff, false);
+                    }
+                }
+            }
         }
         Command::QuickRestore => {
             let repo = Repo::discover(cwd)?;
@@ -3915,7 +4029,7 @@ fn compatibility_label(status: SemanticCompatibilityStatus) -> &'static str {
     }
 }
 
-fn print_semantic_file_diff(diff: &fl_core::SemanticFileDiff) {
+fn print_semantic_file_diff(diff: &fl_core::SemanticFileDiff, patch: bool) {
     println!("{} [{}]", diff.path, diff.language);
     for change in &diff.changes {
         let marker = change_marker(change.kind);
@@ -3946,15 +4060,156 @@ fn print_semantic_file_diff(diff: &fl_core::SemanticFileDiff) {
                 );
             }
         }
+        if patch {
+            print_patch_body(change);
+        }
     }
     if diff.parse_fallback {
         println!("  ! parser fallback used");
     }
 }
 
-fn print_semantic_diffs(
+fn print_patch_body(change: &fl_core::SemanticChange) {
+    match change.kind {
+        SemanticChangeKind::Modified => {
+            if let Some(ref old) = change.old_source {
+                println!("    --- old");
+                for line in old.lines() {
+                    println!("    -{}", line);
+                }
+            }
+            if let Some(ref new) = change.new_source {
+                println!("    +++ new");
+                for line in new.lines() {
+                    println!("    +{}", line);
+                }
+            }
+        }
+        SemanticChangeKind::Added => {
+            if let Some(ref new) = change.new_source {
+                println!("    +++ added");
+                for line in new.lines() {
+                    println!("    +{}", line);
+                }
+            }
+        }
+        SemanticChangeKind::Removed => {
+            if let Some(ref old) = change.old_source {
+                println!("    --- removed");
+                for line in old.lines() {
+                    println!("    -{}", line);
+                }
+            }
+        }
+        SemanticChangeKind::Renamed | SemanticChangeKind::Moved => {
+            if let Some(ref new) = change.new_source {
+                println!("    +++ relocated");
+                for line in new.lines() {
+                    println!("    +{}", line);
+                }
+            }
+        }
+        SemanticChangeKind::StyleOnly => {}
+    }
+}
+
+fn filter_diffs(
+    diffs: &mut Vec<fl_core::SemanticFileDiff>,
+    risk_filter: Option<&str>,
+    kind_filter: Option<&str>,
+    breaking_only: bool,
+) {
+    let min_risk = risk_filter.map(|r| match r.to_lowercase().as_str() {
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    });
+
+    let kind_match = kind_filter.map(|k| k.to_lowercase());
+
+    for diff in diffs.iter_mut() {
+        diff.changes.retain(|change| {
+            if let Some(min) = min_risk {
+                let level = match change.risk {
+                    SemanticRisk::High => 3,
+                    SemanticRisk::Medium => 2,
+                    SemanticRisk::Low => 1,
+                };
+                if level < min {
+                    return false;
+                }
+            }
+            if let Some(ref k) = kind_match {
+                let change_kind = match change.kind {
+                    SemanticChangeKind::Added => "added",
+                    SemanticChangeKind::Removed => "removed",
+                    SemanticChangeKind::Modified => "modified",
+                    SemanticChangeKind::Renamed => "renamed",
+                    SemanticChangeKind::Moved => "moved",
+                    SemanticChangeKind::StyleOnly => "style_only",
+                };
+                if change_kind != k.as_str() {
+                    return false;
+                }
+            }
+            if breaking_only {
+                if change.compatibility.status != SemanticCompatibilityStatus::Breaking
+                    && change.compatibility.status
+                        != SemanticCompatibilityStatus::PotentiallyBreaking
+                {
+                    return false;
+                }
+            }
+            true
+        });
+    }
+
+    diffs.retain(|d| !d.changes.is_empty());
+}
+
+fn print_summary_line(diffs: &[fl_core::SemanticFileDiff]) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut modified = 0usize;
+    let mut high_risk = 0usize;
+    let mut breaking = 0usize;
+
+    for diff in diffs {
+        for change in &diff.changes {
+            match change.kind {
+                SemanticChangeKind::Added => added += 1,
+                SemanticChangeKind::Removed => removed += 1,
+                SemanticChangeKind::Modified => modified += 1,
+                _ => {}
+            }
+            if change.risk == SemanticRisk::High {
+                high_risk += 1;
+            }
+            if change.compatibility.status == SemanticCompatibilityStatus::Breaking
+                || change.compatibility.status == SemanticCompatibilityStatus::PotentiallyBreaking
+            {
+                breaking += 1;
+            }
+        }
+    }
+
+    println!(
+        "{} file{}, +{} -{} ~{} symbols, {} high-risk, {} breaking",
+        diffs.len(),
+        if diffs.len() == 1 { "" } else { "s" },
+        added,
+        removed,
+        modified,
+        high_risk,
+        breaking
+    );
+}
+
+fn print_semantic_diffs_with_patch(
     diffs: &[fl_core::SemanticFileDiff],
     json: bool,
+    patch: bool,
 ) -> Result<()> {
     if diffs.is_empty() {
         if json {
@@ -3975,10 +4230,11 @@ fn print_semantic_diffs(
         return Ok(());
     }
     for diff in diffs {
-        print_semantic_file_diff(diff);
+        print_semantic_file_diff(diff, patch);
     }
     Ok(())
 }
+
 
 fn print_intent_diff(
     groups: &[(String, Vec<fl_core::SemanticFileDiff>)],
@@ -4080,7 +4336,7 @@ fn print_full_diff_summary(
     if !diffs.is_empty() {
         println!("=== Semantic Changes ===");
         for diff in diffs {
-            print_semantic_file_diff(diff);
+            print_semantic_file_diff(diff, false);
         }
     }
 

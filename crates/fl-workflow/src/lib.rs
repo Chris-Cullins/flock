@@ -1189,7 +1189,8 @@ pub fn parse_duration_spec(input: &str) -> Result<Duration> {
         "m" => Duration::from_secs(amount.saturating_mul(60)),
         "h" => Duration::from_secs(amount.saturating_mul(60 * 60)),
         "d" => Duration::from_secs(amount.saturating_mul(60 * 60 * 24)),
-        _ => bail!("unsupported duration unit `{}` (use s, m, h, d)", unit),
+        "w" => Duration::from_secs(amount.saturating_mul(60 * 60 * 24 * 7)),
+        _ => bail!("unsupported duration unit `{}` (use s, m, h, d, w)", unit),
     };
 
     Ok(duration)
@@ -1209,7 +1210,7 @@ mod tests {
     fn parse_duration_specs() {
         assert_eq!(parse_duration_spec("5m").expect("duration").as_secs(), 300);
         assert_eq!(parse_duration_spec("30").expect("duration").as_secs(), 30);
-        assert!(parse_duration_spec("1w").is_err());
+        assert_eq!(parse_duration_spec("1w").expect("duration").as_secs(), 604800);
     }
 
     #[test]

@@ -65,6 +65,10 @@ pub struct SemanticChange {
     pub impact: SemanticImpact,
     #[serde(default)]
     pub compatibility: SemanticCompatibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -147,6 +151,10 @@ pub struct SymbolInfo {
     pub body_hash: String,
     pub match_hash: String,
     pub signature: Option<CallableSignature>,
+    #[serde(default)]
+    pub start_byte: usize,
+    #[serde(default)]
+    pub end_byte: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -885,6 +893,8 @@ impl SemanticAnalyzerPlugin for FallbackTextAnalyzer {
                 risk: SemanticRisk::Medium,
                 impact: SemanticImpact::default(),
                 compatibility: SemanticCompatibility::default(),
+                old_source: None,
+                new_source: None,
             }],
         }))
     }
@@ -962,6 +972,18 @@ pub fn merge(
     default_analyzer_registry().merge(path, base_source, left_source, right_source)
 }
 
+fn extract_symbol_source(source: &[u8], symbol: &SymbolInfo) -> Option<String> {
+    if symbol.end_byte == 0 && symbol.start_byte == 0 {
+        return None;
+    }
+    if symbol.end_byte > source.len() {
+        return None;
+    }
+    std::str::from_utf8(&source[symbol.start_byte..symbol.end_byte])
+        .ok()
+        .map(|s| s.to_string())
+}
+
 fn tree_sitter_diff(
     path: &Path,
     old_source: Option<&[u8]>,
@@ -1007,6 +1029,8 @@ fn tree_sitter_diff(
                         risk: score_modified_risk(&key, compatibility.status),
                         impact: base_impact(&key),
                         compatibility,
+                        old_source: extract_symbol_source(old_source, old),
+                        new_source: extract_symbol_source(new_source, new),
                     })
                 }
                 _ => {}
@@ -1068,6 +1092,8 @@ fn tree_sitter_diff(
                     risk: score_relocation_risk(&old_key, key),
                     impact: base_impact(&format!("{old_key} -> {key}")),
                     compatibility: SemanticCompatibility::default(),
+                    old_source: None,
+                    new_source: new_map.get(key).and_then(|s| extract_symbol_source(new_source, s)),
                 });
             }
         }
@@ -1112,6 +1138,8 @@ fn tree_sitter_diff(
                             risk: score_relocation_risk(old_key, &new_key),
                             impact: base_impact(&format!("{old_key} -> {new_key}")),
                             compatibility: SemanticCompatibility::default(),
+                            old_source: None,
+                            new_source: new_map.get(&new_key).and_then(|s| extract_symbol_source(new_source, s)),
                         });
                     }
                 }
@@ -1125,6 +1153,8 @@ fn tree_sitter_diff(
                 risk: score_risk(SemanticChangeKind::Removed, key),
                 impact: base_impact(key),
                 compatibility: SemanticCompatibility::default(),
+                old_source: old_map.get(key).and_then(|s| extract_symbol_source(old_source, s)),
+                new_source: None,
             });
         }
 
@@ -1135,6 +1165,8 @@ fn tree_sitter_diff(
                 risk: score_risk(SemanticChangeKind::Added, key),
                 impact: base_impact(key),
                 compatibility: SemanticCompatibility::default(),
+                old_source: None,
+                new_source: new_map.get(key).and_then(|s| extract_symbol_source(new_source, s)),
             });
         }
 
@@ -1145,6 +1177,8 @@ fn tree_sitter_diff(
                 risk: SemanticRisk::Low,
                 impact: base_impact("(style-only change)"),
                 compatibility: SemanticCompatibility::default(),
+                old_source: None,
+                new_source: None,
             });
         }
 
@@ -1166,6 +1200,8 @@ fn tree_sitter_diff(
             risk: SemanticRisk::High,
             impact: base_impact("(parser fallback)"),
             compatibility: SemanticCompatibility::default(),
+            old_source: None,
+            new_source: None,
         }],
     }))
 }
@@ -1846,6 +1882,8 @@ fn extract_symbols(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: extract_callable_signature(node, source),
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -1859,6 +1897,8 @@ fn extract_symbols(
                             body_hash: node_hash(node, source)?,
                             match_hash: node_match_hash(node, source)?,
                             signature: extract_callable_signature(value, source),
+                            start_byte: node.start_byte(),
+                            end_byte: node.end_byte(),
                         });
                     }
                 }
@@ -1872,6 +1912,8 @@ fn extract_symbols(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
 
                 let mut cursor = node.walk();
@@ -1894,6 +1936,8 @@ fn extract_symbols(
                         body_hash: node_hash(node, source)?,
                         match_hash: node_match_hash(node, source)?,
                         signature: extract_callable_signature(node, source),
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
                     });
                 } else {
                     let scoped_name = match enclosing_class {
@@ -1907,6 +1951,8 @@ fn extract_symbols(
                         body_hash: node_hash(node, source)?,
                         match_hash: node_match_hash(node, source)?,
                         signature: extract_callable_signature(node, source),
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
                     });
                 }
             }
@@ -1923,6 +1969,8 @@ fn extract_symbols(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -1934,6 +1982,8 @@ fn extract_symbols(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -1945,6 +1995,8 @@ fn extract_symbols(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -1956,6 +2008,8 @@ fn extract_symbols(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -1967,6 +2021,8 @@ fn extract_symbols(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2007,6 +2063,8 @@ fn extract_symbols_python(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: extract_callable_signature(node, source),
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2027,6 +2085,8 @@ fn extract_symbols_python(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
@@ -2072,6 +2132,8 @@ fn extract_symbols_go(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: extract_callable_signature(node, source),
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2099,6 +2161,8 @@ fn extract_symbols_go(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: extract_callable_signature(node, source),
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2119,6 +2183,8 @@ fn extract_symbols_go(
                             body_hash: node_hash(child, source)?,
                             match_hash: node_match_hash(child, source)?,
                             signature: None,
+                            start_byte: child.start_byte(),
+                            end_byte: child.end_byte(),
                         });
                     }
                 }
@@ -2161,6 +2227,8 @@ fn extract_symbols_rust(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: extract_callable_signature(node, source),
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2193,6 +2261,8 @@ fn extract_symbols_rust(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2204,6 +2274,8 @@ fn extract_symbols_rust(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2215,6 +2287,8 @@ fn extract_symbols_rust(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2226,6 +2300,8 @@ fn extract_symbols_rust(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2260,6 +2336,8 @@ fn extract_symbols_csharp(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: extract_callable_signature(node, source),
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2271,6 +2349,8 @@ fn extract_symbols_csharp(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
@@ -2297,6 +2377,8 @@ fn extract_symbols_csharp(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
@@ -2323,6 +2405,8 @@ fn extract_symbols_csharp(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2334,6 +2418,8 @@ fn extract_symbols_csharp(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2349,6 +2435,8 @@ fn extract_symbols_csharp(
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
                 });
             }
         }
@@ -2574,6 +2662,8 @@ mod tests {
                     risk: SemanticRisk::Low,
                     impact: SemanticImpact::default(),
                     compatibility: SemanticCompatibility::default(),
+                    old_source: None,
+                    new_source: None,
                 }],
             }))
         }

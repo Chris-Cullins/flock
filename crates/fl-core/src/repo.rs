@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::{Signer, SigningKey};
@@ -1090,6 +1090,95 @@ impl Repo {
                 n
             ),
         }
+    }
+
+    /// Find the most recent checkpoint that is older than `duration` ago.
+    ///
+    /// If no checkpoint is old enough, returns the earliest checkpoint.
+    pub fn find_checkpoint_before_duration(
+        &self,
+        duration: Duration,
+    ) -> Result<(Event, CheckpointEvent)> {
+        let checkpoints = self.list_checkpoints_with_payload()?;
+        if checkpoints.is_empty() {
+            bail!("no checkpoints found; run `fl commit -m \"...\"` first");
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u128;
+        let cutoff = now.saturating_sub(duration.as_nanos());
+
+        // Find most recent checkpoint with timestamp < cutoff (scanning in order, pick last match)
+        let mut best: Option<(Event, CheckpointEvent)> = None;
+        for (event, payload) in &checkpoints {
+            let ts: u128 = event.timestamp.parse().unwrap_or(0);
+            if ts < cutoff {
+                best = Some((event.clone(), payload.clone()));
+            }
+        }
+
+        // If none found, use earliest checkpoint
+        best.or_else(|| checkpoints.into_iter().next())
+            .ok_or_else(|| anyhow!("no checkpoints found"))
+    }
+
+    /// Semantic diff for a checkpoint against its predecessor.
+    ///
+    /// Finds the checkpoint immediately before `event_id` in the event log
+    /// and diffs the two snapshots. If no predecessor exists, diffs against empty.
+    pub fn semantic_diff_for_checkpoint(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Vec<SemanticFileDiff>> {
+        self.assert_initialized()?;
+        let checkpoints = self.list_checkpoints_with_payload()?;
+
+        let target_idx = checkpoints
+            .iter()
+            .position(|(e, _)| e.id == event_id)
+            .ok_or_else(|| anyhow!("checkpoint {} not found", event_id))?;
+
+        let target_payload = &checkpoints[target_idx].1;
+        let to_root = self.ensure_snapshot_available(target_payload.snapshot_id)?;
+        let to_files = collect_source_files(&to_root, false)?;
+
+        if target_idx == 0 {
+            // No predecessor — diff against empty
+            let mut diffs = Vec::new();
+            for rel_path in &to_files {
+                let after = fs::read(to_root.join(rel_path)).ok();
+                let diff = semantic_diff(rel_path, None, after.as_deref())?;
+                if let Some(diff) = diff {
+                    diffs.push(diff);
+                }
+            }
+            enrich_semantic_impacts(&to_root, &to_files, &mut diffs)?;
+            diffs.sort_by(|a, b| a.path.cmp(&b.path));
+            return Ok(diffs);
+        }
+
+        let prev_payload = &checkpoints[target_idx - 1].1;
+        let from_root = self.ensure_snapshot_available(prev_payload.snapshot_id)?;
+        let from_files = collect_source_files(&from_root, false)?;
+
+        let mut all_paths: BTreeSet<PathBuf> = from_files;
+        all_paths.extend(to_files.iter().cloned());
+
+        let mut diffs = Vec::new();
+        for rel_path in &all_paths {
+            let before = fs::read(from_root.join(rel_path)).ok();
+            let after = fs::read(to_root.join(rel_path)).ok();
+            let diff = semantic_diff(rel_path, before.as_deref(), after.as_deref())?;
+            if let Some(diff) = diff {
+                diffs.push(diff);
+            }
+        }
+
+        enrich_semantic_impacts(&to_root, &to_files, &mut diffs)?;
+        diffs.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(diffs)
     }
 
     /// Semantic diff between two checkpoints identified by ID/prefix.
@@ -11576,7 +11665,7 @@ mod tests {
     fn parse_duration_specs() {
         assert_eq!(parse_duration_spec("5m").expect("duration").as_secs(), 300);
         assert_eq!(parse_duration_spec("30").expect("duration").as_secs(), 30);
-        assert!(parse_duration_spec("1w").is_err());
+        assert_eq!(parse_duration_spec("1w").expect("duration").as_secs(), 604800);
     }
 
     #[test]

@@ -38,6 +38,8 @@ fn diff_units(old_units: &[StructuralUnit], new_units: &[StructuralUnit]) -> Vec
                 risk: SemanticRisk::Medium,
                 impact: SemanticImpact::default(),
                 compatibility: SemanticCompatibility::default(),
+                old_source: Some(old_body.to_string()),
+                new_source: None,
             }),
             Some(new_body) if new_body != old_body => changes.push(SemanticChange {
                 kind: SemanticChangeKind::Modified,
@@ -45,6 +47,8 @@ fn diff_units(old_units: &[StructuralUnit], new_units: &[StructuralUnit]) -> Vec
                 risk: SemanticRisk::Low,
                 impact: SemanticImpact::default(),
                 compatibility: SemanticCompatibility::default(),
+                old_source: Some(old_body.to_string()),
+                new_source: Some(new_body.to_string()),
             }),
             _ => {}
         }
@@ -59,6 +63,8 @@ fn diff_units(old_units: &[StructuralUnit], new_units: &[StructuralUnit]) -> Vec
                 risk: SemanticRisk::Low,
                 impact: SemanticImpact::default(),
                 compatibility: SemanticCompatibility::default(),
+                old_source: None,
+                new_source: new_map.get(name).map(|s| s.to_string()),
             });
         }
     }
