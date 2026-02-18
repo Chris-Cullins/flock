@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{self, Shell};
+use colored::Colorize;
 use fl_core::repo::parse_duration_spec;
 use fl_core::{
     ApiCallRecord, ConflictStatus, DecisionAction, DirectiveKind, EventKind, ExplorationStatus,
@@ -20,7 +21,7 @@ const WORKFLOWS_MD: &str = include_str!("../../../.claude/skills/flock/WORKFLOWS
 const COLLABORATION_MD: &str = include_str!("../../../.claude/skills/flock/COLLABORATION.md");
 
 #[derive(Debug, Parser)]
-#[command(name = "fl", about = "Flock CLI (MVP)")]
+#[command(name = "fl", about = "Flock — version control for AI agents", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,12 +37,18 @@ enum Command {
         /// Use native block-level storage
         #[arg(long)]
         native: bool,
+        /// Re-initialize even if .flock already exists
+        #[arg(long)]
+        force: bool,
     },
     /// Create a commit (save current state)
     #[command(alias = "checkpoint")]
     Commit {
         #[arg(short = 'm', long = "message")]
         message: Option<String>,
+        /// Show full UUIDs and hashes in output
+        #[arg(short, long)]
+        verbose: bool,
         /// Bypass secret detection (recorded in audit log)
         #[arg(long)]
         allow_secrets: bool,
@@ -62,7 +69,17 @@ enum Command {
         description: Option<String>,
     },
     /// Show the event log
-    Log,
+    Log {
+        /// Maximum number of entries to show
+        #[arg(short = 'n', long)]
+        limit: Option<usize>,
+        /// Filter by event type (e.g. commit, init, exploration, undo)
+        #[arg(long = "type")]
+        event_type: Option<String>,
+        /// Show raw nanosecond timestamps instead of human-readable dates
+        #[arg(long)]
+        raw: bool,
+    },
     /// Verify repository integrity
     Fsck,
     /// Show working directory status vs last commit
@@ -626,7 +643,7 @@ enum ConvertCommand {
 enum ExploreCommand {
     /// Start a new exploration
     Start {
-        #[arg(long)]
+        /// Title for the exploration
         title: String,
     },
     /// List all explorations
@@ -1062,12 +1079,27 @@ impl From<RefKindArg> for RefKind {
 }
 
 fn main() -> Result<()> {
+    // Respect NO_COLOR standard (https://no-color.org/)
+    if env::var_os("NO_COLOR").is_some() {
+        colored::control::set_override(false);
+    }
+
     let cli = Cli::parse();
     let cwd = env::current_dir()?;
 
     match cli.command {
-        Command::Init { colocated, native } => {
-            let repo = Repo::at(cwd);
+        Command::Init { colocated, native, force } => {
+            let repo = Repo::at(&cwd);
+            // Check if .flock already exists
+            if repo.flock_dir().is_dir() && !force {
+                eprintln!(
+                    "{} Flock repository already exists at {}",
+                    "warning:".yellow().bold(),
+                    repo.flock_dir().display()
+                );
+                eprintln!("Use {} to re-initialize.", "--force".bold());
+                std::process::exit(1);
+            }
             if colocated && native {
                 bail!("--colocated and --native are mutually exclusive");
             } else if native {
@@ -1078,12 +1110,14 @@ fn main() -> Result<()> {
                 repo.init()?;
             }
             println!(
-                "Initialized Flock repository in {}/.flock",
-                repo.root().display()
+                "{} Flock repository in {}",
+                "Initialized".green().bold(),
+                format!("{}/.flock", repo.root().display()).bold()
             );
         }
         Command::Commit {
             message,
+            verbose,
             allow_secrets,
             skip_hooks,
             category,
@@ -1118,11 +1152,10 @@ fn main() -> Result<()> {
 
             // Reject empty commits when the working tree is clean.
             let st = repo.status()?;
-            if st.checkpoint_id.is_some()
-                && st.new_files.is_empty()
-                && st.modified_files.is_empty()
-                && st.deleted_files.is_empty()
-            {
+            let n_new = st.new_files.len();
+            let n_mod = st.modified_files.len();
+            let n_del = st.deleted_files.len();
+            if st.checkpoint_id.is_some() && n_new == 0 && n_mod == 0 && n_del == 0 {
                 bail!("nothing to commit — working tree is clean");
             }
 
@@ -1131,157 +1164,251 @@ fn main() -> Result<()> {
             let EventKind::Checkpoint(payload) = event.kind else {
                 bail!("unexpected event payload for commit")
             };
-            println!(
-                "commit {} ({}) id={} parent={} merkle={}",
-                payload.label,
-                payload.snapshot_id,
-                commit_id,
-                payload
-                    .parent_checkpoint_event
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                payload.snapshot_merkle_root.as_deref().unwrap_or("none")
-            );
+
+            if verbose {
+                println!(
+                    "commit {} ({}) id={} parent={} merkle={}",
+                    payload.label,
+                    payload.snapshot_id,
+                    commit_id,
+                    payload
+                        .parent_checkpoint_event
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    payload.snapshot_merkle_root.as_deref().unwrap_or("none")
+                );
+            } else {
+                let short_id = &commit_id.to_string()[..8];
+                println!(
+                    "{} {} {}",
+                    "commit".green().bold(),
+                    short_id.yellow(),
+                    payload.label.bold()
+                );
+                // Show file stats
+                let mut parts = Vec::new();
+                if n_new > 0 {
+                    parts.push(format!("{} new", n_new).green().to_string());
+                }
+                if n_mod > 0 {
+                    parts.push(format!("{} modified", n_mod).yellow().to_string());
+                }
+                if n_del > 0 {
+                    parts.push(format!("{} deleted", n_del).red().to_string());
+                }
+                let total = n_new + n_mod + n_del;
+                if total > 0 {
+                    println!(
+                        "  {} file{}, {}",
+                        total,
+                        if total == 1 { "" } else { "s" },
+                        parts.join(", ")
+                    );
+                }
+            }
         }
-        Command::Log => {
+        Command::Log { limit, event_type, raw } => {
             let repo = Repo::discover(cwd)?;
             let events = repo.list_events()?;
 
+            let mut shown = 0usize;
             for event in events {
+                // Filter by event type if requested
+                if let Some(ref filter) = event_type {
+                    if event_type_label(&event.kind) != filter.as_str() {
+                        continue;
+                    }
+                }
+
+                let ts = if raw {
+                    event.timestamp.clone()
+                } else {
+                    format_timestamp(&event.timestamp)
+                };
+                let ts_display = ts.dimmed();
+
                 match event.kind {
                     EventKind::Init(init) => println!(
-                        "{}  init  mode={}",
-                        event.timestamp, init.mode
+                        "{}  {}  mode={}",
+                        ts_display, "init".cyan().bold(), init.mode
                     ),
-                    EventKind::Checkpoint(cp) => println!(
-                        "{}  commit  {}  id={}  snapshot={}  parent={}",
-                        event.timestamp,
-                        cp.label,
-                        event.id,
-                        cp.snapshot_id,
-                        cp.parent_checkpoint_event
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| "none".to_string())
-                    ),
-                    EventKind::Exploration(exp) => println!(
-                        "{}  exploration:{:?}  {}  {}",
-                        event.timestamp, exp.action, exp.exploration_id, exp.title
-                    ),
-                    EventKind::Undo(undo) => println!(
-                        "{}  undo  target={}  restored={}  scope={}",
-                        event.timestamp,
-                        undo.target_event_id,
-                        undo.restored_checkpoint_event
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        undo.file_scope.as_deref().unwrap_or("all")
-                    ),
-                    EventKind::GitBridge(bridge) => println!(
-                        "{}  git:{:?}  success={}  {}",
-                        event.timestamp, bridge.action, bridge.success, bridge.detail
-                    ),
-                    EventKind::Session(ses) => println!(
-                        "{}  session:{:?}  {}  agent={}",
-                        event.timestamp, ses.action, ses.session_id, ses.agent
-                    ),
-                    EventKind::Decision(dec) => println!(
-                        "{}  decision:{:?}  session={}  exploration={}  confidence={:.2}",
-                        event.timestamp,
-                        dec.action,
-                        dec.session_id,
-                        dec.exploration_id,
-                        dec.confidence
-                    ),
+                    EventKind::Checkpoint(cp) => {
+                        let short_id = &event.id.to_string()[..8];
+                        println!(
+                            "{}  {} {} {}",
+                            ts_display,
+                            "commit".green().bold(),
+                            short_id.yellow(),
+                            cp.label.bold()
+                        );
+                    }
+                    EventKind::Exploration(exp) => {
+                        let action = format!("{:?}", exp.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  {}",
+                            ts_display,
+                            "exploration".magenta().bold(),
+                            action,
+                            exp.title
+                        );
+                    }
+                    EventKind::Undo(undo) => {
+                        let target_short = &undo.target_event_id.to_string()[..8];
+                        println!(
+                            "{}  {}  target={}  scope={}",
+                            ts_display,
+                            "undo".red().bold(),
+                            target_short.yellow(),
+                            undo.file_scope.as_deref().unwrap_or("all")
+                        );
+                    }
+                    EventKind::GitBridge(bridge) => {
+                        let action = format!("{:?}", bridge.action).to_lowercase();
+                        let status = if bridge.success { "ok".green() } else { "FAIL".red() };
+                        println!(
+                            "{}  {} {}  {}  {}",
+                            ts_display, "git".blue().bold(), action, status, bridge.detail
+                        );
+                    }
+                    EventKind::Session(ses) => {
+                        let action = format!("{:?}", ses.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  agent={}",
+                            ts_display, "session".blue().bold(), action, ses.agent
+                        );
+                    }
+                    EventKind::Decision(dec) => {
+                        let action = format!("{:?}", dec.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  confidence={:.2}",
+                            ts_display, "decision".cyan().bold(), action, dec.confidence
+                        );
+                    }
                     EventKind::ResourceUsage(usage) => println!(
-                        "{}  resource-usage  session={}  tokens={}  runtime={}ms",
-                        event.timestamp,
-                        usage.session_id,
+                        "{}  {}  tokens={}  runtime={}ms",
+                        ts_display,
+                        "resource".dimmed(),
                         usage.tokens_consumed.unwrap_or(0),
                         usage.runtime_ms.unwrap_or(0)
                     ),
-                    EventKind::Task(task) => println!(
-                        "{}  task:{:?}  {}  {}",
-                        event.timestamp, task.action, task.task_id, task.title
-                    ),
-                    EventKind::Presence(p) => println!(
-                        "{}  presence:{:?}  {}  workspace={}",
-                        event.timestamp, p.action, p.actor, p.workspace
-                    ),
-                    EventKind::Lock(l) => println!(
-                        "{}  lock:{:?}  {}  resource={}  holder={}",
-                        event.timestamp, l.action, l.lock_id, l.resource, l.holder
-                    ),
-                    EventKind::Subscription(s) => println!(
-                        "{}  subscription:{:?}  {}  actor={}",
-                        event.timestamp, s.action, s.subscription_id, s.actor
-                    ),
-                    EventKind::Gate(g) => println!(
-                        "{}  gate:{:?}  {}",
-                        event.timestamp, g.action, g.gate_id
-                    ),
-                    EventKind::Rebase(r) => println!(
-                        "{}  rebase  workspace={}  files={}  conflicts={}",
-                        event.timestamp, r.workspace, r.files_merged.len(), r.conflicts_found
-                    ),
-                    EventKind::ConflictResolution(cr) => println!(
-                        "{}  conflict:{:?}  {}  path={}",
-                        event.timestamp,
-                        cr.action,
-                        cr.conflict_id,
-                        cr.path.as_deref().unwrap_or("-")
-                    ),
-                    EventKind::Hook(h) => {
-                        let status = if h.bypassed {
-                            "skipped"
-                        } else if h.success {
-                            "pass"
-                        } else {
-                            "FAIL"
-                        };
+                    EventKind::Task(task) => {
+                        let action = format!("{:?}", task.action).to_lowercase();
                         println!(
-                            "{}  hook:{}  {}  {}  {}ms",
-                            event.timestamp, h.hook_point, h.hook_name, status, h.duration_ms
+                            "{}  {} {}  {}",
+                            ts_display, "task".cyan().bold(), action, task.title
                         );
                     }
-                    EventKind::RemoteSync(rs) => println!(
-                        "{}  sync:{:?}  roost={}  events={}  blocks={}  success={}",
-                        event.timestamp, rs.action, rs.roost_name, rs.event_count,
-                        rs.block_count, rs.success
+                    EventKind::Presence(p) => {
+                        let action = format!("{:?}", p.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  {}  workspace={}",
+                            ts_display, "presence".dimmed(), action, p.actor, p.workspace
+                        );
+                    }
+                    EventKind::Lock(l) => {
+                        let action = format!("{:?}", l.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  resource={}  holder={}",
+                            ts_display, "lock".yellow().bold(), action, l.resource, l.holder
+                        );
+                    }
+                    EventKind::Subscription(s) => {
+                        let action = format!("{:?}", s.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  actor={}",
+                            ts_display, "subscription".dimmed(), action, s.actor
+                        );
+                    }
+                    EventKind::Gate(g) => {
+                        let action = format!("{:?}", g.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  {}",
+                            ts_display, "gate".yellow().bold(), action, g.gate_id
+                        );
+                    }
+                    EventKind::Rebase(r) => println!(
+                        "{}  {}  workspace={}  files={}  conflicts={}",
+                        ts_display, "rebase".blue().bold(), r.workspace, r.files_merged.len(), r.conflicts_found
                     ),
-                    EventKind::Intelligence(intel) => println!(
-                        "{}  intel:{:?}  model={}  confidence={}",
-                        event.timestamp,
-                        intel.action,
-                        intel.model.as_deref().unwrap_or("-"),
-                        intel.confidence.map(|c| format!("{:.0}", c)).unwrap_or_else(|| "-".to_string()),
-                    ),
+                    EventKind::ConflictResolution(cr) => {
+                        let action = format!("{:?}", cr.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  path={}",
+                            ts_display,
+                            "conflict".red().bold(),
+                            action,
+                            cr.path.as_deref().unwrap_or("-")
+                        );
+                    }
+                    EventKind::Hook(h) => {
+                        let status = if h.bypassed {
+                            "skipped".dimmed()
+                        } else if h.success {
+                            "pass".green()
+                        } else {
+                            "FAIL".red()
+                        };
+                        println!(
+                            "{}  {} {}  {}  {}  {}ms",
+                            ts_display, "hook".dimmed(), h.hook_point, h.hook_name, status, h.duration_ms
+                        );
+                    }
+                    EventKind::RemoteSync(rs) => {
+                        let action = format!("{:?}", rs.action).to_lowercase();
+                        let status = if rs.success { "ok".green() } else { "FAIL".red() };
+                        println!(
+                            "{}  {} {}  roost={}  events={}  {}",
+                            ts_display, "sync".blue().bold(), action, rs.roost_name, rs.event_count, status
+                        );
+                    }
+                    EventKind::Intelligence(intel) => {
+                        let action = format!("{:?}", intel.action).to_lowercase();
+                        println!(
+                            "{}  {} {}  model={}",
+                            ts_display,
+                            "intel".cyan().bold(),
+                            action,
+                            intel.model.as_deref().unwrap_or("-"),
+                        );
+                    }
                     EventKind::Policy(policy) => println!(
-                        "{}  policy  {}  {:?}  op={}  reason={}",
-                        event.timestamp,
+                        "{}  {}  {}  {:?}  op={}",
+                        ts_display,
+                        "policy".yellow().bold(),
                         policy.policy_name,
                         policy.verdict,
                         policy.operation,
-                        policy.reason.as_deref().unwrap_or("-"),
                     ),
-                    EventKind::Directive(d) => println!(
-                        "{}  directive:{:?}  target={}  by={}",
-                        event.timestamp,
-                        d.directive,
-                        d.target_actor,
-                        d.issued_by,
-                    ),
+                    EventKind::Directive(d) => {
+                        let kind = format!("{:?}", d.directive).to_lowercase();
+                        println!(
+                            "{}  {} {}  target={}  by={}",
+                            ts_display,
+                            "directive".magenta().bold(),
+                            kind,
+                            d.target_actor,
+                            d.issued_by,
+                        );
+                    }
                     EventKind::FileWrite(fw) => println!(
-                        "{}  file-write  {}  ({} blocks, {} bytes)",
-                        event.timestamp, fw.path, fw.blocks.len(), fw.size
+                        "{}  {}  {}  ({} bytes)",
+                        ts_display, "write".green(), fw.path.bold(), fw.size
                     ),
                     EventKind::FileDelete(fd) => println!(
-                        "{}  file-delete  {}",
-                        event.timestamp, fd.path
+                        "{}  {}  {}",
+                        ts_display, "delete".red(), fd.path.bold()
                     ),
                     EventKind::FileRename(fr) => println!(
-                        "{}  file-rename  {} → {}  ({} bytes)",
-                        event.timestamp, fr.old_path, fr.new_path, fr.size
+                        "{}  {}  {} -> {}",
+                        ts_display, "rename".yellow(), fr.old_path.bold(), fr.new_path.bold()
                     ),
+                }
+
+                shown += 1;
+                if let Some(max) = limit {
+                    if shown >= max {
+                        break;
+                    }
                 }
             }
         }
@@ -1314,26 +1441,27 @@ fn main() -> Result<()> {
                     }))?
                 );
             } else {
-                println!("On branch {}", report.branch);
+                println!("On branch {}", report.branch.green().bold());
                 if let Some(ref cp) = report.checkpoint_id {
-                    println!("Latest commit: {}", cp);
+                    let short = &cp.to_string()[..8];
+                    println!("Latest commit: {}", short.yellow());
                 } else {
-                    println!("No commits yet");
+                    println!("{}", "No commits yet".dimmed());
                 }
                 let total =
                     report.new_files.len() + report.modified_files.len() + report.deleted_files.len();
                 if total == 0 {
-                    println!("\nNothing changed since last commit.");
+                    println!("\n{}", "Nothing changed since last commit.".dimmed());
                 } else {
                     println!();
                     for f in &report.new_files {
-                        println!("  new:      {}", f);
+                        println!("  {}  {}", "new:     ".green(), f);
                     }
                     for f in &report.modified_files {
-                        println!("  modified: {}", f);
+                        println!("  {}  {}", "modified:".yellow(), f);
                     }
                     for f in &report.deleted_files {
-                        println!("  deleted:  {}", f);
+                        println!("  {}  {}", "deleted: ".red(), f);
                     }
                     println!(
                         "\n{} file(s) changed",
@@ -1343,12 +1471,13 @@ fn main() -> Result<()> {
                 if !report.ignored_symlinks.is_empty() {
                     println!();
                     println!(
-                        "warning: {} symlink{} ignored (not tracked):",
+                        "{} {} symlink{} ignored (not tracked):",
+                        "warning:".yellow().bold(),
                         report.ignored_symlinks.len(),
                         if report.ignored_symlinks.len() == 1 { "" } else { "s" }
                     );
                     for s in &report.ignored_symlinks {
-                        println!("  symlink:  {}", s);
+                        println!("  {}  {}", "symlink:".dimmed(), s);
                     }
                 }
             }
@@ -4018,6 +4147,61 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Format a nanosecond timestamp string into a human-readable date.
+fn format_timestamp(ts: &str) -> String {
+    let nanos: u128 = match ts.parse() {
+        Ok(n) => n,
+        Err(_) => return ts.to_string(),
+    };
+    let secs = (nanos / 1_000_000_000) as u64;
+
+    // Format using libc localtime to get proper timezone
+    let secs_i64 = secs as i64;
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs_i64 as *const i64, &mut tm);
+        tm
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    )
+}
+
+/// Classify an EventKind into a short type label for filtering.
+fn event_type_label(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::Init(_) => "init",
+        EventKind::Checkpoint(_) => "commit",
+        EventKind::Exploration(_) => "exploration",
+        EventKind::Undo(_) => "undo",
+        EventKind::GitBridge(_) => "git",
+        EventKind::Session(_) => "session",
+        EventKind::Decision(_) => "decision",
+        EventKind::ResourceUsage(_) => "resource",
+        EventKind::Task(_) => "task",
+        EventKind::Presence(_) => "presence",
+        EventKind::Lock(_) => "lock",
+        EventKind::Subscription(_) => "subscription",
+        EventKind::Gate(_) => "gate",
+        EventKind::Rebase(_) => "rebase",
+        EventKind::ConflictResolution(_) => "conflict",
+        EventKind::Hook(_) => "hook",
+        EventKind::RemoteSync(_) => "sync",
+        EventKind::Intelligence(_) => "intel",
+        EventKind::Policy(_) => "policy",
+        EventKind::Directive(_) => "directive",
+        EventKind::FileWrite(_) => "file-write",
+        EventKind::FileDelete(_) => "file-delete",
+        EventKind::FileRename(_) => "file-rename",
+    }
+}
+
 fn change_marker(kind: SemanticChangeKind) -> &'static str {
     match kind {
         SemanticChangeKind::Added => "+",
@@ -4046,11 +4230,22 @@ fn compatibility_label(status: SemanticCompatibilityStatus) -> &'static str {
 }
 
 fn print_semantic_file_diff(diff: &fl_core::SemanticFileDiff, patch: bool) {
-    println!("{} [{}]", diff.path, diff.language);
+    println!("{} [{}]", diff.path.bold(), diff.language.dimmed());
     for change in &diff.changes {
         let marker = change_marker(change.kind);
         let risk = risk_label(change.risk);
-        println!("  {} [{}] {}", marker, risk, change.symbol);
+        let colored_marker = match change.kind {
+            SemanticChangeKind::Added => marker.green(),
+            SemanticChangeKind::Removed => marker.red(),
+            SemanticChangeKind::Modified => marker.yellow(),
+            _ => marker.dimmed(),
+        };
+        let colored_risk = match change.risk {
+            SemanticRisk::Low => risk.green(),
+            SemanticRisk::Medium => risk.yellow(),
+            SemanticRisk::High => risk.red(),
+        };
+        println!("  {} [{}] {}", colored_marker, colored_risk, change.symbol);
         let mut impact_fields = Vec::new();
         if !change.impact.symbols.is_empty() {
             impact_fields.push(format!("symbols={}", change.impact.symbols.join(", ")));
@@ -4062,16 +4257,22 @@ fn print_semantic_file_diff(diff: &fl_core::SemanticFileDiff, patch: bool) {
             impact_fields.push(format!("modules={}", change.impact.modules.join(", ")));
         }
         if !impact_fields.is_empty() {
-            println!("    impact: {}", impact_fields.join(" | "));
+            println!("    {}: {}", "impact".dimmed(), impact_fields.join(" | "));
         }
         if change.compatibility.status != SemanticCompatibilityStatus::Compatible {
             let status = compatibility_label(change.compatibility.status);
+            let colored_status = match change.compatibility.status {
+                SemanticCompatibilityStatus::PotentiallyBreaking => status.yellow().bold(),
+                SemanticCompatibilityStatus::Breaking => status.red().bold(),
+                _ => status.normal(),
+            };
             if change.compatibility.notes.is_empty() {
-                println!("    compatibility: {}", status);
+                println!("    {}: {}", "compatibility".dimmed(), colored_status);
             } else {
                 println!(
-                    "    compatibility: {} ({})",
-                    status,
+                    "    {}: {} ({})",
+                    "compatibility".dimmed(),
+                    colored_status,
                     change.compatibility.notes.join("; ")
                 );
             }
@@ -4081,7 +4282,7 @@ fn print_semantic_file_diff(diff: &fl_core::SemanticFileDiff, patch: bool) {
         }
     }
     if diff.parse_fallback {
-        println!("  ! parser fallback used");
+        println!("  {} parser fallback used", "!".yellow());
     }
 }
 
@@ -4089,39 +4290,39 @@ fn print_patch_body(change: &fl_core::SemanticChange) {
     match change.kind {
         SemanticChangeKind::Modified => {
             if let Some(ref old) = change.old_source {
-                println!("    --- old");
+                println!("    {}", "--- old".red());
                 for line in old.lines() {
-                    println!("    -{}", line);
+                    println!("    {}", format!("-{}", line).red());
                 }
             }
             if let Some(ref new) = change.new_source {
-                println!("    +++ new");
+                println!("    {}", "+++ new".green());
                 for line in new.lines() {
-                    println!("    +{}", line);
+                    println!("    {}", format!("+{}", line).green());
                 }
             }
         }
         SemanticChangeKind::Added => {
             if let Some(ref new) = change.new_source {
-                println!("    +++ added");
+                println!("    {}", "+++ added".green());
                 for line in new.lines() {
-                    println!("    +{}", line);
+                    println!("    {}", format!("+{}", line).green());
                 }
             }
         }
         SemanticChangeKind::Removed => {
             if let Some(ref old) = change.old_source {
-                println!("    --- removed");
+                println!("    {}", "--- removed".red());
                 for line in old.lines() {
-                    println!("    -{}", line);
+                    println!("    {}", format!("-{}", line).red());
                 }
             }
         }
         SemanticChangeKind::Renamed | SemanticChangeKind::Moved => {
             if let Some(ref new) = change.new_source {
-                println!("    +++ relocated");
+                println!("    {}", "+++ relocated".cyan());
                 for line in new.lines() {
-                    println!("    +{}", line);
+                    println!("    {}", format!("+{}", line).cyan());
                 }
             }
         }
