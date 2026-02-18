@@ -48,7 +48,7 @@ tree-sitter-javascript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
-tungstenite = { version = "0.24", features = ["native-tls"] }
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "2", features = ["json"] }
 uuid = { version = "1.15", features = ["v4", "serde"] }
 walkdir = "2.5"

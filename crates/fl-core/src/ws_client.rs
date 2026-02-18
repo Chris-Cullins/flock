@@ -156,7 +156,7 @@ fn ws_event_loop(
             tungstenite::stream::MaybeTlsStream::Plain(tcp) => {
                 let _ = tcp.set_read_timeout(Some(Duration::from_millis(100)));
             }
-            tungstenite::stream::MaybeTlsStream::NativeTls(tls) => {
+            tungstenite::stream::MaybeTlsStream::Rustls(tls) => {
                 let _ = tls.get_ref().set_read_timeout(Some(Duration::from_millis(100)));
             }
             _ => {}
