@@ -1721,17 +1721,12 @@ impl Repo {
             let age_nanos = now_nanos.saturating_sub(updated_nanos);
 
             if age_nanos >= max_age.as_nanos() {
-                // Clean up snapshot if exploration had a base checkpoint
-                if let Some(base_id) = exploration.base_checkpoint_event {
-                    if let Ok(event) = self.event_by_id(base_id) {
-                        if let EventKind::Checkpoint(payload) = event.kind {
-                            let snapshot_path = self.snapshot_path(payload.snapshot_id);
-                            if snapshot_path.is_dir() {
-                                let _ = fs::remove_dir_all(&snapshot_path);
-                            }
-                        }
-                    }
-                }
+                // Note: we intentionally do NOT delete the base checkpoint's
+                // snapshot here. The base checkpoint belongs to the main
+                // timeline and may be referenced by other events, undo, or
+                // branches. Snapshot cleanup should be handled by a dedicated
+                // gc/cleanup command that checks for dangling snapshots.
+
                 // Emit a Prune event so the exploration is removed from
                 // replayed state.
                 self.append_event(EventKind::Exploration(ExplorationEvent {
@@ -7784,25 +7779,30 @@ impl Repo {
             let need_resp = transport.check_snapshots_needed(&fl_storage::SnapshotNeedRequest {
                 snapshot_ids: snapshot_ids.clone(),
             })?;
+            let is_native = self.repo_mode()? == RepoMode::Native;
             for snap_id in &need_resp.needed_ids {
-                let snap_dir = self.root.join(SNAPSHOT_DIR).join(snap_id.to_string());
-                if snap_dir.is_dir() {
-                    // Git-compatible mode: pack snapshot directory as tar and upload.
-                    let mut buf = Vec::new();
-                    {
-                        let mut builder = tar::Builder::new(&mut buf);
-                        builder.append_dir_all(".", &snap_dir)?;
-                        builder.finish()?;
-                    }
-                    transport.upload_snapshot(*snap_id, &buf)?;
-                    blocks_uploaded += 1;
-                } else {
+                if is_native {
                     // Native mode: upload the snapshot index JSON as the snapshot data.
+                    // Check the file index first (authoritative for native mode) even
+                    // if a materialized cache directory also exists.
                     let file_index = fl_storage::FileIndex::for_root(self.root());
                     if file_index.has(*snap_id) {
                         let index = file_index.read(*snap_id)?;
                         let json = serde_json::to_vec(&index)?;
                         transport.upload_snapshot(*snap_id, &json)?;
+                        blocks_uploaded += 1;
+                    }
+                } else {
+                    // Git-compatible mode: pack snapshot directory as tar and upload.
+                    let snap_dir = self.root.join(SNAPSHOT_DIR).join(snap_id.to_string());
+                    if snap_dir.is_dir() {
+                        let mut buf = Vec::new();
+                        {
+                            let mut builder = tar::Builder::new(&mut buf);
+                            builder.append_dir_all(".", &snap_dir)?;
+                            builder.finish()?;
+                        }
+                        transport.upload_snapshot(*snap_id, &buf)?;
                         blocks_uploaded += 1;
                     }
                 }
@@ -7912,7 +7912,19 @@ impl Repo {
         let depth = entry.clone_depth;
         let lazy = entry.lazy;
 
-        self.pull_with_options(roost_name, branch, depth, &sparse, lazy)
+        let report = self.pull_with_options(roost_name, branch, depth, &sparse, lazy)?;
+
+        // Restore working directory from the latest pulled checkpoint so that
+        // the workspace reflects the updated HEAD after pull.
+        if !lazy && report.events_pulled > 0 {
+            if let Some(cp_event) = self.latest_checkpoint() {
+                if let EventKind::Checkpoint(cp) = &cp_event.kind {
+                    self.restore_workspace_from_snapshot(cp.snapshot_id)?;
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     /// Clone a remote repository to a local directory.
