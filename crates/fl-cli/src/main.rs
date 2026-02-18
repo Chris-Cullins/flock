@@ -1635,9 +1635,53 @@ fn main() -> Result<()> {
                     );
                 }
             } else if full {
-                // Full mode: show complete semantic diff output
+                // Full mode: show expanded detail for every change
+                let mut change_index = 0usize;
                 for diff in &summary.diffs {
-                    print_semantic_file_diff(diff);
+                    println!("{} [{}]", diff.path, diff.language);
+                    for change in &diff.changes {
+                        change_index += 1;
+                        let marker = change_marker(change.kind);
+                        let risk = risk_label(change.risk);
+                        println!("  #{:<3} {} [{}] {}", change_index, marker, risk, change.symbol);
+
+                        if !change.impact.symbols.is_empty() {
+                            println!(
+                                "       Impact symbols: {}",
+                                change.impact.symbols.join(", ")
+                            );
+                        }
+                        if !change.impact.files.is_empty() {
+                            println!(
+                                "       Impact files: {}",
+                                change.impact.files.join(", ")
+                            );
+                        }
+                        if !change.impact.modules.is_empty() {
+                            println!(
+                                "       Impact modules: {}",
+                                change.impact.modules.join(", ")
+                            );
+                        }
+                        if change.compatibility.status
+                            != SemanticCompatibilityStatus::Compatible
+                        {
+                            let status = compatibility_label(change.compatibility.status);
+                            if change.compatibility.notes.is_empty() {
+                                println!("       Compatibility: {}", status);
+                            } else {
+                                println!(
+                                    "       Compatibility: {} ({})",
+                                    status,
+                                    change.compatibility.notes.join("; ")
+                                );
+                            }
+                        }
+                    }
+                    if diff.parse_fallback {
+                        println!("  ! parser fallback used");
+                    }
+                    println!();
                 }
             } else {
                 // Summary mode: numbered list of changes
@@ -3914,14 +3958,20 @@ fn print_semantic_diffs(
 ) -> Result<()> {
     if diffs.is_empty() {
         if json {
-            println!("[]");
+            let output = serde_json::json!({
+                "semantic_changes": [],
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             println!("No semantic changes.");
         }
         return Ok(());
     }
     if json {
-        println!("{}", serde_json::to_string_pretty(&diffs)?);
+        let output = serde_json::json!({
+            "semantic_changes": diffs,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
     for diff in diffs {
@@ -3936,7 +3986,10 @@ fn print_intent_diff(
 ) -> Result<()> {
     if groups.is_empty() {
         if json {
-            println!("[]");
+            let output = serde_json::json!({
+                "intent_groups": [],
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             println!("No semantic changes.");
         }
@@ -3952,7 +4005,10 @@ fn print_intent_diff(
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&json_groups)?);
+        let output = serde_json::json!({
+            "intent_groups": json_groups,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
     for (intent_label, files) in groups {

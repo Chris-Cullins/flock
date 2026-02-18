@@ -9866,7 +9866,7 @@ fn build_reverse_dependency_index(
             )
         })?;
 
-        for specifier in extract_local_import_specifiers(&source) {
+        for specifier in extract_local_import_specifiers(&source, importer) {
             for target in resolve_import_targets(importer, &specifier, current_files) {
                 reverse.entry(target).or_default().insert(importer.clone());
             }
@@ -9876,7 +9876,22 @@ fn build_reverse_dependency_index(
     Ok(reverse)
 }
 
-fn extract_local_import_specifiers(source: &str) -> Vec<String> {
+fn extract_local_import_specifiers(source: &str, importer: &Path) -> Vec<String> {
+    let ext = importer
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    match ext {
+        "py" => extract_python_import_specifiers(source),
+        "go" => extract_go_import_specifiers(source),
+        "rs" => extract_rust_import_specifiers(source),
+        "cs" => extract_csharp_import_specifiers(source),
+        _ => extract_js_import_specifiers(source),
+    }
+}
+
+fn extract_js_import_specifiers(source: &str) -> Vec<String> {
     let mut specifiers = BTreeSet::new();
     collect_specifiers_for_token(
         source,
@@ -9903,6 +9918,98 @@ fn extract_local_import_specifiers(source: &str) -> Vec<String> {
             value.starts_with("./") || value.starts_with("../") || value.starts_with('/')
         })
         .collect()
+}
+
+fn extract_python_import_specifiers(source: &str) -> Vec<String> {
+    use regex::Regex;
+    let mut specifiers = Vec::new();
+
+    // `from .foo import bar` or `from ..foo import bar` (relative imports)
+    let re_relative =
+        Regex::new(r"(?m)^\s*from\s+(\.+\w*(?:\.\w+)*)\s+import\b").unwrap();
+    for cap in re_relative.captures_iter(source) {
+        let module = &cap[1];
+        // Convert Python relative import to path-like specifier
+        let mut prefix = String::new();
+        let mut chars = module.chars();
+        let mut dot_count = 0;
+        for ch in chars.by_ref() {
+            if ch == '.' {
+                dot_count += 1;
+            } else {
+                // Put back the first non-dot char
+                prefix = if dot_count == 1 {
+                    format!("./{}", ch)
+                } else {
+                    let ups = "../".repeat(dot_count - 1);
+                    format!("{}{}", ups, ch)
+                };
+                break;
+            }
+        }
+        if prefix.is_empty() {
+            // All dots, no module name (e.g., `from . import foo`)
+            prefix = if dot_count == 1 {
+                "./__init__".to_string()
+            } else {
+                format!("{}__init__", "../".repeat(dot_count - 1))
+            };
+        }
+        let rest: String = chars.collect();
+        let path = format!("{}{}", prefix, rest.replace('.', "/"));
+        specifiers.push(path);
+    }
+
+    // `from app.module import X` or `import app.module` (absolute imports)
+    let re_abs_from =
+        Regex::new(r"(?m)^\s*from\s+([a-zA-Z_]\w*(?:\.\w+)*)\s+import\b").unwrap();
+    for cap in re_abs_from.captures_iter(source) {
+        let module = cap[1].replace('.', "/");
+        specifiers.push(module);
+    }
+
+    let re_import = Regex::new(r"(?m)^\s*import\s+([a-zA-Z_]\w*(?:\.\w+)*)").unwrap();
+    for cap in re_import.captures_iter(source) {
+        let module = cap[1].replace('.', "/");
+        specifiers.push(module);
+    }
+
+    specifiers
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn extract_go_import_specifiers(source: &str) -> Vec<String> {
+    use regex::Regex;
+    let mut specifiers = Vec::new();
+    let re = Regex::new(r#"(?m)^\s*(?:import\s+)?"([^"]+)""#).unwrap();
+    for cap in re.captures_iter(source) {
+        let path = &cap[1];
+        // Only track local imports (those with a dot or starting with ./)
+        if path.starts_with("./") || path.starts_with("../") {
+            specifiers.push(path.to_string());
+        }
+    }
+    specifiers
+}
+
+fn extract_rust_import_specifiers(source: &str) -> Vec<String> {
+    use regex::Regex;
+    let mut specifiers = Vec::new();
+    // `mod foo;` declares a submodule — maps to foo.rs or foo/mod.rs
+    let re_mod = Regex::new(r"(?m)^\s*(?:pub\s+)?mod\s+(\w+)\s*;").unwrap();
+    for cap in re_mod.captures_iter(source) {
+        specifiers.push(format!("./{}", &cap[1]));
+    }
+    specifiers
+}
+
+fn extract_csharp_import_specifiers(_source: &str) -> Vec<String> {
+    // C# `using` directives refer to namespaces, not files.
+    // Without a project model we can't resolve them to files, so skip.
+    Vec::new()
 }
 
 fn collect_specifiers_for_token(
@@ -9984,13 +10091,35 @@ fn resolve_import_targets(
     };
     let base = normalize_relative_path(&base);
 
+    let importer_ext = importer
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
     let mut candidates = Vec::new();
     if base.extension().is_some() {
         candidates.push(base);
     } else {
-        for ext in ["ts", "tsx", "js", "jsx"] {
+        let extensions: &[&str] = match importer_ext {
+            "py" => &["py"],
+            "go" => &["go"],
+            "rs" => &["rs"],
+            "cs" => &["cs"],
+            _ => &["ts", "tsx", "js", "jsx"],
+        };
+        for ext in extensions {
             candidates.push(base.with_extension(ext));
-            candidates.push(base.join(format!("index.{ext}")));
+            match importer_ext {
+                "py" => {
+                    candidates.push(base.join("__init__.py"));
+                }
+                "rs" => {
+                    candidates.push(base.join("mod.rs"));
+                }
+                _ => {
+                    candidates.push(base.join(format!("index.{ext}")));
+                }
+            }
         }
     }
 

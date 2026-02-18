@@ -458,6 +458,13 @@ impl AnalyzerRegistry {
 
     pub fn with_builtin() -> Self {
         let mut registry = Self::new();
+        // Catch-all fallback registered first (lowest priority, since resolve()
+        // searches in reverse): text-level diff for files no other analyzer handles.
+        registry.register(FallbackTextAnalyzer::new(
+            "fallback-text",
+            "unknown",
+            std::iter::empty::<String>(),
+        ));
         registry.register(TreeSitterAnalyzer::default());
         registry.register(structured::JsonAnalyzer);
         registry.register(structured::YamlTomlAnalyzer);
@@ -846,6 +853,9 @@ impl SemanticAnalyzerPlugin for FallbackTextAnalyzer {
     }
 
     fn supports_path(&self, path: &Path) -> bool {
+        if self.extensions.is_empty() {
+            return true; // catch-all fallback
+        }
         let extension = path
             .extension()
             .and_then(|value| value.to_str())
@@ -1059,6 +1069,52 @@ fn tree_sitter_diff(
                     impact: base_impact(&format!("{old_key} -> {key}")),
                     compatibility: SemanticCompatibility::default(),
                 });
+            }
+        }
+
+        // Propagate renames to export symbols: if `function:foo` was renamed
+        // to `function:bar`, pair `export:declaration:foo` with `export:declaration:bar`.
+        {
+            let mut rename_map = BTreeMap::<String, String>::new();
+            for change in &changes {
+                if matches!(
+                    change.kind,
+                    SemanticChangeKind::Renamed | SemanticChangeKind::Moved
+                ) {
+                    if let Some((old, new)) = change.symbol.split_once(" -> ") {
+                        if let Some(old_leaf) = old.split(':').last() {
+                            if let Some(new_leaf) = new.split(':').last() {
+                                rename_map.insert(old_leaf.to_string(), new_leaf.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let remaining_removed: BTreeSet<_> =
+                removed_candidates.difference(&consumed_removed).cloned().collect();
+            let remaining_added: BTreeSet<_> =
+                added_candidates.difference(&consumed_added).cloned().collect();
+
+            for old_key in &remaining_removed {
+                if !old_key.starts_with("export:declaration:") {
+                    continue;
+                }
+                let old_decl_name = &old_key["export:declaration:".len()..];
+                if let Some(new_decl_name) = rename_map.get(old_decl_name) {
+                    let new_key = format!("export:declaration:{}", new_decl_name);
+                    if remaining_added.contains(&new_key) {
+                        consumed_removed.insert(old_key.clone());
+                        consumed_added.insert(new_key.clone());
+                        changes.push(SemanticChange {
+                            kind: relocation_kind(old_key, &new_key),
+                            symbol: format!("{old_key} -> {new_key}"),
+                            risk: score_relocation_risk(old_key, &new_key),
+                            impact: base_impact(&format!("{old_key} -> {new_key}")),
+                            compatibility: SemanticCompatibility::default(),
+                        });
+                    }
+                }
             }
         }
 
@@ -2234,14 +2290,29 @@ fn extract_symbols_csharp(
             }
         }
         "interface_declaration" => {
-            if let Some(name) = symbol_name(node, source) {
+            if let Some(iface_name) = symbol_name(node, source) {
                 symbols.push(SymbolInfo {
                     kind: SymbolKind::Interface,
-                    name,
+                    name: iface_name.clone(),
                     body_hash: node_hash(node, source)?,
                     match_hash: node_match_hash(node, source)?,
                     signature: None,
                 });
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "declaration_list" {
+                        let mut inner_cursor = child.walk();
+                        for inner in child.named_children(&mut inner_cursor) {
+                            extract_symbols_csharp(
+                                inner,
+                                source,
+                                Some(&iface_name),
+                                symbols,
+                            )?;
+                        }
+                    }
+                }
+                return Ok(());
             }
         }
         "struct_declaration" => {
@@ -2305,6 +2376,15 @@ fn export_symbol_name(node: Node, source: &[u8]) -> Option<String> {
     if let Some(declaration) = node.child_by_field_name("declaration") {
         if let Some(name) = symbol_name(declaration, source) {
             return Some(format!("declaration:{}", name));
+        }
+        // For `export const foo = ...` the name is nested in a variable_declarator.
+        let mut cursor = declaration.walk();
+        for child in declaration.named_children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(name) = symbol_name(child, source) {
+                    return Some(format!("declaration:{}", name));
+                }
+            }
         }
         return Some(format!("declaration:{}", compact_text(declaration, source)));
     }
@@ -2404,11 +2484,16 @@ fn compact_text(node: Node, source: &[u8]) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn normalize_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn node_hash(node: Node, source: &[u8]) -> Result<String> {
     let text = node
         .utf8_text(source)
         .context("node text was not valid UTF-8")?;
-    Ok(blake3::hash(text.as_bytes()).to_hex().to_string())
+    let normalized = normalize_whitespace(text);
+    Ok(blake3::hash(normalized.as_bytes()).to_hex().to_string())
 }
 
 fn node_match_hash(node: Node, source: &[u8]) -> Result<String> {
@@ -2417,26 +2502,30 @@ fn node_match_hash(node: Node, source: &[u8]) -> Result<String> {
         .context("node text was not valid UTF-8")?;
 
     let Some(name_node) = node.child_by_field_name("name") else {
-        return Ok(blake3::hash(text.as_bytes()).to_hex().to_string());
+        let normalized = normalize_whitespace(text);
+        return Ok(blake3::hash(normalized.as_bytes()).to_hex().to_string());
     };
 
     let node_start = node.start_byte();
     let name_start = name_node.start_byte();
     let name_end = name_node.end_byte();
     if name_start < node_start || name_end > node.end_byte() {
-        return Ok(blake3::hash(text.as_bytes()).to_hex().to_string());
+        let normalized = normalize_whitespace(text);
+        return Ok(blake3::hash(normalized.as_bytes()).to_hex().to_string());
     }
 
     let start = name_start - node_start;
     let end = name_end - node_start;
     if start > text.len() || end > text.len() || start > end {
-        return Ok(blake3::hash(text.as_bytes()).to_hex().to_string());
+        let normalized = normalize_whitespace(text);
+        return Ok(blake3::hash(normalized.as_bytes()).to_hex().to_string());
     }
 
-    let mut normalized = String::with_capacity(text.len() + "<name>".len());
-    normalized.push_str(&text[..start]);
-    normalized.push_str("<name>");
-    normalized.push_str(&text[end..]);
+    let mut replaced = String::with_capacity(text.len() + "<name>".len());
+    replaced.push_str(&text[..start]);
+    replaced.push_str("<name>");
+    replaced.push_str(&text[end..]);
+    let normalized = normalize_whitespace(&replaced);
 
     Ok(blake3::hash(normalized.as_bytes()).to_hex().to_string())
 }
