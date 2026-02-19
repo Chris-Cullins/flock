@@ -1018,7 +1018,7 @@ impl Repo {
 
         let checkpoint = self
             .latest_checkpoint()
-            .ok_or_else(|| anyhow!("no checkpoint found; run `fl checkpoint -m \"...\"` first"))?;
+            .ok_or_else(|| anyhow!("no checkpoint found; run `fl commit -m \"...\"` first"))?;
 
         let EventKind::Checkpoint(checkpoint_payload) = checkpoint.kind else {
             bail!("latest checkpoint event had unexpected kind")
@@ -1064,7 +1064,7 @@ impl Repo {
 
         let checkpoint = self
             .latest_checkpoint()
-            .ok_or_else(|| anyhow!("no checkpoint found; run `fl checkpoint -m \"...\"` first"))?;
+            .ok_or_else(|| anyhow!("no checkpoint found; run `fl commit -m \"...\"` first"))?;
 
         let EventKind::Checkpoint(payload) = checkpoint.kind else {
             bail!("latest checkpoint event had unexpected kind")
@@ -2148,7 +2148,7 @@ impl Repo {
 
         // Read the stash list
         let mut entries = self.stash_read_entries()?;
-        let index = entries.len();
+        let _internal_index = entries.len();
 
         // Snapshot the working directory into a stash-specific location
         let stash_snap_dir = snapshot_dir.join(snapshot_id.to_string());
@@ -2188,10 +2188,12 @@ impl Repo {
             self.restore_working_directory(&snap_root)?;
         }
 
-        Ok(index)
+        // stash@{0} is always the most recent (git convention)
+        Ok(0)
     }
 
     /// Restore a stash entry and remove it from the list.
+    /// Index follows git convention: 0 = most recent stash.
     pub fn stash_pop(&self, index: usize) -> Result<()> {
         self.assert_initialized()?;
 
@@ -2200,7 +2202,9 @@ impl Repo {
             bail!("stash@{{{}}} does not exist (only {} entries)", index, entries.len());
         }
 
-        let entry = entries.remove(index);
+        // Map user-facing index (0=newest) to internal index (0=oldest)
+        let internal_index = entries.len() - 1 - index;
+        let entry = entries.remove(internal_index);
         let stash_snap_dir = self.stash_dir().join(entry.snapshot_id.to_string());
 
         if !stash_snap_dir.exists() {
@@ -2217,13 +2221,16 @@ impl Repo {
         Ok(())
     }
 
-    /// List all stash entries.
+    /// List all stash entries, newest first (git convention: stash@{0} = most recent).
     pub fn stash_list(&self) -> Result<Vec<StashEntry>> {
         self.assert_initialized()?;
-        self.stash_read_entries()
+        let mut entries = self.stash_read_entries()?;
+        entries.reverse();
+        Ok(entries)
     }
 
     /// Remove a stash entry without applying it.
+    /// Index follows git convention: 0 = most recent stash.
     pub fn stash_drop(&self, index: usize) -> Result<()> {
         self.assert_initialized()?;
 
@@ -2232,7 +2239,9 @@ impl Repo {
             bail!("stash@{{{}}} does not exist (only {} entries)", index, entries.len());
         }
 
-        let entry = entries.remove(index);
+        // Map user-facing index (0=newest) to internal index (0=oldest)
+        let internal_index = entries.len() - 1 - index;
+        let entry = entries.remove(internal_index);
         let stash_snap_dir = self.stash_dir().join(entry.snapshot_id.to_string());
         if stash_snap_dir.exists() {
             fs::remove_dir_all(&stash_snap_dir)?;
@@ -2858,7 +2867,7 @@ impl Repo {
         // Capture current state as the workspace base
         let checkpoint = self
             .latest_checkpoint()
-            .ok_or_else(|| anyhow!("cannot create workspace: no checkpoint exists; run `fl checkpoint` first"))?;
+            .ok_or_else(|| anyhow!("cannot create workspace: no checkpoint exists; run `fl commit` first"))?;
         let EventKind::Checkpoint(payload) = checkpoint.kind else {
             bail!("latest checkpoint event is malformed")
         };
@@ -4075,7 +4084,7 @@ impl Repo {
                     ok: false,
                     detail: "refs/flock/branches/main is missing".to_string(),
                     recovery: Some(
-                        "run `fl checkpoint -m \"sync\"` to recreate flock main ref mapping"
+                        "run `fl commit -m \"sync\"` to recreate flock main ref mapping"
                             .to_string(),
                     ),
                 }),
@@ -4093,7 +4102,7 @@ impl Repo {
                     ok: false,
                     detail: "both HEAD and refs/flock/branches/main are missing".to_string(),
                     recovery: Some(
-                        "create a checkpoint (`fl checkpoint -m \"bootstrap\"`) to establish initial mappings"
+                        "create a checkpoint (`fl commit -m \"bootstrap\"`) to establish initial mappings"
                             .to_string(),
                     ),
                 }),
@@ -7608,7 +7617,7 @@ impl Repo {
             .resolve_git_revision_if_exists("refs/flock/branches/main")?
             .ok_or_else(|| {
                 anyhow!(
-                    "shadow mode safety check failed: refs/flock/branches/main is missing. Recovery: run `fl checkpoint -m \"sync\"`"
+                    "shadow mode safety check failed: refs/flock/branches/main is missing. Recovery: run `fl commit -m \"sync\"`"
                 )
             })?;
 

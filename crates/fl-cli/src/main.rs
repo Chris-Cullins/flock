@@ -3200,9 +3200,15 @@ fn main() -> Result<()> {
                             let detail_str = d.directive_detail.as_deref()
                                 .map(|det| format!(": {}", det))
                                 .unwrap_or_default();
-                            let reason_str = d.reason.as_deref()
-                                .map(|r| format!(" ({})", r))
-                                .unwrap_or_default();
+                            // Only show reason parenthetical when there's no detail
+                            // (abort embeds the reason in detail, so showing both duplicates it)
+                            let reason_str = if d.directive_detail.is_some() {
+                                String::new()
+                            } else {
+                                d.reason.as_deref()
+                                    .map(|r| format!(" ({})", r))
+                                    .unwrap_or_default()
+                            };
                             println!(
                                 "{}  {} → {}  {}{}{}",
                                 &d.id.to_string()[..8],
