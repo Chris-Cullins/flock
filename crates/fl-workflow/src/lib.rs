@@ -917,7 +917,14 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
 
     for event in events {
         if state_before_event.contains_key(&event.id) {
-            bail!("duplicate event id {} encountered during replay", event.id);
+            // Skip duplicate event IDs gracefully.  This can happen after a
+            // backup restore + pull where the same events appear twice in the
+            // log.  Crashing here would make many commands unusable (issue #80).
+            eprintln!(
+                "warning: skipping duplicate event id {} during replay",
+                event.id
+            );
+            continue;
         }
         state_before_event.insert(event.id, state.clone());
 
@@ -970,7 +977,11 @@ pub fn replay_state_incremental(
 
     for event in &events[start_index..] {
         if state_before_event.contains_key(&event.id) {
-            bail!("duplicate event id {} encountered during replay", event.id);
+            eprintln!(
+                "warning: skipping duplicate event id {} during incremental replay",
+                event.id
+            );
+            continue;
         }
         state_before_event.insert(event.id, state.clone());
 

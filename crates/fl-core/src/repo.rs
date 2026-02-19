@@ -9812,9 +9812,56 @@ impl Repo {
             }
         }
 
+        // Deduplicate: after a backup restore the local event log may already
+        // contain some of the events the remote is sending.  Filter those out
+        // so we never write duplicate event IDs (which would crash replay).
+        let existing_ids: BTreeSet<Uuid> = {
+            let local_events = AutoEventLog::for_root(self.root()).read_all()?;
+            local_events.iter().map(|e| e.id).collect()
+        };
+        let deduped_events: Vec<Event> = resp
+            .events
+            .iter()
+            .filter(|e| !existing_ids.contains(&e.id))
+            .cloned()
+            .collect();
+
+        if deduped_events.is_empty() {
+            // All pulled events already exist locally — nothing to append.
+            // Still update refs and sync state.
+            let ref_store = AutoRefStore::for_root(self.root());
+            let refs_updated: Vec<String> = resp.refs.iter().map(|r| r.name.clone()).collect();
+            for r in &resp.refs {
+                ref_store.upsert(r.clone())?;
+            }
+            let entry = fl_storage::find_roost_mut(&mut config, roost_name).unwrap();
+            entry.last_synced_event = resp.events.last().map(|e| e.id);
+            fl_storage::save_roosts(self.root(), &config)?;
+
+            self.append_event(EventKind::RemoteSync(crate::event::RemoteSyncEvent {
+                action: crate::event::RemoteSyncAction::Pull,
+                roost_name: roost_name.to_string(),
+                roost_url: url.to_string(),
+                success: true,
+                detail: Some(format!(
+                    "{} events already present locally (skipped duplicates)",
+                    events_pulled
+                )),
+                event_count: 0,
+                block_count: 0,
+            }))?;
+
+            return Ok(fl_storage::PullReport {
+                roost_name: roost_name.to_string(),
+                events_pulled: 0,
+                blocks_downloaded,
+                refs_updated,
+            });
+        }
+
         // Re-sign any graft events (those with cleared signatures from
         // shallow clone depth truncation) using our local signing key.
-        let mut events_to_append = resp.events.clone();
+        let mut events_to_append = deduped_events;
         for event in &mut events_to_append {
             if event.signature.is_none() && event.signer_public_key.is_none() {
                 // Graft event — re-sign with our key.
@@ -9825,8 +9872,9 @@ impl Repo {
         // Re-parent the first pulled event if our local log has diverged due
         // to local-only events (e.g. RemoteSync from a previous pull/push).
         // The first event's parent_id points to the remote's chain, but our
-        // local tail may be a RemoteSync event. Re-parent and re-sign so the
-        // causal chain stays valid locally.
+        // local tail may be a RemoteSync event.  After deduplication, the
+        // first event's parent may also be one that was already in the local
+        // log.  Re-parent and re-sign so the causal chain stays valid locally.
         let local_tail = AutoEventLog::for_root(self.root()).latest_event_id()?;
         if let (Some(first_event), Some(local_tail_id)) =
             (events_to_append.first_mut(), local_tail)
@@ -9834,6 +9882,18 @@ impl Repo {
             if first_event.parent_id != Some(local_tail_id) {
                 first_event.parent_id = Some(local_tail_id);
                 self.sign_event(first_event)?;
+            }
+        }
+
+        // Fix internal chain gaps from deduplication: if we removed events
+        // from the middle of the pulled batch, subsequent events may reference
+        // a removed duplicate as their parent.  Re-parent them to the previous
+        // event that is still in the batch.
+        for i in 1..events_to_append.len() {
+            let prev_id = events_to_append[i - 1].id;
+            if events_to_append[i].parent_id != Some(prev_id) {
+                events_to_append[i].parent_id = Some(prev_id);
+                self.sign_event(&mut events_to_append[i])?;
             }
         }
 
@@ -9853,13 +9913,22 @@ impl Repo {
         fl_storage::save_roosts(self.root(), &config)?;
 
         // Record sync event.
+        let actually_appended = events_to_append.len();
+        let dedup_detail = if actually_appended < events_pulled {
+            Some(format!(
+                "{} duplicate events skipped",
+                events_pulled - actually_appended
+            ))
+        } else {
+            None
+        };
         self.append_event(EventKind::RemoteSync(crate::event::RemoteSyncEvent {
             action: crate::event::RemoteSyncAction::Pull,
             roost_name: roost_name.to_string(),
             roost_url: url.to_string(),
             success: true,
-            detail: None,
-            event_count: events_pulled,
+            detail: dedup_detail,
+            event_count: actually_appended,
             block_count: blocks_downloaded,
         }))?;
 
