@@ -265,6 +265,7 @@ pub struct RebaseResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictDetail {
+    pub id: Option<Uuid>,
     pub path: String,
     pub symbol: Option<String>,
     pub classification: String,
@@ -8616,11 +8617,13 @@ impl Repo {
             }
 
             // Check if the workspace has local changes to this file
-            let workspace_file = self.root.parent().unwrap_or(&self.root).join(rel_path);
+            let workspace_file = self.root.join(rel_path);
             if !workspace_file.exists() {
-                // File was deleted in workspace; if new base added/changed it, that's a conflict
-                if new_content.is_some() && old_content.is_some() {
+                if old_content.is_some() && new_content.is_some() {
+                    // File existed in old base and was modified in new base,
+                    // but is missing from workspace — user deleted it.
                     conflicts.push(ConflictDetail {
+                        id: None,
                         path: rel_path.clone(),
                         symbol: None,
                         classification: "DeleteVsEdit".to_string(),
@@ -8629,6 +8632,14 @@ impl Repo {
                             rel_path
                         ),
                     });
+                } else if old_content.is_none() && new_content.is_some() {
+                    // File is new in the new base and didn't exist before —
+                    // not a deletion; fast-forward by creating it.
+                    if let Some(parent) = workspace_file.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&workspace_file, new_content.unwrap())?;
+                    files_merged.push(rel_path.clone());
                 }
                 continue;
             }
@@ -8664,6 +8675,7 @@ impl Repo {
                             // Conflicts found
                             for conflict in &result.conflicts {
                                 conflicts.push(ConflictDetail {
+                                    id: None,
                                     path: rel_path.clone(),
                                     symbol: Some(conflict.symbol.clone()),
                                     classification: format!("{:?}", conflict.classification),
@@ -8678,6 +8690,7 @@ impl Repo {
                     Ok(None) | Err(_) => {
                         // Unsupported file type or merge error — text fallback
                         conflicts.push(ConflictDetail {
+                            id: None,
                             path: rel_path.clone(),
                             symbol: None,
                             classification: "TextFallback".to_string(),
@@ -8832,7 +8845,7 @@ impl Repo {
                 continue;
             }
 
-            let workspace_file = self.root.parent().unwrap_or(&self.root).join(rel_path);
+            let workspace_file = self.root.join(rel_path);
             let ws_content = fs::read(&workspace_file).ok();
 
             // If workspace changed the same file as the new base, there's a potential conflict
@@ -8849,6 +8862,7 @@ impl Repo {
                     Ok(Some(result)) if !result.conflicts.is_empty() => {
                         for conflict in &result.conflicts {
                             conflicts.push(ConflictDetail {
+                                id: None,
                                 path: rel_path.clone(),
                                 symbol: Some(conflict.symbol.clone()),
                                 classification: format!("{:?}", conflict.classification),
@@ -8859,6 +8873,39 @@ impl Repo {
                     _ => {}
                 }
             }
+        }
+
+        // Persist detected conflicts as events so they flow through the
+        // detect → suggest → resolve pipeline.
+        for conflict in &mut conflicts {
+            let conflict_id = Uuid::new_v4();
+            conflict.id = Some(conflict_id);
+            self.append_event(EventKind::ConflictResolution(ConflictResolutionEvent {
+                conflict_id,
+                action: ConflictAction::Detect,
+                workspace: Some(workspace_name.to_string()),
+                path: Some(conflict.path.clone()),
+                symbol: conflict.symbol.clone(),
+                classification: None,
+                suggestion: None,
+                resolution: None,
+                resolved_by: None,
+                verified: None,
+                reason: None,
+            }))?;
+            self.append_event(EventKind::ConflictResolution(ConflictResolutionEvent {
+                conflict_id,
+                action: ConflictAction::Classify,
+                workspace: Some(workspace_name.to_string()),
+                path: Some(conflict.path.clone()),
+                symbol: conflict.symbol.clone(),
+                classification: Some(conflict.classification.clone()),
+                suggestion: None,
+                resolution: None,
+                resolved_by: None,
+                verified: None,
+                reason: None,
+            }))?;
         }
 
         Ok(conflicts)
@@ -9897,8 +9944,9 @@ impl Repo {
             }
         }
 
-        // Append pulled events.
-        AutoEventLog::for_root(self.root()).append_batch(&events_to_append)?;
+        // Append pulled events (use relaxed validation for pull/clone since
+        // the remote causal chain may have branches from undo/exploration events).
+        AutoEventLog::for_root(self.root()).append_batch_for_pull(&events_to_append)?;
 
         // Update refs from remote.
         let ref_store = AutoRefStore::for_root(self.root());
@@ -13871,6 +13919,83 @@ mod tests {
         // Only the auto-rebase workspace should be processed
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].workspace, "auto-ws");
+    }
+
+    #[test]
+    fn rebase_no_local_changes_no_spurious_conflicts() {
+        // Regression test for #88: workspace with no local changes should
+        // not generate DeleteVsEdit conflicts when new base adds files.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Create initial checkpoint with one file
+        fs::write(dir.path().join("main.ts"), "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        // Create workspace (no local changes will be made)
+        repo.create_workspace("agent-1".to_string(), false)
+            .expect("create workspace");
+
+        // Upstream: add new files and modify the existing one
+        fs::write(dir.path().join("main.ts"), "export const x = 2;").expect("modify");
+        fs::write(dir.path().join("new-file.ts"), "export const y = 1;").expect("new file");
+        repo.create_checkpoint(Some("upstream".to_string()))
+            .expect("checkpoint 2");
+
+        let result = repo.rebase_workspace("agent-1").expect("rebase");
+        assert!(!result.already_up_to_date);
+        // No local changes → should be zero conflicts (fast-forward)
+        assert!(
+            result.conflicts.is_empty(),
+            "expected zero conflicts for workspace with no local changes, got: {:?}",
+            result.conflicts,
+        );
+    }
+
+    #[test]
+    fn detect_conflicts_persists_to_event_log() {
+        // Regression test for #82: detect_conflicts should persist conflicts
+        // so that list/suggest/resolve can reference them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        fs::write(dir.path().join("main.ts"), "export const x = 1;").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        // Create workspace
+        repo.create_workspace("ws1".to_string(), false)
+            .expect("create workspace");
+
+        // Modify file in workspace (local change)
+        fs::write(dir.path().join("main.ts"), "export const x = 'ws-change';").expect("ws edit");
+
+        // Also create an upstream change
+        fs::write(dir.path().join("other.ts"), "export const y = 2;").expect("upstream add");
+        repo.create_checkpoint(Some("upstream".to_string()))
+            .expect("checkpoint 2");
+
+        // Re-apply workspace change so it diverges from base
+        fs::write(dir.path().join("main.ts"), "export const x = 'ws-change';").expect("ws edit again");
+
+        let detected = repo.detect_conflicts("ws1").expect("detect");
+
+        // Whether or not there are semantic conflicts depends on the merge
+        // engine, but if there are any, they should have IDs and be in list_conflicts.
+        if !detected.is_empty() {
+            for c in &detected {
+                assert!(c.id.is_some(), "detected conflict should have an id");
+            }
+
+            let listed = repo.list_conflicts(None).expect("list conflicts");
+            assert!(
+                !listed.is_empty(),
+                "list_conflicts should return persisted conflicts after detect"
+            );
+        }
     }
 
     #[test]

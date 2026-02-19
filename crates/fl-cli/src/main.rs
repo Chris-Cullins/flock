@@ -3698,8 +3698,11 @@ fn main() -> Result<()> {
                     } else {
                         println!("{} conflict(s) detected:", conflicts.len());
                         for c in &conflicts {
+                            let id_str = c.id.map(|id| format!("{}", id))
+                                .unwrap_or_else(|| "-".to_string());
                             println!(
-                                "  {} [{}]: {}",
+                                "  {} {} [{}]: {}",
+                                &id_str[..8.min(id_str.len())],
                                 c.path,
                                 c.classification,
                                 c.explanation
