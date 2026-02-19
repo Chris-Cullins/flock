@@ -864,6 +864,9 @@ mod tests {
             signer_public_key: None,
             signature: None,
             prev_event_hash: None,
+            exploration_id: None,
+            session_id: None,
+            workspace_name: None,
             kind: EventKind::Checkpoint(CheckpointEvent {
                 label: label.to_string(),
                 message: Some(message.to_string()),

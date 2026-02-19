@@ -36,7 +36,8 @@ use crate::semantic::{
 };
 use fl_workflow::{
     build_task_graph, previous_checkpoint_before, replay_state, replay_state_incremental,
-    resolve_target_event, to_undo_mode, walk_checkpoint_ancestor,
+    resolve_target_event, resolve_target_event_scoped, to_undo_mode, walk_checkpoint_ancestor,
+    walk_checkpoint_ancestor_scoped,
 };
 
 pub use fl_collab::{
@@ -48,7 +49,7 @@ pub use fl_workflow::parse_duration_spec;
 pub use fl_workflow::{
     DecisionSummary, ExplorationStatus, ExplorationSummary, FileState, ReplayedState,
     ResourceUsageTotals, SessionStatus, SessionSummary, TaskEdge, TaskGraph, TaskRelation,
-    TaskStatus, TaskSummary, UndoRequest, UndoResult,
+    TaskStatus, TaskSummary, UndoRequest, UndoResult, UndoScope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3023,6 +3024,7 @@ impl Repo {
             mode: UndoMode::Last,
             restored_checkpoint_event,
             file_scope: None,
+            undo_scope: None,
         }))?;
 
         Ok(UndoResult {
@@ -3039,6 +3041,381 @@ impl Repo {
     /// bypassing file-level undo even in native mode.
     pub fn undo_to_checkpoint(&self, request: UndoRequest) -> Result<UndoResult> {
         self.undo_inner(request, true)
+    }
+
+    /// Scoped undo: only reverts events matching the given scope filters.
+    /// If the scope is empty, delegates to the normal `undo()`.
+    pub fn undo_scoped(&self, request: UndoRequest, scope: UndoScope) -> Result<UndoResult> {
+        if scope.is_empty() {
+            return self.undo(request);
+        }
+        self.assert_initialized()?;
+
+        let events = self.list_events()?;
+        if events.is_empty() {
+            bail!("cannot undo: event log is empty");
+        }
+
+        // In native mode, check for trailing scoped file events
+        if self.repo_mode().unwrap_or(RepoMode::GitCompatible) == RepoMode::Native {
+            let latest_checkpoint_idx = events.iter().rposition(|e| {
+                matches!(e.kind, EventKind::Checkpoint(_))
+            });
+
+            let has_trailing_scoped_file_events = if let Some(cp_idx) = latest_checkpoint_idx {
+                events[cp_idx + 1..].iter().any(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::FileWrite(_) | EventKind::FileDelete(_) | EventKind::FileRename(_)
+                    ) && scope.matches(e)
+                })
+            } else {
+                events.iter().any(|e| {
+                    matches!(
+                        e.kind,
+                        EventKind::FileWrite(_) | EventKind::FileDelete(_) | EventKind::FileRename(_)
+                    ) && scope.matches(e)
+                })
+            };
+
+            if has_trailing_scoped_file_events {
+                return self.undo_file_events_scoped(&events, &request, &scope);
+            }
+        }
+
+        // Checkpoint-level scoped undo
+        self.undo_selective_checkpoint(&events, &request, &scope)
+    }
+
+    /// Undo file events that match the scope, reusing the existing file-undo logic.
+    fn undo_file_events_scoped(
+        &self,
+        events: &[Event],
+        request: &UndoRequest,
+        scope: &UndoScope,
+    ) -> Result<UndoResult> {
+        let file_events: Vec<&Event> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::FileWrite(_) | EventKind::FileDelete(_) | EventKind::FileRename(_)
+                ) && scope.matches(e)
+            })
+            .collect();
+
+        if file_events.is_empty() {
+            bail!("cannot undo: no file events match the given scope");
+        }
+
+        let count = match request {
+            UndoRequest::Last => 1,
+            UndoRequest::N(n) => *n,
+            UndoRequest::Since(duration) => {
+                let cutoff = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .checked_sub(*duration)
+                    .unwrap_or_default();
+                let cutoff_nanos = cutoff.as_nanos();
+                file_events
+                    .iter()
+                    .rev()
+                    .take_while(|e| {
+                        e.timestamp
+                            .parse::<u128>()
+                            .map(|t| t > cutoff_nanos)
+                            .unwrap_or(false)
+                    })
+                    .count()
+            }
+            UndoRequest::To(id_prefix) => {
+                let target_idx = file_events
+                    .iter()
+                    .position(|e| e.id.to_string().starts_with(id_prefix.as_str()))
+                    .ok_or_else(|| anyhow!("scoped file event with prefix {} not found", id_prefix))?;
+                file_events.len() - target_idx - 1
+            }
+        };
+
+        if count == 0 {
+            bail!("no scoped file events to undo");
+        }
+
+        let events_by_id: HashMap<Uuid, &Event> =
+            events.iter().map(|e| (e.id, e)).collect();
+
+        let to_undo: Vec<&Event> = file_events
+            .iter()
+            .rev()
+            .take(count)
+            .copied()
+            .collect();
+
+        let first_target = to_undo
+            .first()
+            .ok_or_else(|| anyhow!("no scoped file events to undo"))?;
+        let target_event_id = first_target.id;
+
+        for file_event in &to_undo {
+            match &file_event.kind {
+                EventKind::FileWrite(fw) => {
+                    if let Some(prev_id) = fw.previous_file_event {
+                        if let Some(prev_event) = events_by_id.get(&prev_id) {
+                            match &prev_event.kind {
+                                EventKind::FileWrite(prev_fw) => {
+                                    self.restore_file_from_blocks(&fw.path, &prev_fw.blocks)?;
+                                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                                        path: fw.path.clone(),
+                                        content_hash: prev_fw.content_hash.clone(),
+                                        blocks: prev_fw.blocks.clone(),
+                                        size: prev_fw.size,
+                                        previous_file_event: Some(file_event.id),
+                                    }))?;
+                                }
+                                EventKind::FileRename(prev_fr) => {
+                                    self.restore_file_from_blocks(&fw.path, &prev_fr.blocks)?;
+                                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                                        path: fw.path.clone(),
+                                        content_hash: prev_fr.content_hash.clone(),
+                                        blocks: prev_fr.blocks.clone(),
+                                        size: prev_fr.size,
+                                        previous_file_event: Some(file_event.id),
+                                    }))?;
+                                }
+                                _ => {
+                                    bail!(
+                                        "previous file event {} is not a FileWrite or FileRename",
+                                        prev_id
+                                    );
+                                }
+                            }
+                        } else {
+                            bail!("previous file event {} not found", prev_id);
+                        }
+                    } else {
+                        let target = self.root.join(&fw.path);
+                        if target.exists() {
+                            fs::remove_file(&target).with_context(|| {
+                                format!("failed to delete {}", target.display())
+                            })?;
+                        }
+                        self.append_event(EventKind::FileDelete(FileDeleteEvent {
+                            path: fw.path.clone(),
+                            previous_file_event: Some(file_event.id),
+                        }))?;
+                    }
+                }
+                EventKind::FileDelete(fd) => {
+                    if let Some(prev_id) = fd.previous_file_event {
+                        if let Some(prev_event) = events_by_id.get(&prev_id) {
+                            match &prev_event.kind {
+                                EventKind::FileWrite(prev_fw) => {
+                                    self.restore_file_from_blocks(&fd.path, &prev_fw.blocks)?;
+                                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                                        path: fd.path.clone(),
+                                        content_hash: prev_fw.content_hash.clone(),
+                                        blocks: prev_fw.blocks.clone(),
+                                        size: prev_fw.size,
+                                        previous_file_event: Some(file_event.id),
+                                    }))?;
+                                }
+                                EventKind::FileRename(prev_fr) => {
+                                    self.restore_file_from_blocks(&fd.path, &prev_fr.blocks)?;
+                                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                                        path: fd.path.clone(),
+                                        content_hash: prev_fr.content_hash.clone(),
+                                        blocks: prev_fr.blocks.clone(),
+                                        size: prev_fr.size,
+                                        previous_file_event: Some(file_event.id),
+                                    }))?;
+                                }
+                                _ => {
+                                    bail!(
+                                        "previous file event {} is not a FileWrite or FileRename",
+                                        prev_id
+                                    );
+                                }
+                            }
+                        } else {
+                            bail!("previous file event {} not found", prev_id);
+                        }
+                    } else {
+                        bail!("cannot undo file delete: no previous file event recorded");
+                    }
+                }
+                EventKind::FileRename(fr) => {
+                    let new_loc = self.root.join(&fr.new_path);
+                    let old_loc = self.root.join(&fr.old_path);
+                    if new_loc.exists() {
+                        if let Some(parent) = old_loc.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::rename(&new_loc, &old_loc).with_context(|| {
+                            format!("failed to rename {} back to {}", fr.new_path, fr.old_path)
+                        })?;
+                    }
+                    self.append_event(EventKind::FileWrite(FileWriteEvent {
+                        path: fr.old_path.clone(),
+                        content_hash: fr.content_hash.clone(),
+                        blocks: fr.blocks.clone(),
+                        size: fr.size,
+                        previous_file_event: Some(file_event.id),
+                    }))?;
+                    self.append_event(EventKind::FileDelete(FileDeleteEvent {
+                        path: fr.new_path.clone(),
+                        previous_file_event: Some(file_event.id),
+                    }))?;
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id,
+            mode: to_undo_mode(request, target_event_id),
+            restored_checkpoint_event: None,
+            file_scope: Some(format!("{} scoped file event(s)", to_undo.len())),
+            undo_scope: Some(scope.to_record()),
+        }))?;
+
+        Ok(UndoResult {
+            target_event_id,
+            restored_checkpoint_event: None,
+        })
+    }
+
+    /// Selective checkpoint undo: restores only files changed by scoped checkpoints.
+    fn undo_selective_checkpoint(
+        &self,
+        events: &[Event],
+        request: &UndoRequest,
+        scope: &UndoScope,
+    ) -> Result<UndoResult> {
+        // Find the latest scoped checkpoint as the head
+        let scoped_checkpoints: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Checkpoint(_)) && scope.matches(e))
+            .collect();
+
+        if scoped_checkpoints.is_empty() {
+            bail!("cannot undo: no checkpoints match the given scope");
+        }
+
+        let head = *scoped_checkpoints.last().unwrap();
+        let head_id = head.id;
+
+        let steps = match request {
+            UndoRequest::Last => 1,
+            UndoRequest::N(n) => *n,
+            _ => {
+                // For To/Since, resolve to a target event in scoped set and compute steps
+                let target = resolve_target_event_scoped(events, request, scope)?;
+                // Count scoped checkpoints from target to head
+                let target_pos = scoped_checkpoints.iter().position(|e| e.id == target.id);
+                let head_pos = scoped_checkpoints.len() - 1;
+                match target_pos {
+                    Some(pos) => head_pos - pos,
+                    None => bail!("target event is not a scoped checkpoint"),
+                }
+            }
+        };
+
+        let target = walk_checkpoint_ancestor_scoped(events, head_id, steps, scope)?;
+
+        let EventKind::Checkpoint(ref target_payload) = target.kind else {
+            bail!("expected checkpoint payload");
+        };
+
+        // Collect files_changed from all scoped checkpoints between target (exclusive)
+        // and head (inclusive)
+        let target_pos = scoped_checkpoints.iter().position(|e| e.id == target.id)
+            .ok_or_else(|| anyhow!("target checkpoint not found in scoped list"))?;
+        let head_pos = scoped_checkpoints.len() - 1;
+
+        let mut scoped_files: BTreeSet<String> = BTreeSet::new();
+        for cp in &scoped_checkpoints[target_pos + 1..=head_pos] {
+            if let EventKind::Checkpoint(ref cp_payload) = cp.kind {
+                if let Some(ref files_changed) = cp_payload.files_changed {
+                    for fc in files_changed {
+                        scoped_files.insert(fc.path.clone());
+                    }
+                } else {
+                    bail!(
+                        "scoped checkpoint {} has no files_changed metadata; \
+                         use --file or global undo instead",
+                        cp.id
+                    );
+                }
+            }
+        }
+
+        if scoped_files.is_empty() {
+            bail!("no files to restore from scoped checkpoints");
+        }
+
+        // Check for overlapping files with non-scoped checkpoints that are newer than target
+        let non_scoped_newer_files: BTreeSet<String> = events
+            .iter()
+            .filter(|e| {
+                matches!(e.kind, EventKind::Checkpoint(_))
+                    && !scope.matches(e)
+                    && e.timestamp > target.timestamp
+            })
+            .filter_map(|e| {
+                if let EventKind::Checkpoint(ref cp) = e.kind {
+                    cp.files_changed.as_ref()
+                } else {
+                    None
+                }
+            })
+            .flat_map(|files| files.iter().map(|f| f.path.clone()))
+            .collect();
+
+        let overlapping: Vec<&String> = scoped_files
+            .iter()
+            .filter(|f| non_scoped_newer_files.contains(*f))
+            .collect();
+
+        if !overlapping.is_empty() {
+            eprintln!(
+                "warning: {} file(s) were also modified by non-scoped checkpoints: {}",
+                overlapping.len(),
+                overlapping.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        // Restore only scoped files from the target checkpoint's snapshot
+        // (target is the state we want to restore TO)
+        for path_str in &scoped_files {
+            let path = Path::new(path_str);
+            self.restore_workspace_file_from_snapshot(target_payload.snapshot_id, path)?;
+        }
+
+        // Create a new checkpoint capturing the selective restore
+        let checkpoint_event = self.create_checkpoint(
+            Some(format!(
+                "scoped-undo: restore {} file(s) to state before checkpoint {}",
+                scoped_files.len(),
+                target.id
+            )),
+        )?;
+        let restored_checkpoint_event = Some(checkpoint_event.id);
+
+        let mode = to_undo_mode(request, head_id);
+
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id: head_id,
+            mode,
+            restored_checkpoint_event,
+            file_scope: None,
+            undo_scope: Some(scope.to_record()),
+        }))?;
+
+        Ok(UndoResult {
+            target_event_id: head_id,
+            restored_checkpoint_event,
+        })
     }
 
     fn undo_inner(&self, request: UndoRequest, force_checkpoint: bool) -> Result<UndoResult> {
@@ -3146,6 +3523,7 @@ impl Repo {
             mode,
             restored_checkpoint_event,
             file_scope: None,
+            undo_scope: None,
         }))?;
 
         Ok(UndoResult {
@@ -3214,6 +3592,7 @@ impl Repo {
             mode,
             restored_checkpoint_event,
             file_scope: None,
+            undo_scope: None,
         }))?;
 
         Ok(UndoResult {
@@ -3423,6 +3802,7 @@ impl Repo {
             mode: to_undo_mode(request, target_event_id),
             restored_checkpoint_event: None,
             file_scope: Some(format!("{} file event(s)", to_undo.len())),
+            undo_scope: None,
         }))?;
 
         Ok(UndoResult {
@@ -3503,6 +3883,7 @@ impl Repo {
             mode,
             restored_checkpoint_event,
             file_scope: Some(scoped_file_display.to_string()),
+            undo_scope: None,
         }))?;
 
         Ok(UndoResult {
@@ -3586,6 +3967,7 @@ impl Repo {
             mode,
             restored_checkpoint_event,
             file_scope: Some(scoped_file_display.to_string()),
+            undo_scope: None,
         }))?;
 
         Ok(UndoResult {
@@ -5757,6 +6139,20 @@ impl Repo {
             .map(|e| e.id)
     }
 
+    /// Find the active session ID for the current actor from replayed state.
+    fn active_session_id(&self) -> Option<Uuid> {
+        let state = self.replay_state().ok()?;
+        let actor = current_actor();
+        state
+            .sessions
+            .values()
+            .find(|s| {
+                s.status == fl_workflow::SessionStatus::Active
+                    && s.agent == actor
+            })
+            .map(|s| s.id)
+    }
+
     /// Scan the working directory for secrets and return an error if any are
     /// found and the config is set to block.
     fn scan_working_directory_for_secrets(&self) -> Result<()> {
@@ -6930,6 +7326,9 @@ impl Repo {
         self.ensure_signing_key()?;
         let signing_key = self.load_signing_key()?;
 
+        let exploration_id = self.active_exploration_id();
+        let session_id = self.active_session_id();
+
         let mut event = Event {
             id: Uuid::new_v4(),
             timestamp: unix_timestamp_nanos()?,
@@ -6938,6 +7337,9 @@ impl Repo {
             signer_public_key: None,
             signature: None,
             prev_event_hash: None,
+            exploration_id,
+            session_id,
+            workspace_name: None, // populated by caller via CLI flag when needed
             kind,
         };
         // Signing happens inside the lock (via finalize callback) because
@@ -14053,6 +14455,9 @@ mod tests {
                 signer_public_key: None,
                 signature: None,
                 prev_event_hash: None,
+                exploration_id: None,
+                session_id: None,
+                workspace_name: None,
                 kind: EventKind::Session(crate::event::SessionEvent {
                     session_id: id,
                     action: crate::event::SessionAction::Start,
@@ -14122,6 +14527,9 @@ mod tests {
                 signer_public_key: None,
                 signature: None,
                 prev_event_hash: None,
+                exploration_id: None,
+                session_id: None,
+                workspace_name: None,
                 kind: EventKind::Session(crate::event::SessionEvent {
                     session_id: id,
                     action: crate::event::SessionAction::Start,
@@ -14175,6 +14583,9 @@ mod tests {
                 signer_public_key: None,
                 signature: None,
                 prev_event_hash: None,
+                exploration_id: None,
+                session_id: None,
+                workspace_name: None,
                 kind: EventKind::Session(crate::event::SessionEvent {
                     session_id: id,
                     action: crate::event::SessionAction::Start,
@@ -14202,5 +14613,83 @@ mod tests {
         let (count, json) = store.load_latest().unwrap().unwrap();
         assert_eq!(count, Repo::AUTO_MATERIALIZE_INTERVAL);
         assert!(json.contains("pre-existing"), "existing snapshot should not be overwritten");
+    }
+
+    #[test]
+    fn test_context_tags_auto_populated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Start an exploration — its ID should appear on subsequent events
+        let exploration = repo.start_exploration("test-exp".to_string()).expect("start exploration");
+
+        let file = dir.path().join("hello.txt");
+        fs::write(&file, "hello").expect("write");
+        let cp = repo.create_checkpoint(Some("tagged".to_string())).expect("checkpoint");
+
+        // The checkpoint event should have exploration_id set
+        assert_eq!(cp.exploration_id, Some(exploration.id));
+    }
+
+    #[test]
+    fn test_undo_scoped_by_exploration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Create base checkpoint (before exploration)
+        let file_a = dir.path().join("a.txt");
+        fs::write(&file_a, "base-a").expect("write a");
+        repo.create_checkpoint(Some("base".to_string())).expect("base checkpoint");
+
+        // Start exploration and create two checkpoints
+        let exp = repo.start_exploration("exp1".to_string()).expect("start exp");
+
+        // First exploration checkpoint
+        fs::write(&file_a, "exp-v1").expect("write exp v1");
+        repo.create_checkpoint(Some("exp-v1".to_string())).expect("exp checkpoint 1");
+
+        // Second exploration checkpoint (further modification)
+        fs::write(&file_a, "exp-v2").expect("write exp v2");
+        repo.create_checkpoint(Some("exp-v2".to_string())).expect("exp checkpoint 2");
+
+        // Verify a.txt has latest value
+        let content = fs::read_to_string(&file_a).expect("read a");
+        assert_eq!(content, "exp-v2");
+
+        // Scoped undo by exploration — go back 1 step within exploration
+        let scope = UndoScope {
+            exploration_id: Some(exp.id),
+            ..Default::default()
+        };
+        let result = repo.undo_scoped(UndoRequest::Last, scope).expect("scoped undo");
+        assert!(result.restored_checkpoint_event.is_some());
+
+        // a.txt should be restored to the first exploration checkpoint state
+        let content = fs::read_to_string(&file_a).expect("read a after undo");
+        assert_eq!(content, "exp-v1");
+    }
+
+    #[test]
+    fn test_undo_scoped_empty_delegates_to_normal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        let file = dir.path().join("test.txt");
+        fs::write(&file, "v1").expect("write");
+        repo.create_checkpoint(Some("cp1".to_string())).expect("cp1");
+        fs::write(&file, "v2").expect("write");
+        repo.create_checkpoint(Some("cp2".to_string())).expect("cp2");
+
+        // Empty scope should delegate to normal undo
+        let scope = UndoScope::default();
+        let result = repo.undo_scoped(UndoRequest::Last, scope).expect("undo");
+        assert!(result.restored_checkpoint_event.is_some());
+
+        // File should be back to v1
+        let content = fs::read_to_string(&file).expect("read");
+        assert_eq!(content, "v1");
     }
 }

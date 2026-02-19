@@ -415,6 +415,9 @@ mod tests {
             signer_public_key: None,
             signature: None,
             prev_event_hash: None,
+            exploration_id: None,
+            session_id: None,
+            workspace_name: None,
             kind: EventKind::Checkpoint(CheckpointEvent {
                 label: "test".to_string(),
                 message: Some("Test".to_string()),
@@ -441,6 +444,9 @@ mod tests {
             signer_public_key: None,
             signature: None,
             prev_event_hash: None,
+            exploration_id: None,
+            session_id: None,
+            workspace_name: None,
             kind: EventKind::Task(TaskEvent {
                 task_id: Uuid::new_v4(),
                 action: TaskAction::Create,
@@ -465,11 +471,15 @@ mod tests {
             signer_public_key: None,
             signature: None,
             prev_event_hash: None,
+            exploration_id: None,
+            session_id: None,
+            workspace_name: None,
             kind: EventKind::Undo(UndoEvent {
                 target_event_id: Uuid::new_v4(),
                 mode: UndoMode::Last,
                 restored_checkpoint_event: None,
                 file_scope: None,
+                undo_scope: None,
             }),
         }
     }

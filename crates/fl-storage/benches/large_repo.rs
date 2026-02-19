@@ -27,6 +27,9 @@ fn make_checkpoint_event(seq: u128, parent: Option<Uuid>) -> Event {
         signer_public_key: None,
         signature: None,
         prev_event_hash: None,
+        exploration_id: None,
+        session_id: None,
+        workspace_name: None,
         kind: EventKind::Checkpoint(CheckpointEvent {
             label: format!("cp-{}", seq),
             message: None,

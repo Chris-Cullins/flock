@@ -12,7 +12,7 @@ use fl_core::{
     ApiCallRecord, ConflictStatus, DecisionAction, DirectiveKind, EventKind, ExplorationStatus,
     GateCondition, GatePolicy, RefKind, Repo, SemanticChangeKind, SemanticCompatibilityStatus,
     SemanticConflictClassification, SemanticRisk, TaskRelation, TaskStatus,
-    UndoRequest,
+    UndoRequest, UndoScope,
 };
 use uuid::Uuid;
 
@@ -198,6 +198,18 @@ enum Command {
         /// Undo to the previous checkpoint boundary (coarse granularity)
         #[arg(long)]
         to_checkpoint: bool,
+        /// Scope undo to an exploration (ID or prefix)
+        #[arg(long)]
+        exploration: Option<String>,
+        /// Scope undo to a session (ID or prefix)
+        #[arg(long)]
+        session: Option<String>,
+        /// Scope undo to a workspace
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Scope undo to an actor
+        #[arg(long)]
+        actor: Option<String>,
     },
     /// Record specific file changes to the event log (native mode)
     
@@ -2214,11 +2226,14 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Undo { n, to, since, file, to_checkpoint } => {
+        Command::Undo { n, to, since, file, to_checkpoint, exploration, session, workspace, actor } => {
             let repo = Repo::discover(cwd)?;
             repo.snapshot_working_directory()?;
             let request = build_undo_request(n, to, since)?;
-            let result = if let Some(path) = file {
+            let scope = build_undo_scope(exploration, session, workspace, actor, &repo)?;
+            let result = if !scope.is_empty() {
+                repo.undo_scoped(request, scope)?
+            } else if let Some(path) = file {
                 repo.undo_file(request, path)?
             } else if to_checkpoint {
                 repo.undo_to_checkpoint(request)?
@@ -4949,6 +4964,33 @@ fn build_undo_request(
     }
 
     Ok(UndoRequest::Last)
+}
+
+fn build_undo_scope(
+    exploration: Option<String>,
+    session: Option<String>,
+    workspace: Option<String>,
+    actor: Option<String>,
+    repo: &Repo,
+) -> Result<UndoScope> {
+    let exploration_id = match exploration {
+        Some(val) => Some(resolve_exploration(&val, repo)?),
+        None => None,
+    };
+    let session_id = match session {
+        Some(val) => {
+            let sessions = repo.list_sessions()?;
+            let known_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+            Some(resolve_uuid_prefix(&val, &known_ids)?)
+        }
+        None => None,
+    };
+    Ok(UndoScope {
+        exploration_id,
+        session_id,
+        workspace_name: workspace,
+        actor,
+    })
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid> {

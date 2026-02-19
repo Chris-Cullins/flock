@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::file_index::BlockRef;
 
-pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 16;
+pub const CURRENT_EVENT_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
@@ -20,6 +20,15 @@ pub struct Event {
     /// BLAKE3 hex hash of the previous event's serialized JSON (hash chain).
     #[serde(default)]
     pub prev_event_hash: Option<String>,
+    /// Scope context: exploration this event belongs to (for scoped undo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exploration_id: Option<Uuid>,
+    /// Scope context: session this event belongs to (for scoped undo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    /// Scope context: workspace this event belongs to (for scoped undo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
     pub kind: EventKind,
 }
 
@@ -152,6 +161,21 @@ pub struct UndoEvent {
     pub restored_checkpoint_event: Option<Uuid>,
     #[serde(default)]
     pub file_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_scope: Option<UndoScopeRecord>,
+}
+
+/// Records the scope filters that were active during a scoped undo operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndoScopeRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exploration_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -585,6 +609,12 @@ struct EventSigningPayload<'a> {
     timestamp: &'a str,
     actor: &'a str,
     parent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exploration_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_name: Option<&'a str>,
     kind: &'a EventKind,
 }
 
@@ -601,6 +631,9 @@ pub fn event_signing_payload(event: &Event) -> Result<Vec<u8>> {
         timestamp: &event.timestamp,
         actor: &event.actor,
         parent_id: event.parent_id,
+        exploration_id: event.exploration_id,
+        session_id: event.session_id,
+        workspace_name: event.workspace_name.as_deref(),
         kind: &event.kind,
     };
     serde_json::to_vec(&payload).context("failed to serialize event signing payload")
@@ -619,6 +652,9 @@ mod tests {
             signer_public_key: None,
             signature: None,
             prev_event_hash: None,
+            exploration_id: None,
+            session_id: None,
+            workspace_name: None,
             kind,
         }
     }

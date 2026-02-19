@@ -437,7 +437,7 @@ impl ReplayAccumulator {
                     bail!("undo event {} cannot target itself", event.id);
                 }
 
-                if undo.file_scope.is_none() {
+                if undo.file_scope.is_none() && undo.undo_scope.is_none() {
                     if let Some(rewound) = state_before_event
                         .get(&undo.target_event_id)
                         .cloned()
@@ -951,7 +951,7 @@ pub fn replay_state_incremental(
         .collect();
     for event in &events[start_index..] {
         if let EventKind::Undo(ref undo) = event.kind {
-            if undo.file_scope.is_none() && pre_event_ids.contains(&undo.target_event_id) {
+            if undo.file_scope.is_none() && undo.undo_scope.is_none() && pre_event_ids.contains(&undo.target_event_id) {
                 return replay_state(events);
             }
         }
@@ -1165,6 +1165,170 @@ pub fn walk_checkpoint_ancestor(events: &[Event], start_id: Uuid, steps: usize) 
     Ok(current.clone())
 }
 
+// ---------------------------------------------------------------------------
+// Scoped undo support
+// ---------------------------------------------------------------------------
+
+/// Scope filters for scoped undo. All `Some` fields must match (AND semantics).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UndoScope {
+    pub exploration_id: Option<Uuid>,
+    pub session_id: Option<Uuid>,
+    pub workspace_name: Option<String>,
+    pub actor: Option<String>,
+}
+
+impl UndoScope {
+    /// Returns true if no scope filters are set.
+    pub fn is_empty(&self) -> bool {
+        self.exploration_id.is_none()
+            && self.session_id.is_none()
+            && self.workspace_name.is_none()
+            && self.actor.is_none()
+    }
+
+    /// Returns true if the event matches all set scope filters (AND semantics).
+    pub fn matches(&self, event: &Event) -> bool {
+        if let Some(exp_id) = self.exploration_id {
+            if event.exploration_id != Some(exp_id) {
+                return false;
+            }
+        }
+        if let Some(sess_id) = self.session_id {
+            if event.session_id != Some(sess_id) {
+                return false;
+            }
+        }
+        if let Some(ref ws) = self.workspace_name {
+            if event.workspace_name.as_ref() != Some(ws) {
+                return false;
+            }
+        }
+        if let Some(ref actor) = self.actor {
+            if event.actor != *actor {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Convert to the serializable record format for storing in undo events.
+    pub fn to_record(&self) -> fl_storage::UndoScopeRecord {
+        fl_storage::UndoScopeRecord {
+            exploration_id: self.exploration_id,
+            session_id: self.session_id,
+            workspace_name: self.workspace_name.clone(),
+            actor: self.actor.clone(),
+        }
+    }
+}
+
+/// Like `resolve_target_event` but filters events by scope first.
+pub fn resolve_target_event_scoped<'a>(
+    events: &'a [Event],
+    request: &UndoRequest,
+    scope: &UndoScope,
+) -> Result<&'a Event> {
+    let filtered: Vec<&'a Event> = events.iter().filter(|e| scope.matches(e)).collect();
+    if filtered.is_empty() {
+        bail!("no events match the given scope filters");
+    }
+
+    match request {
+        UndoRequest::Last => Ok(*filtered.last().unwrap()),
+        UndoRequest::N(n) => {
+            if *n == 0 {
+                bail!("--n must be >= 1")
+            }
+            if *n > filtered.len() {
+                bail!(
+                    "cannot undo {} scoped events: only {} events match the scope",
+                    n,
+                    filtered.len()
+                )
+            }
+            let idx = filtered.len() - *n;
+            Ok(filtered[idx])
+        }
+        UndoRequest::To(raw_id) => {
+            let matches: Vec<&&Event> = filtered
+                .iter()
+                .filter(|event| event.id.to_string().starts_with(raw_id.as_str()))
+                .collect();
+
+            match matches.as_slice() {
+                [] => bail!("no scoped event id matches `{}`", raw_id),
+                [event] => Ok(**event),
+                _ => bail!("event id prefix `{}` is ambiguous within scope", raw_id),
+            }
+        }
+        UndoRequest::Since(duration) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock is before unix epoch")?
+                .as_nanos();
+            let cutoff = now.saturating_sub(duration.as_nanos());
+
+            filtered
+                .iter()
+                .find(|event| {
+                    event
+                        .timestamp
+                        .parse::<u128>()
+                        .map(|ts| ts >= cutoff)
+                        .unwrap_or(false)
+                })
+                .map(|e| *e)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no scoped events found in the last {} seconds",
+                        duration.as_secs_f64()
+                    )
+                })
+        }
+    }
+}
+
+/// Walk checkpoint ancestors, only considering checkpoints that match the scope.
+/// Returns the ancestor checkpoint `steps` back in the filtered checkpoint list.
+pub fn walk_checkpoint_ancestor_scoped(
+    events: &[Event],
+    start_id: Uuid,
+    steps: usize,
+    scope: &UndoScope,
+) -> Result<Event> {
+    if steps == 0 {
+        bail!("steps must be >= 1");
+    }
+
+    // Build a list of checkpoints matching the scope, in order
+    let scoped_checkpoints: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::Checkpoint(_)) && scope.matches(e))
+        .collect();
+
+    // Find the position of start_id in the scoped list
+    let start_pos = scoped_checkpoints
+        .iter()
+        .position(|e| e.id == start_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "start checkpoint {} not found in scoped checkpoint list",
+                start_id
+            )
+        })?;
+
+    if steps > start_pos {
+        bail!(
+            "only {} scoped checkpoint(s) exist before the start",
+            start_pos
+        );
+    }
+
+    let ancestor_pos = start_pos - steps;
+    Ok(scoped_checkpoints[ancestor_pos].clone())
+}
+
 pub fn parse_duration_spec(input: &str) -> Result<Duration> {
     let value = input.trim();
     if value.is_empty() {
@@ -1251,6 +1415,7 @@ mod tests {
                 mode: UndoMode::Last,
                 restored_checkpoint_event: None,
                 file_scope: None,
+                undo_scope: None,
             }),
         );
 
@@ -1331,6 +1496,7 @@ mod tests {
                 mode: UndoMode::Last,
                 restored_checkpoint_event: Some(restored.id),
                 file_scope: None,
+                undo_scope: None,
             }),
         );
 
@@ -1461,6 +1627,7 @@ mod tests {
                 mode: UndoMode::To(cp2.id),
                 restored_checkpoint_event: Some(restored.id),
                 file_scope: Some("src/file.ts".to_string()),
+                undo_scope: None,
             }),
         );
 
@@ -2403,6 +2570,265 @@ mod tests {
         );
     }
 
+    // --- Scoped undo tests ---
+
+    fn make_scoped_event(
+        id: u128,
+        parent_id: Option<Uuid>,
+        actor: &str,
+        exploration_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+        workspace_name: Option<&str>,
+        kind: EventKind,
+    ) -> Event {
+        Event {
+            id: Uuid::from_u128(id),
+            timestamp: format!("1739571600000000{}", id),
+            actor: actor.to_string(),
+            parent_id,
+            signer_public_key: None,
+            signature: None,
+            prev_event_hash: None,
+            exploration_id,
+            session_id,
+            workspace_name: workspace_name.map(String::from),
+            kind,
+        }
+    }
+
+    #[test]
+    fn test_undo_scope_matches() {
+        let exp_id = Uuid::from_u128(100);
+        let sess_id = Uuid::from_u128(200);
+
+        let event = make_scoped_event(
+            1, None, "agent-a", Some(exp_id), Some(sess_id), Some("ws1"),
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp".to_string(),
+                message: None,
+                snapshot_id: Uuid::from_u128(10),
+                parent_checkpoint_event: None,
+                snapshot_merkle_root: None,
+                ai_intent: None,
+                intent_confidence: None,
+                files_changed: None,
+                category: None,
+                scope_label: None,
+                structured_description: None,
+                git_commit_sha: None,
+            }),
+        );
+
+        // Empty scope matches everything
+        let empty = UndoScope::default();
+        assert!(empty.is_empty());
+        assert!(empty.matches(&event));
+
+        // Exploration match
+        let scope = UndoScope { exploration_id: Some(exp_id), ..Default::default() };
+        assert!(scope.matches(&event));
+
+        // Exploration mismatch
+        let scope = UndoScope { exploration_id: Some(Uuid::from_u128(999)), ..Default::default() };
+        assert!(!scope.matches(&event));
+
+        // Session match
+        let scope = UndoScope { session_id: Some(sess_id), ..Default::default() };
+        assert!(scope.matches(&event));
+
+        // Workspace match
+        let scope = UndoScope { workspace_name: Some("ws1".to_string()), ..Default::default() };
+        assert!(scope.matches(&event));
+
+        // Workspace mismatch
+        let scope = UndoScope { workspace_name: Some("ws2".to_string()), ..Default::default() };
+        assert!(!scope.matches(&event));
+
+        // Actor match
+        let scope = UndoScope { actor: Some("agent-a".to_string()), ..Default::default() };
+        assert!(scope.matches(&event));
+
+        // Actor mismatch
+        let scope = UndoScope { actor: Some("agent-b".to_string()), ..Default::default() };
+        assert!(!scope.matches(&event));
+
+        // AND semantics: exploration + actor both match
+        let scope = UndoScope {
+            exploration_id: Some(exp_id),
+            actor: Some("agent-a".to_string()),
+            ..Default::default()
+        };
+        assert!(scope.matches(&event));
+
+        // AND semantics: exploration matches but actor doesn't
+        let scope = UndoScope {
+            exploration_id: Some(exp_id),
+            actor: Some("agent-b".to_string()),
+            ..Default::default()
+        };
+        assert!(!scope.matches(&event));
+    }
+
+    #[test]
+    fn test_resolve_target_event_scoped() {
+        let exp_a = Uuid::from_u128(100);
+        let exp_b = Uuid::from_u128(200);
+
+        let e1 = make_scoped_event(1, None, "agent-a", Some(exp_a), None, None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(), message: None,
+                snapshot_id: Uuid::from_u128(10), parent_checkpoint_event: None,
+                snapshot_merkle_root: None, ai_intent: None, intent_confidence: None,
+                files_changed: None, category: None, scope_label: None,
+                structured_description: None, git_commit_sha: None,
+            }));
+        let e2 = make_scoped_event(2, Some(e1.id), "agent-b", Some(exp_b), None, None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp2".to_string(), message: None,
+                snapshot_id: Uuid::from_u128(20), parent_checkpoint_event: Some(e1.id),
+                snapshot_merkle_root: None, ai_intent: None, intent_confidence: None,
+                files_changed: None, category: None, scope_label: None,
+                structured_description: None, git_commit_sha: None,
+            }));
+        let e3 = make_scoped_event(3, Some(e2.id), "agent-a", Some(exp_a), None, None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp3".to_string(), message: None,
+                snapshot_id: Uuid::from_u128(30), parent_checkpoint_event: Some(e2.id),
+                snapshot_merkle_root: None, ai_intent: None, intent_confidence: None,
+                files_changed: None, category: None, scope_label: None,
+                structured_description: None, git_commit_sha: None,
+            }));
+
+        let events = vec![e1.clone(), e2.clone(), e3.clone()];
+
+        // Scope to exp_a: last should be e3
+        let scope = UndoScope { exploration_id: Some(exp_a), ..Default::default() };
+        let result = resolve_target_event_scoped(&events, &UndoRequest::Last, &scope).unwrap();
+        assert_eq!(result.id, e3.id);
+
+        // Scope to exp_a: N(1) should also be e3 (last of 2 scoped events)
+        let result = resolve_target_event_scoped(&events, &UndoRequest::N(1), &scope).unwrap();
+        assert_eq!(result.id, e3.id);
+
+        // Scope to exp_a: N(2) should be e1
+        let result = resolve_target_event_scoped(&events, &UndoRequest::N(2), &scope).unwrap();
+        assert_eq!(result.id, e1.id);
+
+        // Scope to exp_b: last should be e2
+        let scope_b = UndoScope { exploration_id: Some(exp_b), ..Default::default() };
+        let result = resolve_target_event_scoped(&events, &UndoRequest::Last, &scope_b).unwrap();
+        assert_eq!(result.id, e2.id);
+
+        // Scope to exp_a: N(3) should fail (only 2 events)
+        let err = resolve_target_event_scoped(&events, &UndoRequest::N(3), &scope).unwrap_err();
+        assert!(err.to_string().contains("only 2 events match"));
+    }
+
+    #[test]
+    fn test_walk_checkpoint_ancestor_scoped() {
+        let exp_a = Uuid::from_u128(100);
+        let exp_b = Uuid::from_u128(200);
+
+        let cp1 = make_scoped_event(1, None, "a", Some(exp_a), None, None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(), message: None,
+                snapshot_id: Uuid::from_u128(10), parent_checkpoint_event: None,
+                snapshot_merkle_root: None, ai_intent: None, intent_confidence: None,
+                files_changed: None, category: None, scope_label: None,
+                structured_description: None, git_commit_sha: None,
+            }));
+        let cp2 = make_scoped_event(2, Some(cp1.id), "b", Some(exp_b), None, None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp2".to_string(), message: None,
+                snapshot_id: Uuid::from_u128(20), parent_checkpoint_event: Some(cp1.id),
+                snapshot_merkle_root: None, ai_intent: None, intent_confidence: None,
+                files_changed: None, category: None, scope_label: None,
+                structured_description: None, git_commit_sha: None,
+            }));
+        let cp3 = make_scoped_event(3, Some(cp2.id), "a", Some(exp_a), None, None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp3".to_string(), message: None,
+                snapshot_id: Uuid::from_u128(30), parent_checkpoint_event: Some(cp2.id),
+                snapshot_merkle_root: None, ai_intent: None, intent_confidence: None,
+                files_changed: None, category: None, scope_label: None,
+                structured_description: None, git_commit_sha: None,
+            }));
+
+        let events = vec![cp1.clone(), cp2.clone(), cp3.clone()];
+
+        // Walk scoped to exp_a: 1 step from cp3 -> cp1 (skips cp2 which is exp_b)
+        let scope = UndoScope { exploration_id: Some(exp_a), ..Default::default() };
+        let result = walk_checkpoint_ancestor_scoped(&events, cp3.id, 1, &scope).unwrap();
+        assert_eq!(result.id, cp1.id);
+
+        // Walk scoped to exp_a: 2 steps from cp3 -> error (only cp1 before cp3)
+        let err = walk_checkpoint_ancestor_scoped(&events, cp3.id, 2, &scope).unwrap_err();
+        assert!(err.to_string().contains("scoped checkpoint(s) exist before"));
+
+        // Walk scoped to exp_b: 1 step from cp2 -> error (no scoped checkpoints before cp2)
+        let scope_b = UndoScope { exploration_id: Some(exp_b), ..Default::default() };
+        let err = walk_checkpoint_ancestor_scoped(&events, cp2.id, 1, &scope_b).unwrap_err();
+        assert!(err.to_string().contains("scoped checkpoint(s) exist before"));
+    }
+
+    #[test]
+    fn test_replay_scoped_undo_no_full_rewind() {
+        // Scoped undo should NOT rewind full state — only affect the
+        // restored checkpoint, not undo exploration starts etc.
+        let exp_a = Uuid::from_u128(100);
+
+        let cp1 = make_scoped_event(1, None, "a", Some(exp_a), None, None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp1".to_string(), message: None,
+                snapshot_id: Uuid::from_u128(10), parent_checkpoint_event: None,
+                snapshot_merkle_root: None, ai_intent: None, intent_confidence: None,
+                files_changed: None, category: None, scope_label: None,
+                structured_description: None, git_commit_sha: None,
+            }));
+        let exp_start = make_event(2, Some(cp1.id),
+            EventKind::Exploration(ExplorationEvent {
+                exploration_id: exp_a,
+                title: "test-exploration".to_string(),
+                base_checkpoint_event: Some(cp1.id),
+                action: ExplorationAction::Start,
+            }));
+        let cp2 = make_scoped_event(3, Some(exp_start.id), "a", Some(exp_a), None, None,
+            EventKind::Checkpoint(CheckpointEvent {
+                label: "cp2".to_string(), message: None,
+                snapshot_id: Uuid::from_u128(30), parent_checkpoint_event: Some(cp1.id),
+                snapshot_merkle_root: None, ai_intent: None, intent_confidence: None,
+                files_changed: None, category: None, scope_label: None,
+                structured_description: None, git_commit_sha: None,
+            }));
+        // Scoped undo with undo_scope set: should NOT rewind state
+        let undo = make_event(4, Some(cp2.id),
+            EventKind::Undo(UndoEvent {
+                target_event_id: cp2.id,
+                mode: UndoMode::Last,
+                restored_checkpoint_event: Some(cp1.id),
+                file_scope: None,
+                undo_scope: Some(fl_storage::UndoScopeRecord {
+                    exploration_id: Some(exp_a),
+                    session_id: None,
+                    workspace_name: None,
+                    actor: None,
+                }),
+            }));
+
+        let state = replay_state(&[cp1, exp_start, cp2, undo]).unwrap();
+        // The exploration should still be active (scoped undo didn't rewind state)
+        assert_eq!(state.explorations.len(), 1);
+        assert_eq!(
+            state.explorations.get(&exp_a).unwrap().status,
+            ExplorationStatus::Active
+        );
+        // But the checkpoint was restored
+        assert_eq!(
+            state.latest_checkpoint_event_id,
+            Some(Uuid::from_u128(1))
+        );
+    }
+
     fn make_event(id: u128, parent_id: Option<Uuid>, kind: EventKind) -> Event {
         Event {
             id: Uuid::from_u128(id),
@@ -2412,6 +2838,9 @@ mod tests {
             signer_public_key: None,
             signature: None,
             prev_event_hash: None,
+            exploration_id: None,
+            session_id: None,
+            workspace_name: None,
             kind,
         }
     }
