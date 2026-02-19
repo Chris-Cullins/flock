@@ -2981,6 +2981,47 @@ impl Repo {
         Ok(ws_ref)
     }
 
+    /// Delete a workspace by name. Returns true if it existed.
+    pub fn delete_workspace(&self, name: &str) -> Result<bool> {
+        self.assert_initialized()?;
+        self.delete_ref(RefKind::Workspace, name)
+    }
+
+    /// Rename a workspace. Returns the updated ref.
+    pub fn rename_workspace(&self, old_name: &str, new_name: &str) -> Result<RepoRef> {
+        self.assert_initialized()?;
+
+        let store = AutoRefStore::for_root(self.root());
+        let refs = store.read_all()?;
+        let old_ref = refs
+            .iter()
+            .find(|r| r.kind == RefKind::Workspace && r.name == old_name)
+            .ok_or_else(|| anyhow!("workspace `{}` not found", old_name))?
+            .clone();
+
+        // Check new name doesn't conflict
+        if refs
+            .iter()
+            .any(|r| r.kind == RefKind::Workspace && r.name == new_name)
+        {
+            bail!("workspace `{}` already exists", new_name);
+        }
+
+        let new_ref = RepoRef {
+            name: new_name.to_string(),
+            ..old_ref
+        };
+
+        store.delete(RefKind::Workspace, old_name)?;
+        store.upsert(new_ref.clone())?;
+
+        // Sync git refs if colocated
+        self.delete_git_ref_if_colocated(RefKind::Workspace, old_name)?;
+        self.sync_ref_to_git_if_colocated(&new_ref)?;
+
+        Ok(new_ref)
+    }
+
     /// Quick save: create a checkpoint with auto-generated label, optimized for agent use.
     pub fn quick_save(&self, tag: Option<String>) -> Result<Event> {
         self.assert_initialized()?;

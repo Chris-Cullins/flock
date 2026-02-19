@@ -843,6 +843,15 @@ enum WorkspaceCommand {
         #[arg(long)]
         auto_rebase: bool,
     },
+    /// Delete a workspace
+    Delete {
+        name: String,
+    },
+    /// Rename a workspace
+    Rename {
+        old_name: String,
+        new_name: String,
+    },
     /// List all workspaces
     List,
     /// Show workspace details
@@ -1057,7 +1066,14 @@ enum DirectiveCommand {
         json: bool,
     },
     /// Listen for directives targeting this actor
-    Listen,
+    Listen {
+        /// Actor name to listen for (defaults to current actor)
+        #[arg(long)]
+        actor: Option<String>,
+        /// Filter by directive kind (pause, resume, redirect, abort)
+        #[arg(long)]
+        kind: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2511,6 +2527,18 @@ fn main() -> Result<()> {
                             .unwrap_or_else(|| "none".to_string())
                     );
                 }
+                WorkspaceCommand::Delete { name } => {
+                    let removed = repo.delete_workspace(&name)?;
+                    if removed {
+                        println!("workspace {} deleted", name);
+                    } else {
+                        println!("workspace {} not found", name);
+                    }
+                }
+                WorkspaceCommand::Rename { old_name, new_name } => {
+                    let ws = repo.rename_workspace(&old_name, &new_name)?;
+                    println!("workspace {} renamed to {}", old_name, ws.name);
+                }
                 WorkspaceCommand::List => {
                     let workspaces = repo.list_workspaces()?;
                     if workspaces.is_empty() {
@@ -3221,8 +3249,8 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                DirectiveCommand::Listen => {
-                    let actor = repo.current_actor_name();
+                DirectiveCommand::Listen { actor, kind: kind_filter } => {
+                    let actor = actor.unwrap_or_else(|| repo.current_actor_name());
                     println!("listening for directives targeting {} (Ctrl+C to stop)...", actor);
 
                     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3235,6 +3263,12 @@ fn main() -> Result<()> {
                     while running.load(std::sync::atomic::Ordering::Relaxed) {
                         let directives = repo.list_directives_for_actor(&actor)?;
                         for d in directives.iter().skip(seen_count) {
+                            // Apply kind filter if specified
+                            if let Some(ref filter) = kind_filter {
+                                if d.directive_kind != *filter {
+                                    continue;
+                                }
+                            }
                             match d.directive_kind.as_str() {
                                 "pause" => {
                                     eprintln!("DIRECTIVE: paused by {}", d.issued_by);
