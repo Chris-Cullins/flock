@@ -1820,6 +1820,14 @@ impl Repo {
             action: ExplorationAction::Abandon,
         }))?;
 
+        // Restore working directory to the pre-exploration state
+        if let Some(base_event_id) = existing.base_checkpoint_event {
+            let event = self.event_by_id(base_event_id)?;
+            if let EventKind::Checkpoint(payload) = event.kind {
+                self.restore_workspace_from_snapshot(payload.snapshot_id)?;
+            }
+        }
+
         self.list_explorations()?
             .into_iter()
             .find(|entry| entry.id == id)
@@ -13719,6 +13727,47 @@ mod tests {
             .prune_explorations(std::time::Duration::from_secs(0))
             .expect("prune");
         assert_eq!(pruned, 1);
+    }
+
+    #[test]
+    fn abandon_exploration_restores_working_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // Create base state with one file
+        let file_a = dir.path().join("base.txt");
+        fs::write(&file_a, "original content").expect("write");
+        repo.create_checkpoint(Some("base".to_string()))
+            .expect("checkpoint");
+
+        // Start exploration and add a new file + modify existing
+        let exp = repo
+            .start_exploration("test-abandon".to_string())
+            .expect("start");
+        let file_b = dir.path().join("exploration-file.txt");
+        fs::write(&file_b, "new file in exploration").expect("write");
+        fs::write(&file_a, "modified in exploration").expect("write");
+        repo.create_checkpoint(Some("exploration work".to_string()))
+            .expect("checkpoint");
+
+        // Abandon the exploration
+        repo.abandon_exploration(exp.id).expect("abandon");
+
+        // Working directory should be restored to pre-exploration state
+        assert!(
+            file_a.exists(),
+            "base file should still exist after abandon"
+        );
+        assert_eq!(
+            fs::read_to_string(&file_a).expect("read"),
+            "original content",
+            "base file should be restored to original content"
+        );
+        assert!(
+            !file_b.exists(),
+            "exploration-only file should be removed after abandon"
+        );
     }
 
     #[test]
