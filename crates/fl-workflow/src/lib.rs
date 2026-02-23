@@ -1158,8 +1158,9 @@ pub fn walk_checkpoint_ancestor(events: &[Event], start_id: Uuid, steps: usize) 
 
         let parent_id = cp.parent_checkpoint_event.ok_or_else(|| {
             anyhow!(
-                "only {} checkpoint(s) exist before HEAD",
-                step
+                "cannot undo: only {} undoable checkpoint(s) exist before HEAD (requested {})",
+                step,
+                steps
             )
         })?;
 

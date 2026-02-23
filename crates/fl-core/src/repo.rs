@@ -3193,13 +3193,22 @@ impl Repo {
             bail!("no scoped file events to undo");
         }
 
+        // Clamp count to available scoped file events
+        let actual_count = count.min(file_events.len());
+        if actual_count < count {
+            eprintln!(
+                "note: only {} scoped file event(s) available to undo (requested {})",
+                actual_count, count
+            );
+        }
+
         let events_by_id: HashMap<Uuid, &Event> =
             events.iter().map(|e| (e.id, e)).collect();
 
         let to_undo: Vec<&Event> = file_events
             .iter()
             .rev()
-            .take(count)
+            .take(actual_count)
             .copied()
             .collect();
 
@@ -3236,7 +3245,7 @@ impl Repo {
                                 }
                                 _ => {
                                     bail!(
-                                        "previous file event {} is not a FileWrite or FileRename",
+                                        "cannot undo: reached an event ({}) that cannot be rolled back further; you may be at the beginning of history",
                                         prev_id
                                     );
                                 }
@@ -3283,7 +3292,7 @@ impl Repo {
                                 }
                                 _ => {
                                     bail!(
-                                        "previous file event {} is not a FileWrite or FileRename",
+                                        "cannot undo: reached an event ({}) that cannot be rolled back further; you may be at the beginning of history",
                                         prev_id
                                     );
                                 }
@@ -3709,6 +3718,15 @@ impl Repo {
             bail!("no file events to undo");
         }
 
+        // Clamp count to available file events
+        let actual_count = count.min(file_events.len());
+        if actual_count < count {
+            eprintln!(
+                "note: only {} file event(s) available to undo (requested {})",
+                actual_count, count
+            );
+        }
+
         // Build event-by-id lookup
         let events_by_id: HashMap<Uuid, &Event> =
             events.iter().map(|e| (e.id, e)).collect();
@@ -3717,7 +3735,7 @@ impl Repo {
         let to_undo: Vec<&Event> = file_events
             .iter()
             .rev()
-            .take(count)
+            .take(actual_count)
             .copied()
             .collect();
 
@@ -3756,7 +3774,7 @@ impl Repo {
                                 }
                                 _ => {
                                     bail!(
-                                        "previous file event {} is not a FileWrite or FileRename",
+                                        "cannot undo: reached an event ({}) that cannot be rolled back further; you may be at the beginning of history",
                                         prev_id
                                     );
                                 }
@@ -3805,7 +3823,7 @@ impl Repo {
                                 }
                                 _ => {
                                     bail!(
-                                        "previous file event {} is not a FileWrite or FileRename",
+                                        "cannot undo: reached an event ({}) that cannot be rolled back further; you may be at the beginning of history",
                                         prev_id
                                     );
                                 }
