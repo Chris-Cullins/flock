@@ -1136,7 +1136,24 @@ pub fn previous_checkpoint_before(events: &[Event], target_event_id: Uuid) -> Op
 
 /// Walk the `parent_checkpoint_event` chain starting from `start_id`,
 /// following `steps` parent links. Returns the ancestor checkpoint event.
-pub fn walk_checkpoint_ancestor(events: &[Event], start_id: Uuid, steps: usize) -> Result<Event> {
+/// Result of walking a checkpoint ancestor chain.
+pub struct WalkResult {
+    /// The ancestor checkpoint event reached.
+    pub event: Event,
+    /// The number of steps actually taken (may be less than requested if clamped).
+    pub steps_taken: usize,
+    /// The number of steps originally requested.
+    pub steps_requested: usize,
+}
+
+impl WalkResult {
+    /// Returns true if the walk was clamped (fewer steps taken than requested).
+    pub fn was_clamped(&self) -> bool {
+        self.steps_taken < self.steps_requested
+    }
+}
+
+pub fn walk_checkpoint_ancestor(events: &[Event], start_id: Uuid, steps: usize) -> Result<WalkResult> {
     if steps == 0 {
         bail!("steps must be >= 1");
     }
@@ -1156,13 +1173,25 @@ pub fn walk_checkpoint_ancestor(events: &[Event], start_id: Uuid, steps: usize) 
             );
         };
 
-        let parent_id = cp.parent_checkpoint_event.ok_or_else(|| {
-            anyhow!(
-                "cannot undo: only {} undoable checkpoint(s) exist before HEAD (requested {})",
-                step,
-                steps
-            )
-        })?;
+        let parent_id = match cp.parent_checkpoint_event {
+            Some(id) => id,
+            None => {
+                // Reached the root checkpoint — clamp to what's available.
+                if step == 0 {
+                    // Can't go back at all from start: this is a real error.
+                    bail!(
+                        "cannot undo: only {} undoable checkpoint(s) exist before HEAD (requested {})",
+                        step,
+                        steps
+                    );
+                }
+                return Ok(WalkResult {
+                    event: current.clone(),
+                    steps_taken: step,
+                    steps_requested: steps,
+                });
+            }
+        };
 
         current = event_map
             .get(&parent_id)
@@ -1174,7 +1203,11 @@ pub fn walk_checkpoint_ancestor(events: &[Event], start_id: Uuid, steps: usize) 
             })?;
     }
 
-    Ok(current.clone())
+    Ok(WalkResult {
+        event: current.clone(),
+        steps_taken: steps,
+        steps_requested: steps,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2567,19 +2600,22 @@ mod tests {
 
         // 1 step from cp3 -> cp2
         let result = walk_checkpoint_ancestor(&events, cp3.id, 1).unwrap();
-        assert_eq!(result.id, cp2.id);
+        assert_eq!(result.event.id, cp2.id);
+        assert_eq!(result.steps_taken, 1);
+        assert!(!result.was_clamped());
 
         // 2 steps from cp3 -> cp1
         let result = walk_checkpoint_ancestor(&events, cp3.id, 2).unwrap();
-        assert_eq!(result.id, cp1.id);
+        assert_eq!(result.event.id, cp1.id);
+        assert_eq!(result.steps_taken, 2);
+        assert!(!result.was_clamped());
 
-        // 3 steps from cp3 -> error (cp1 has no parent)
-        let err = walk_checkpoint_ancestor(&events, cp3.id, 3).unwrap_err();
-        assert!(
-            err.to_string().contains("checkpoint(s) exist before HEAD"),
-            "unexpected error: {}",
-            err
-        );
+        // 3 steps from cp3 -> clamps to cp1 (cp1 has no parent)
+        let result = walk_checkpoint_ancestor(&events, cp3.id, 3).unwrap();
+        assert_eq!(result.event.id, cp1.id);
+        assert_eq!(result.steps_taken, 2);
+        assert_eq!(result.steps_requested, 3);
+        assert!(result.was_clamped());
     }
 
     // --- Scoped undo tests ---

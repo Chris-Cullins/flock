@@ -3567,8 +3567,16 @@ impl Repo {
             .latest_checkpoint()
             .ok_or_else(|| anyhow!("cannot undo: no checkpoint exists"))?;
 
-        let ancestor = walk_checkpoint_ancestor(events, head.id, steps)?;
+        let walk = walk_checkpoint_ancestor(events, head.id, steps)?;
 
+        if walk.was_clamped() {
+            eprintln!(
+                "note: only {} undoable checkpoint(s) exist before HEAD (requested {}); undoing {}",
+                walk.steps_taken, walk.steps_requested, walk.steps_taken
+            );
+        }
+
+        let ancestor = walk.event;
         let EventKind::Checkpoint(ref ancestor_payload) = ancestor.kind else {
             bail!("expected checkpoint payload");
         };
@@ -3973,8 +3981,8 @@ impl Repo {
         // fail with a confusing "not enough checkpoints" message).
         let in_head = self.snapshot_contains_file(head_payload.snapshot_id, scoped_file)?;
 
-        let ancestor = match walk_checkpoint_ancestor(events, head.id, steps) {
-            Ok(a) => a,
+        let walk = match walk_checkpoint_ancestor(events, head.id, steps) {
+            Ok(w) => w,
             Err(e) => {
                 // If the file wasn't in head either, surface the file-not-found
                 // error instead of the chain-walk error (e.g. "only 0 undoable
@@ -3989,6 +3997,14 @@ impl Repo {
             }
         };
 
+        if walk.was_clamped() {
+            eprintln!(
+                "note: only {} undoable checkpoint(s) exist before HEAD (requested {}); undoing {}",
+                walk.steps_taken, walk.steps_requested, walk.steps_taken
+            );
+        }
+
+        let ancestor = walk.event;
         let EventKind::Checkpoint(ref ancestor_payload) = ancestor.kind else {
             bail!("expected checkpoint payload");
         };
@@ -12680,7 +12696,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_past_beginning_of_chain_errors() {
+    fn undo_past_beginning_of_chain_clamps_gracefully() {
         let dir = tempfile::tempdir().expect("tempdir should be created");
         let repo = Repo::at(dir.path());
         repo.init().expect("repo init should succeed");
@@ -12692,13 +12708,17 @@ mod tests {
         fs::write(&file, "v2").expect("write");
         repo.create_checkpoint(Some("cp2".to_string())).expect("cp2");
 
-        // Trying to undo 3 steps with only 2 checkpoints should error
-        let err = repo.undo(UndoRequest::N(3)).unwrap_err();
+        // Trying to undo 3 steps with only 2 checkpoints should clamp to 1
+        // (undo back to cp1) and succeed gracefully
+        let result = repo.undo(UndoRequest::N(3)).expect("undo should clamp gracefully");
         assert!(
-            err.to_string().contains("checkpoint(s) exist before HEAD"),
-            "unexpected error: {}",
-            err
+            result.restored_checkpoint_event.is_some(),
+            "should have restored a checkpoint"
         );
+
+        // Working directory should be restored to v1 (the earliest checkpoint)
+        let content = fs::read_to_string(&file).expect("read");
+        assert_eq!(content, "v1", "working directory should be restored to cp1");
     }
 
     #[test]
