@@ -10043,12 +10043,22 @@ impl Repo {
         let depth = entry.clone_depth;
         let lazy = entry.lazy;
 
-        let report = self.pull_with_options(roost_name, branch, depth, &sparse, lazy, force)?;
+        let mut report = self.pull_with_options(roost_name, branch, depth, &sparse, lazy, force)?;
 
         // Restore working directory from the latest pulled checkpoint so that
-        // the workspace reflects the updated HEAD after pull.
+        // the workspace reflects the updated HEAD after pull — but only when
+        // safe to do so. If repos have diverged, restoring from the remote's
+        // latest checkpoint would silently lose local commit content.
         if !lazy && report.events_pulled > 0 {
-            if let Some(cp_event) = self.latest_checkpoint() {
+            if report.diverged {
+                // Repos have diverged (force pull). Preserve the local working
+                // directory — the user needs to merge/rebase explicitly.
+                eprintln!(
+                    "warning: local and remote have diverged. Working directory preserved \
+                     at local state. Use `fl merge` or `fl rebase` to reconcile."
+                );
+                report.workspace_preserved = true;
+            } else if let Some(cp_event) = self.latest_checkpoint() {
                 if let EventKind::Checkpoint(cp) = &cp_event.kind {
                     self.restore_workspace_from_snapshot(cp.snapshot_id)?;
                 }
@@ -10183,6 +10193,8 @@ impl Repo {
                 events_pulled: 0,
                 blocks_downloaded: 0,
                 refs_updated: vec![],
+                diverged: false,
+                workspace_preserved: false,
             });
         }
 
@@ -10190,7 +10202,7 @@ impl Repo {
 
         // Divergence check: if local has checkpoint events after the last sync
         // point AND the remote is sending new events, the repos have diverged.
-        if !force {
+        let has_local_diverged_checkpoints = {
             let local_events = AutoEventLog::for_root(self.root()).read_all()?;
             let local_after_sync: Vec<&Event> = if let Some(last_synced) = entry.last_synced_event {
                 let pos = local_events.iter().position(|e| e.id == last_synced);
@@ -10201,15 +10213,15 @@ impl Repo {
             } else {
                 local_events.iter().collect()
             };
-            let has_local_checkpoints = local_after_sync.iter().any(|e| {
+            local_after_sync.iter().any(|e| {
                 matches!(e.kind, EventKind::Checkpoint(_))
-            });
-            if has_local_checkpoints {
-                anyhow::bail!(
-                    "local and remote have diverged: you have local commit(s) that the remote \
-                     does not. Push your local changes first, or use --force to overwrite local state."
-                );
-            }
+            })
+        };
+        if has_local_diverged_checkpoints && !force {
+            anyhow::bail!(
+                "local and remote have diverged: you have local commit(s) that the remote \
+                 does not. Push your local changes first, or use --force to overwrite local state."
+            );
         }
 
         // Download missing snapshots (unless lazy).
@@ -10322,6 +10334,8 @@ impl Repo {
                 events_pulled: 0,
                 blocks_downloaded,
                 refs_updated,
+                diverged: has_local_diverged_checkpoints,
+                workspace_preserved: false,
             });
         }
 
@@ -10404,6 +10418,8 @@ impl Repo {
             events_pulled,
             blocks_downloaded,
             refs_updated,
+            diverged: has_local_diverged_checkpoints,
+            workspace_preserved: false,
         })
     }
 
@@ -15507,5 +15523,113 @@ mod tests {
         // File should be back to v1
         let content = fs::read_to_string(&file).expect("read");
         assert_eq!(content, "v1");
+    }
+
+    #[test]
+    fn pull_force_on_diverged_repos_preserves_working_directory() {
+        // Create a source repo with a checkpoint.
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repo::at(source_dir.path());
+        source.init().unwrap();
+        fs::write(source_dir.path().join("shared.txt"), "shared").unwrap();
+        source.create_checkpoint(Some("initial".to_string())).unwrap();
+
+        // Clone to a local repo.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let target = clone_dir.path().join("cloned");
+        let source_url = format!("file://{}", source_dir.path().display());
+        Repo::clone_from(&source_url, &target, None, vec![], false, None).unwrap();
+
+        let local = Repo::discover(&target).unwrap();
+
+        // Local diverges: create a local-only checkpoint.
+        fs::write(target.join("local.txt"), "local content").unwrap();
+        local.create_checkpoint(Some("local commit".to_string())).unwrap();
+
+        // Remote diverges: create a remote-only checkpoint.
+        fs::write(source_dir.path().join("remote.txt"), "remote content").unwrap();
+        source.create_checkpoint(Some("remote commit".to_string())).unwrap();
+
+        // Force pull — should NOT overwrite local working directory.
+        let report = local.pull("origin", None, true).unwrap();
+
+        assert!(report.diverged, "report should indicate divergence");
+        assert!(report.workspace_preserved, "working directory should be preserved");
+
+        // Local file should still exist in working directory.
+        assert!(
+            target.join("local.txt").exists(),
+            "local.txt should still be in working directory after diverged pull"
+        );
+        let content = fs::read_to_string(target.join("local.txt")).unwrap();
+        assert_eq!(content, "local content");
+    }
+
+    #[test]
+    fn pull_fastforward_clean_updates_workspace() {
+        // Create a source repo with a checkpoint.
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repo::at(source_dir.path());
+        source.init().unwrap();
+        fs::write(source_dir.path().join("a.txt"), "a").unwrap();
+        source.create_checkpoint(Some("initial".to_string())).unwrap();
+
+        // Clone.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let target = clone_dir.path().join("cloned");
+        let source_url = format!("file://{}", source_dir.path().display());
+        Repo::clone_from(&source_url, &target, None, vec![], false, None).unwrap();
+
+        let local = Repo::discover(&target).unwrap();
+
+        // Remote advances with a new checkpoint.
+        fs::write(source_dir.path().join("b.txt"), "b").unwrap();
+        source.create_checkpoint(Some("second".to_string())).unwrap();
+
+        // Pull — fast-forward, clean working dir.
+        let report = local.pull("origin", None, false).unwrap();
+
+        assert!(!report.diverged, "should not be diverged");
+        assert!(!report.workspace_preserved, "workspace should be updated");
+
+        // New file from remote should exist in working directory.
+        assert!(
+            target.join("b.txt").exists(),
+            "b.txt should exist after fast-forward pull"
+        );
+    }
+
+    #[test]
+    fn pull_diverged_without_force_is_rejected() {
+        // Create a source repo.
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Repo::at(source_dir.path());
+        source.init().unwrap();
+        fs::write(source_dir.path().join("shared.txt"), "shared").unwrap();
+        source.create_checkpoint(Some("initial".to_string())).unwrap();
+
+        // Clone.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let target = clone_dir.path().join("cloned");
+        let source_url = format!("file://{}", source_dir.path().display());
+        Repo::clone_from(&source_url, &target, None, vec![], false, None).unwrap();
+
+        let local = Repo::discover(&target).unwrap();
+
+        // Both diverge.
+        fs::write(target.join("local.txt"), "local").unwrap();
+        local.create_checkpoint(Some("local".to_string())).unwrap();
+        fs::write(source_dir.path().join("remote.txt"), "remote").unwrap();
+        source.create_checkpoint(Some("remote".to_string())).unwrap();
+
+        // Pull without force should fail.
+        let result = local.pull("origin", None, false);
+        assert!(result.is_err(), "diverged pull without --force should be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("diverged"),
+            "error should mention divergence: {}",
+            err
+        );
     }
 }

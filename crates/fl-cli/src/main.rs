@@ -4061,6 +4061,11 @@ fn main() -> Result<()> {
                 if !report.refs_updated.is_empty() {
                     println!("refs updated: {}", report.refs_updated.join(", "));
                 }
+                if report.diverged && report.workspace_preserved {
+                    println!(
+                        "note: repos have diverged — working directory was preserved at local state."
+                    );
+                }
             }
         }
         Command::Clone {

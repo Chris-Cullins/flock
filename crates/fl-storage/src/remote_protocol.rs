@@ -308,6 +308,10 @@ pub struct PullReport {
     pub events_pulled: usize,
     pub blocks_downloaded: usize,
     pub refs_updated: Vec<String>,
+    /// True if local had checkpoint(s) that the remote didn't (repos diverged).
+    pub diverged: bool,
+    /// True if the working directory was NOT updated to the remote HEAD.
+    pub workspace_preserved: bool,
 }
 
 #[derive(Debug, Clone)]
