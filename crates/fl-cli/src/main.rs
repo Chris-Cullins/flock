@@ -965,6 +965,12 @@ enum TaskCommand {
         /// Allowed path patterns for scope enforcement (glob)
         #[arg(long = "scope")]
         scope: Vec<String>,
+        /// Task priority: critical, high, medium (default), low, backlog
+        #[arg(long, default_value = "medium")]
+        priority: String,
+        /// Task kind: feature (default), bugfix, refactor, test, docs, discovery
+        #[arg(long, default_value = "feature")]
+        kind: String,
     },
     /// List tasks (open and claimed by default)
     List {
@@ -2958,6 +2964,8 @@ fn main() -> Result<()> {
                     depends_on,
                     discovered_from,
                     scope,
+                    priority,
+                    kind,
                 } => {
                     let deps = depends_on
                         .iter()
@@ -2969,7 +2977,21 @@ fn main() -> Result<()> {
                         .filter(|s| !s.is_empty())
                         .map(|s| -> Result<Uuid> { Ok(repo.find_task_by_prefix(s)?.id) })
                         .transpose()?;
-                    let task = repo.create_task(title, description, deps, discovered, scope)?;
+                    let priority: fl_core::TaskPriority = serde_json::from_value(
+                        serde_json::Value::String(priority.to_lowercase()),
+                    )
+                    .map_err(|_| anyhow::anyhow!(
+                        "invalid priority '{}': expected critical, high, medium, low, or backlog",
+                        priority
+                    ))?;
+                    let kind: fl_core::TaskKind = serde_json::from_value(
+                        serde_json::Value::String(kind.to_lowercase()),
+                    )
+                    .map_err(|_| anyhow::anyhow!(
+                        "invalid kind '{}': expected feature, bugfix, refactor, test, docs, or discovery",
+                        kind
+                    ))?;
+                    let task = repo.create_task(title, description, deps, discovered, scope, priority, kind)?;
                     println!("task {} created: {}", task.id, task.title);
                 }
                 TaskCommand::List { all, json, live } => {
@@ -3041,6 +3063,8 @@ fn main() -> Result<()> {
                     if let Some(desc) = &task.description {
                         println!("  Description: {}", desc);
                     }
+                    println!("  Priority: {}", task.priority);
+                    println!("  Kind: {}", task.kind);
                     println!("  Status: {}", task.status);
                     if let Some(assignee) = &task.assignee {
                         println!("  Assignee: {}", assignee);
@@ -5432,6 +5456,8 @@ fn task_to_json(task: &fl_core::TaskSummary) -> serde_json::Value {
         "result": task.result,
         "linked_events": task.linked_events.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
         "discovered_from": task.discovered_from.map(|id| id.to_string()),
+        "priority": task.priority.to_string(),
+        "kind": task.kind.to_string(),
     })
 }
 

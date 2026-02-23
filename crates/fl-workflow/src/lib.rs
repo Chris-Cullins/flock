@@ -116,6 +116,64 @@ pub enum TaskStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskPriority {
+    Critical,
+    High,
+    Medium,
+    Low,
+    Backlog,
+}
+
+impl Default for TaskPriority {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+impl fmt::Display for TaskPriority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Critical => f.write_str("critical"),
+            Self::High => f.write_str("high"),
+            Self::Medium => f.write_str("medium"),
+            Self::Low => f.write_str("low"),
+            Self::Backlog => f.write_str("backlog"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskKind {
+    Feature,
+    Bugfix,
+    Refactor,
+    Test,
+    Docs,
+    Discovery,
+}
+
+impl Default for TaskKind {
+    fn default() -> Self {
+        Self::Feature
+    }
+}
+
+impl fmt::Display for TaskKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Feature => f.write_str("feature"),
+            Self::Bugfix => f.write_str("bugfix"),
+            Self::Refactor => f.write_str("refactor"),
+            Self::Test => f.write_str("test"),
+            Self::Docs => f.write_str("docs"),
+            Self::Discovery => f.write_str("discovery"),
+        }
+    }
+}
+
 impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -144,6 +202,10 @@ pub struct TaskSummary {
     pub discovered_from: Option<Uuid>,
     #[serde(default)]
     pub allowed_paths: Vec<String>,
+    #[serde(default)]
+    pub priority: TaskPriority,
+    #[serde(default)]
+    pub kind: TaskKind,
 }
 
 impl TaskSummary {
@@ -816,6 +878,12 @@ impl ReplayAccumulator {
             },
             EventKind::Task(task) => match task.action {
                 TaskAction::Create => {
+                    let priority = task.priority.as_deref()
+                        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+                        .unwrap_or_default();
+                    let kind = task.kind.as_deref()
+                        .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+                        .unwrap_or_default();
                     self.tasks.insert(
                         task.task_id,
                         TaskSummary {
@@ -833,6 +901,8 @@ impl ReplayAccumulator {
                             linked_events: task.linked_events.clone(),
                             discovered_from: task.discovered_from,
                             allowed_paths: task.allowed_paths.clone(),
+                            priority,
+                            kind,
                         },
                     );
                 }
@@ -1901,6 +1971,8 @@ mod tests {
             linked_events: Vec::new(),
             discovered_from: None,
             allowed_paths: Vec::new(),
+            priority: None,
+            kind: None,
         }
     }
 

@@ -38,7 +38,8 @@ pub use repo::{
     RemoteLoginResult, StashEntry, StatusReport, RebaseSummary, ReplayedState, Repo,
     ResourceUsageTotals, ReviewStats, ReviewSummary, SessionReplay, SessionStatus, SessionSummary,
     ShadowSafetyCheck, ShadowSafetyReport, SubscriptionNotify, SubscriptionStatus,
-    SubscriptionSummary, TaskEdge, TaskGraph, TaskRelation, TaskStatus, TaskSummary, TextFileDiff,
+    SubscriptionSummary, TaskEdge, TaskGraph, TaskKind, TaskPriority, TaskRelation, TaskStatus,
+    TaskSummary, TextFileDiff,
     UndoRequest, UndoResult, UndoScope, WhoReport, ActorSummary, WorkspaceInfo,
 };
 pub use intelligence::{

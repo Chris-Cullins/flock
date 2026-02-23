@@ -48,8 +48,8 @@ pub use fl_collab::{
 pub use fl_workflow::parse_duration_spec;
 pub use fl_workflow::{
     DecisionSummary, ExplorationStatus, ExplorationSummary, FileState, ReplayedState,
-    ResourceUsageTotals, SessionStatus, SessionSummary, TaskEdge, TaskGraph, TaskRelation,
-    TaskStatus, TaskSummary, UndoRequest, UndoResult, UndoScope,
+    ResourceUsageTotals, SessionStatus, SessionSummary, TaskEdge, TaskGraph, TaskKind,
+    TaskPriority, TaskRelation, TaskStatus, TaskSummary, UndoRequest, UndoResult, UndoScope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2676,6 +2676,8 @@ impl Repo {
         dependencies: Vec<Uuid>,
         discovered_from: Option<Uuid>,
         allowed_paths: Vec<String>,
+        priority: TaskPriority,
+        kind: TaskKind,
     ) -> Result<TaskSummary> {
         self.assert_initialized()?;
 
@@ -2702,6 +2704,8 @@ impl Repo {
             linked_events: Vec::new(),
             discovered_from,
             allowed_paths: allowed_paths.clone(),
+            priority: Some(priority.to_string()),
+            kind: Some(kind.to_string()),
         }))?;
 
         Ok(TaskSummary {
@@ -2719,6 +2723,8 @@ impl Repo {
             linked_events: Vec::new(),
             discovered_from,
             allowed_paths,
+            priority,
+            kind,
         })
     }
 
@@ -2786,6 +2792,8 @@ impl Repo {
             linked_events: Vec::new(),
             discovered_from: None,
             allowed_paths: Vec::new(),
+            priority: None,
+            kind: None,
         }))?;
 
         self.task_info(task_id)
@@ -2814,6 +2822,8 @@ impl Repo {
             linked_events: Vec::new(),
             discovered_from: None,
             allowed_paths: Vec::new(),
+            priority: None,
+            kind: None,
         }))?;
 
         self.task_info(task_id)
@@ -2842,6 +2852,8 @@ impl Repo {
             linked_events: Vec::new(),
             discovered_from: None,
             allowed_paths: Vec::new(),
+            priority: None,
+            kind: None,
         }))?;
 
         self.task_info(task_id)
@@ -2870,6 +2882,8 @@ impl Repo {
             linked_events: Vec::new(),
             discovered_from: None,
             allowed_paths: Vec::new(),
+            priority: None,
+            kind: None,
         }))?;
 
         self.task_info(task_id)
@@ -2898,6 +2912,8 @@ impl Repo {
             linked_events: event_ids,
             discovered_from: None,
             allowed_paths: Vec::new(),
+            priority: None,
+            kind: None,
         }))?;
 
         Ok(())
@@ -6067,6 +6083,8 @@ impl Repo {
             vec![],
             Some(source_task_id),
             out_of_scope_files.to_vec(),
+            TaskPriority::Medium,
+            TaskKind::Discovery,
         )?;
         Ok(())
     }
@@ -14954,7 +14972,7 @@ mod tests {
         repo.init().expect("init");
 
         let task = repo
-            .create_task("test task".to_string(), None, vec![], None, vec![])
+            .create_task("test task".to_string(), None, vec![], None, vec![], TaskPriority::default(), TaskKind::default())
             .expect("create task");
         let full_id = task.id.to_string();
         let prefix = &full_id[..8];

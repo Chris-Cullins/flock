@@ -458,6 +458,8 @@ mod tests {
                 linked_events: vec![],
                 discovered_from: None,
                 allowed_paths: Vec::new(),
+                priority: None,
+                kind: None,
             }),
         }
     }
