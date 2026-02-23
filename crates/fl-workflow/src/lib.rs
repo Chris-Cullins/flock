@@ -991,11 +991,29 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
         })
         .collect();
 
+    // Pre-scan: collect event IDs that are targets of full (non-file-scoped,
+    // non-undo-scoped) undo events.  We only need to store pre-event state
+    // snapshots for these targets.  Without this optimisation, cloning the
+    // full ReplayAccumulator for every single event (including thousands of
+    // FileWrite events) is O(n^2) in both time and memory.
+    let undo_targets: std::collections::HashSet<Uuid> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Undo(undo)
+                if undo.file_scope.is_none() && undo.undo_scope.is_none() =>
+            {
+                Some(undo.target_event_id)
+            }
+            _ => None,
+        })
+        .collect();
+
     let mut state = ReplayAccumulator::default();
     let mut state_before_event = BTreeMap::<Uuid, ReplayAccumulator>::new();
+    let mut seen_ids = std::collections::HashSet::<Uuid>::new();
 
     for event in events {
-        if state_before_event.contains_key(&event.id) {
+        if !seen_ids.insert(event.id) {
             // Skip duplicate event IDs gracefully.  This can happen after a
             // backup restore + pull where the same events appear twice in the
             // log.  Crashing here would make many commands unusable (issue #80).
@@ -1005,7 +1023,12 @@ pub fn replay_state(events: &[Event]) -> Result<ReplayedState> {
             );
             continue;
         }
-        state_before_event.insert(event.id, state.clone());
+
+        // Only store pre-event state for events that are actual undo targets.
+        // This avoids O(n^2) cloning when there are thousands of file events.
+        if undo_targets.contains(&event.id) {
+            state_before_event.insert(event.id, state.clone());
+        }
 
         state.apply_event(event, &checkpoints, &state_before_event)?;
     }
@@ -1051,18 +1074,34 @@ pub fn replay_state_incremental(
         })
         .collect();
 
+    // Pre-scan: collect undo targets in the incremental range.
+    let undo_targets: std::collections::HashSet<Uuid> = events[start_index..]
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Undo(undo)
+                if undo.file_scope.is_none() && undo.undo_scope.is_none() =>
+            {
+                Some(undo.target_event_id)
+            }
+            _ => None,
+        })
+        .collect();
+
     let mut state = ReplayAccumulator::from(base_state);
     let mut state_before_event = BTreeMap::<Uuid, ReplayAccumulator>::new();
+    let mut seen_ids = std::collections::HashSet::<Uuid>::new();
 
     for event in &events[start_index..] {
-        if state_before_event.contains_key(&event.id) {
+        if !seen_ids.insert(event.id) {
             eprintln!(
                 "warning: skipping duplicate event id {} during incremental replay",
                 event.id
             );
             continue;
         }
-        state_before_event.insert(event.id, state.clone());
+        if undo_targets.contains(&event.id) {
+            state_before_event.insert(event.id, state.clone());
+        }
 
         state.apply_event(event, &checkpoints, &state_before_event)?;
     }
