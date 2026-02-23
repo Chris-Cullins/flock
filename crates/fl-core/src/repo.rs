@@ -3663,6 +3663,24 @@ impl Repo {
                 None,
             )?;
             restored_checkpoint_event = Some(checkpoint_event.id);
+        } else {
+            // Non-checkpoint, non-undo event (e.g. FileWrite, Session, Exploration).
+            // Restore workspace to the most recent checkpoint before the target event.
+            if let Some(previous_checkpoint) = previous_checkpoint_before(events, target.id) {
+                let EventKind::Checkpoint(payload) = previous_checkpoint.kind else {
+                    bail!("expected checkpoint payload")
+                };
+
+                self.restore_workspace_from_snapshot(payload.snapshot_id)?;
+
+                let checkpoint_event = self.create_checkpoint_with_lineage(
+                    format!("undo-{}", target.id.simple()),
+                    Some(format!("undo target {}", target.id)),
+                    Some(previous_checkpoint.id),
+                    None,
+                )?;
+                restored_checkpoint_event = Some(checkpoint_event.id);
+            }
         }
 
         self.append_event(EventKind::Undo(UndoEvent {
@@ -12601,6 +12619,48 @@ mod tests {
         // undo --n 2: v3 -> v1
         repo.undo(UndoRequest::N(2)).expect("undo n=2");
         assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
+    }
+
+    #[test]
+    fn undo_targeting_non_checkpoint_event_restores_working_directory() {
+        // In native mode, `fl commit` emits FileWrite events before the Checkpoint.
+        // When `--since` resolves to one of those FileWrite events (rather than the
+        // Checkpoint itself), undo should still restore the working directory to the
+        // state of the previous checkpoint.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_native().expect("native init should succeed");
+
+        let file = dir.path().join("since.txt");
+        fs::write(&file, "v1").expect("write");
+        repo.create_checkpoint(Some("cp1".to_string())).expect("cp1");
+
+        fs::write(&file, "v2").expect("write");
+        repo.create_checkpoint(Some("cp2".to_string())).expect("cp2");
+
+        // Find a FileWrite event that was created as part of cp2.
+        // These are emitted by snapshot_working_directory() inside
+        // create_checkpoint in native mode.
+        let events = repo.list_events().expect("list events");
+        let file_write_event = events.iter().rev().find(|e| {
+            matches!(e.kind, EventKind::FileWrite(_))
+        }).expect("should have FileWrite events in native mode");
+
+        // Use UndoRequest::To targeting the FileWrite event — this simulates
+        // what happens when --since resolves to a FileWrite instead of a Checkpoint.
+        let result = repo
+            .undo(UndoRequest::To(file_write_event.id.to_string()))
+            .expect("undo targeting FileWrite should succeed");
+
+        // Must have a restored checkpoint (working dir restored)
+        assert!(
+            result.restored_checkpoint_event.is_some(),
+            "undo targeting non-checkpoint event should restore a checkpoint"
+        );
+
+        // Working directory file should be restored to v1
+        let content = fs::read_to_string(&file).expect("read");
+        assert_eq!(content, "v1", "working directory should be restored to v1");
     }
 
     #[test]
