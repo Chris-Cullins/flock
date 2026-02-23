@@ -78,7 +78,7 @@ pub fn find_roost_mut<'a>(config: &'a mut RoostsConfig, name: &str) -> Option<&'
 }
 
 /// Add a roost. Errors if the name is already taken.
-pub fn add_roost(config: &mut RoostsConfig, name: &str, url: &str) -> Result<()> {
+pub fn add_roost(config: &mut RoostsConfig, name: &str, url: &str, token: Option<&str>) -> Result<()> {
     if find_roost(config, name).is_some() {
         bail!("roost '{}' already exists", name);
     }
@@ -86,7 +86,7 @@ pub fn add_roost(config: &mut RoostsConfig, name: &str, url: &str) -> Result<()>
         name: name.to_string(),
         url: url.to_string(),
         last_synced_event: None,
-        token: None,
+        token: token.map(|t| t.to_string()),
         clone_depth: None,
         sparse_patterns: Vec::new(),
         lazy: false,
@@ -123,7 +123,7 @@ mod tests {
         fs::create_dir_all(dir.path().join(FLOCK_DIR)).unwrap();
 
         let mut config = RoostsConfig::default();
-        add_roost(&mut config, "origin", "flock://example.com/acme/repo").unwrap();
+        add_roost(&mut config, "origin", "flock://example.com/acme/repo", None).unwrap();
         save_roosts(dir.path(), &config).unwrap();
 
         let loaded = load_roosts(dir.path()).unwrap();
@@ -135,8 +135,8 @@ mod tests {
     #[test]
     fn add_duplicate_fails() {
         let mut config = RoostsConfig::default();
-        add_roost(&mut config, "origin", "flock://a.com/x/y").unwrap();
-        assert!(add_roost(&mut config, "origin", "flock://b.com/x/y").is_err());
+        add_roost(&mut config, "origin", "flock://a.com/x/y", None).unwrap();
+        assert!(add_roost(&mut config, "origin", "flock://b.com/x/y", None).is_err());
     }
 
     #[test]
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn find_and_mutate() {
         let mut config = RoostsConfig::default();
-        add_roost(&mut config, "origin", "flock://a.com/x/y").unwrap();
+        add_roost(&mut config, "origin", "flock://a.com/x/y", None).unwrap();
         let entry = find_roost_mut(&mut config, "origin").unwrap();
         entry.url = "flock://b.com/x/y".to_string();
         assert_eq!(find_roost(&config, "origin").unwrap().url, "flock://b.com/x/y");

@@ -9410,12 +9410,12 @@ impl Repo {
     // Roost (remote) management
     // -----------------------------------------------------------------------
 
-    pub fn roost_add(&self, name: &str, url: &str) -> Result<()> {
+    pub fn roost_add(&self, name: &str, url: &str, token: Option<&str>) -> Result<()> {
         self.assert_initialized()?;
         // Validate the URL parses.
         fl_storage::RemoteUrl::parse(url)?;
         let mut config = fl_storage::load_roosts(self.root())?;
-        fl_storage::add_roost(&mut config, name, url)?;
+        fl_storage::add_roost(&mut config, name, url, token)?;
         fl_storage::save_roosts(self.root(), &config)?;
         Ok(())
     }
@@ -9839,7 +9839,7 @@ impl Repo {
         // Initialize with git-compatible layout first; we'll switch to native
         // after pulling if the remote's Init event says mode=native.
         repo.init_layout(RepoMode::GitCompatible)?;
-        repo.roost_add("origin", url)?;
+        repo.roost_add("origin", url, None)?;
 
         // Compute sparse patterns from focus target if specified.
         let final_sparse = if let Some(target) = focus_target {
@@ -14850,7 +14850,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repo::at(dir.path());
         repo.init().unwrap();
-        repo.roost_add("origin", "file:///tmp/fake").unwrap();
+        repo.roost_add("origin", "file:///tmp/fake", None).unwrap();
 
         // Add sparse patterns.
         repo.sparse_add("origin", "src/**").unwrap();
@@ -14873,7 +14873,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repo::at(dir.path());
         repo.init().unwrap();
-        repo.roost_add("origin", "file:///tmp/fake").unwrap();
+        repo.roost_add("origin", "file:///tmp/fake", None).unwrap();
 
         // Pin list starts empty.
         assert!(repo.pin_list("origin").unwrap().is_empty());

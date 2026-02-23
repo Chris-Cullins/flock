@@ -672,6 +672,9 @@ enum RoostCommand {
     Add {
         name: String,
         url: String,
+        /// Bearer token for authentication
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Remove a roost
     Remove {
@@ -3972,8 +3975,8 @@ fn main() -> Result<()> {
         Command::Roost { command } => {
             let repo = Repo::discover(cwd)?;
             match command {
-                RoostCommand::Add { name, url } => {
-                    repo.roost_add(&name, &url)?;
+                RoostCommand::Add { name, url, token } => {
+                    repo.roost_add(&name, &url, token.as_deref())?;
                     println!("roost '{}' added: {}", name, url);
                 }
                 RoostCommand::Remove { name } => {
