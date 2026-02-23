@@ -489,6 +489,15 @@ impl ReplayAccumulator {
                         entry.status = ExplorationStatus::Abandoned;
                         entry.updated_at = event.timestamp.clone();
                     }
+                    // Restore the checkpoint pointer to the pre-exploration
+                    // state so that `fl status` compares against the correct
+                    // baseline after abandoning an exploration.
+                    if let Some(base_event_id) = exploration.base_checkpoint_event {
+                        if let Some(&snapshot_id) = checkpoints.get(&base_event_id) {
+                            self.latest_checkpoint_event_id = Some(base_event_id);
+                            self.latest_checkpoint_snapshot_id = Some(snapshot_id);
+                        }
+                    }
                 }
                 ExplorationAction::Prune => {
                     self.explorations.remove(&exploration.exploration_id);

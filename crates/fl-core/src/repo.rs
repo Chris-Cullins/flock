@@ -13988,6 +13988,15 @@ mod tests {
             !file_b.exists(),
             "exploration-only file should be removed after abandon"
         );
+
+        // HEAD should point back to the pre-exploration checkpoint, not the
+        // exploration's checkpoint.
+        let status = repo.status().expect("status");
+        assert!(
+            status.new_files.is_empty() && status.modified_files.is_empty() && status.deleted_files.is_empty(),
+            "status should be clean after abandon restores to base checkpoint, got: new={:?}, modified={:?}, deleted={:?}",
+            status.new_files, status.modified_files, status.deleted_files,
+        );
     }
 
     #[test]
