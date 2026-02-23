@@ -3690,10 +3690,24 @@ impl Repo {
         )?;
         let restored_checkpoint_event = Some(checkpoint_event.id);
 
-        let mode = to_undo_mode(request, head.id);
+        // In native mode, file events (FileWrite/FileDelete/FileRename) are
+        // emitted before the checkpoint they belong to.  When we undo a
+        // checkpoint, the replay must also rewind past those file events so
+        // that file_states stays consistent with the restored working
+        // directory.  To achieve this, target the undo at the first event
+        // after the ancestor checkpoint rather than at HEAD.  This way the
+        // state rewind in replay goes to the ancestor's state (before the
+        // intermediate file events), keeping file_states in sync.
+        let ancestor_idx = events.iter().position(|e| e.id == ancestor.id);
+        let undo_target_id = ancestor_idx
+            .and_then(|idx| events.get(idx + 1))
+            .map(|e| e.id)
+            .unwrap_or(head.id);
+
+        let mode = to_undo_mode(request, undo_target_id);
 
         self.append_event(EventKind::Undo(UndoEvent {
-            target_event_id: head.id,
+            target_event_id: undo_target_id,
             mode,
             restored_checkpoint_event,
             file_scope: None,
@@ -3701,7 +3715,7 @@ impl Repo {
         }))?;
 
         Ok(UndoResult {
-            target_event_id: head.id,
+            target_event_id: undo_target_id,
             restored_checkpoint_event,
         })
     }
@@ -12933,6 +12947,42 @@ mod tests {
             panic!("expected checkpoint");
         };
         assert_eq!(r2_payload.parent_checkpoint_event, None);
+    }
+
+    /// Regression test for #112: after undo, file_states must be consistent
+    /// with the restored working directory so that a subsequent undo (or
+    /// snapshot_working_directory) does not emit spurious file events.
+    #[test]
+    fn undo_keeps_file_states_consistent_in_native_mode() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init_native().expect("native init should succeed");
+
+        let file = dir.path().join("test.txt");
+        fs::write(&file, "v1").expect("write");
+        repo.create_checkpoint(Some("cp1".to_string())).expect("cp1");
+
+        fs::write(&file, "v2").expect("write");
+        repo.create_checkpoint(Some("cp2".to_string())).expect("cp2");
+
+        fs::write(&file, "v3").expect("write");
+        repo.create_checkpoint(Some("cp3".to_string())).expect("cp3");
+
+        // Undo once: v3 → v2
+        repo.undo(UndoRequest::Last).expect("undo 1");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v2");
+
+        // snapshot_working_directory should emit zero events because the
+        // working dir matches the restored state (file_states are in sync).
+        let emitted = repo.snapshot_working_directory().expect("snapshot");
+        assert_eq!(emitted, 0, "expected no file events after undo (file_states should be in sync)");
+
+        // Second undo: v2 → v1 (no spurious modified status)
+        repo.undo(UndoRequest::Last).expect("undo 2");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "v1");
+
+        let emitted = repo.snapshot_working_directory().expect("snapshot");
+        assert_eq!(emitted, 0, "expected no file events after second undo");
     }
 
     #[test]
