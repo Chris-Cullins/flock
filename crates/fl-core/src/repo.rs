@@ -1692,6 +1692,18 @@ impl Repo {
         let task_id = self.active_task_id();
         self.enforce_rate_limit_policy(task_id, None)?;
 
+        // Reject duplicate names among active explorations.
+        let state = self.replay_state()?;
+        let has_duplicate = state.explorations.values().any(|e| {
+            e.title == title && e.status == ExplorationStatus::Active
+        });
+        if has_duplicate {
+            anyhow::bail!(
+                "exploration named '{}' already exists (use a different name or abandon the existing one first)",
+                title
+            );
+        }
+
         let id = Uuid::new_v4();
         let base_checkpoint_event = self.latest_checkpoint().map(|event| event.id);
         let event = self.append_event(EventKind::Exploration(ExplorationEvent {
