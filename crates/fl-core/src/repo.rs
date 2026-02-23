@@ -3963,20 +3963,36 @@ impl Repo {
             .latest_checkpoint()
             .ok_or_else(|| anyhow!("cannot undo: no checkpoint exists"))?;
 
-        let ancestor = walk_checkpoint_ancestor(events, head.id, steps)?;
-
         let EventKind::Checkpoint(ref head_payload) = head.kind else {
             bail!("expected checkpoint payload");
         };
+
+        // Check if the file exists in the head checkpoint before walking the
+        // ancestor chain. This gives a clear "file not found" error even when
+        // there's only one checkpoint (where the ancestor walk would otherwise
+        // fail with a confusing "not enough checkpoints" message).
+        let in_head = self.snapshot_contains_file(head_payload.snapshot_id, scoped_file)?;
+
+        let ancestor = match walk_checkpoint_ancestor(events, head.id, steps) {
+            Ok(a) => a,
+            Err(e) => {
+                // If the file wasn't in head either, surface the file-not-found
+                // error instead of the chain-walk error (e.g. "only 0 undoable
+                // checkpoints exist").
+                if !in_head {
+                    bail!(
+                        "file '{}' was not found in the last commit or its predecessor",
+                        scoped_file_display
+                    );
+                }
+                return Err(e);
+            }
+        };
+
         let EventKind::Checkpoint(ref ancestor_payload) = ancestor.kind else {
             bail!("expected checkpoint payload");
         };
 
-        // Check that the file actually exists in either the head or ancestor
-        // snapshot — otherwise the undo is a no-op on a file that was never
-        // tracked and we should give a clear error instead of silently creating
-        // a useless checkpoint.
-        let in_head = self.snapshot_contains_file(head_payload.snapshot_id, scoped_file)?;
         let in_ancestor =
             self.snapshot_contains_file(ancestor_payload.snapshot_id, scoped_file)?;
         if !in_head && !in_ancestor {
@@ -12829,6 +12845,29 @@ mod tests {
 
         fs::write(&tracked, "hello v2").expect("write should succeed");
         repo.create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+
+        let result = repo.undo_file(UndoRequest::Last, Path::new("nonexistent.txt"));
+        assert!(result.is_err(), "undo of untracked file should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "error should mention file not found, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn undo_file_rejects_untracked_filename_single_checkpoint() {
+        // When only one checkpoint exists, the ancestor walk fails before the
+        // file-existence check. We should still get a clear "file not found"
+        // error rather than a confusing "not enough checkpoints" message.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let tracked = dir.path().join("tracked.txt");
+        fs::write(&tracked, "hello").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
             .expect("checkpoint should succeed");
 
         let result = repo.undo_file(UndoRequest::Last, Path::new("nonexistent.txt"));
