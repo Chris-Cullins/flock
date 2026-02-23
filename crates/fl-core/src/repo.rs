@@ -3610,6 +3610,12 @@ impl Repo {
         request: &UndoRequest,
     ) -> Result<UndoResult> {
         let target = resolve_target_event(events, request)?;
+
+        // Cannot undo the Init event — there is nothing before it.
+        if matches!(target.kind, EventKind::Init(_)) {
+            bail!("nothing to undo — already at the beginning of history");
+        }
+
         let mode = to_undo_mode(request, target.id);
 
         let mut restored_checkpoint_event = None;
@@ -12614,6 +12620,21 @@ mod tests {
         let err = repo.undo(UndoRequest::N(3)).unwrap_err();
         assert!(
             err.to_string().contains("checkpoint(s) exist before HEAD"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn undo_at_beginning_of_history_errors() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        // No checkpoints — only Init event exists
+        let err = repo.undo(UndoRequest::Last).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to undo"),
             "unexpected error: {}",
             err
         );

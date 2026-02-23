@@ -2257,9 +2257,21 @@ fn main() -> Result<()> {
                 repo.undo(request)?
             };
 
-            println!("undo target event: {}", result.target_event_id);
+            let short_target = &result.target_event_id.to_string()[..8];
             if let Some(checkpoint_id) = result.restored_checkpoint_event {
-                println!("restored commit event: {}", checkpoint_id);
+                let short_restored = &checkpoint_id.to_string()[..8];
+                println!(
+                    "{}  undid event {}  restored commit {}",
+                    "undo".red().bold(),
+                    short_target.yellow(),
+                    short_restored.green()
+                );
+            } else {
+                println!(
+                    "{}  undid event {}",
+                    "undo".red().bold(),
+                    short_target.yellow()
+                );
             }
         }
         Command::Record { paths } => {
