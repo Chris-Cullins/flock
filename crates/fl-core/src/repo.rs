@@ -3911,9 +3911,26 @@ impl Repo {
 
         let ancestor = walk_checkpoint_ancestor(events, head.id, steps)?;
 
+        let EventKind::Checkpoint(ref head_payload) = head.kind else {
+            bail!("expected checkpoint payload");
+        };
         let EventKind::Checkpoint(ref ancestor_payload) = ancestor.kind else {
             bail!("expected checkpoint payload");
         };
+
+        // Check that the file actually exists in either the head or ancestor
+        // snapshot — otherwise the undo is a no-op on a file that was never
+        // tracked and we should give a clear error instead of silently creating
+        // a useless checkpoint.
+        let in_head = self.snapshot_contains_file(head_payload.snapshot_id, scoped_file)?;
+        let in_ancestor =
+            self.snapshot_contains_file(ancestor_payload.snapshot_id, scoped_file)?;
+        if !in_head && !in_ancestor {
+            bail!(
+                "file '{}' was not found in the last commit or its predecessor",
+                scoped_file_display
+            );
+        }
 
         self.restore_workspace_file_from_snapshot(ancestor_payload.snapshot_id, scoped_file)?;
 
@@ -12685,6 +12702,30 @@ mod tests {
         assert_ne!(
             replayed.latest_checkpoint_snapshot_id,
             Some(cp1_payload.snapshot_id)
+        );
+    }
+
+    #[test]
+    fn undo_file_rejects_untracked_filename() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("repo init should succeed");
+
+        let tracked = dir.path().join("tracked.txt");
+        fs::write(&tracked, "hello").expect("write should succeed");
+        repo.create_checkpoint(Some("cp1".to_string()))
+            .expect("checkpoint should succeed");
+
+        fs::write(&tracked, "hello v2").expect("write should succeed");
+        repo.create_checkpoint(Some("cp2".to_string()))
+            .expect("checkpoint should succeed");
+
+        let result = repo.undo_file(UndoRequest::Last, Path::new("nonexistent.txt"));
+        assert!(result.is_err(), "undo of untracked file should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found"),
+            "error should mention file not found, got: {err_msg}"
         );
     }
 
