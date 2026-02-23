@@ -2771,8 +2771,10 @@ fn main() -> Result<()> {
                     session_id,
                     exploration_id,
                 } => {
-                    let sid = parse_uuid(&session_id)?;
-                    let eid = parse_uuid(&exploration_id)?;
+                    let sessions = repo.list_sessions()?;
+                    let session_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+                    let sid = resolve_uuid_prefix(&session_id, &session_ids)?;
+                    let eid = resolve_exploration(&exploration_id, &repo)?;
                     repo.link_session_exploration(sid, eid)?;
                     println!("linked exploration {} to session {}", eid, sid);
                 }
@@ -2783,8 +2785,10 @@ fn main() -> Result<()> {
                     reason,
                     confidence,
                 } => {
-                    let sid = parse_uuid(&session_id)?;
-                    let eid = parse_uuid(&exploration_id)?;
+                    let sessions = repo.list_sessions()?;
+                    let session_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+                    let sid = resolve_uuid_prefix(&session_id, &session_ids)?;
+                    let eid = resolve_exploration(&exploration_id, &repo)?;
                     let decision_action = match action.to_lowercase().as_str() {
                         "kept" => DecisionAction::Kept,
                         "discarded" => DecisionAction::Discarded,
@@ -2799,7 +2803,9 @@ fn main() -> Result<()> {
                     runtime_ms,
                     api_call,
                 } => {
-                    let sid = parse_uuid(&session_id)?;
+                    let sessions = repo.list_sessions()?;
+                    let session_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+                    let sid = resolve_uuid_prefix(&session_id, &session_ids)?;
                     let api_calls = if api_call.is_empty() {
                         None
                     } else {
@@ -2844,7 +2850,7 @@ fn main() -> Result<()> {
                     exploration_id,
                     json,
                 } => {
-                    let eid = parse_uuid(&exploration_id)?;
+                    let eid = resolve_exploration(&exploration_id, &repo)?;
                     let info = repo.query_provenance(eid)?;
 
                     if json {
@@ -2897,7 +2903,9 @@ fn main() -> Result<()> {
                     println!("  Related events: {}", info.related_events.len());
                 }
                 SessionCommand::Replay { id, json } => {
-                    let session_id = parse_uuid(&id)?;
+                    let sessions = repo.list_sessions()?;
+                    let session_ids: Vec<Uuid> = sessions.iter().map(|s| s.id).collect();
+                    let session_id = resolve_uuid_prefix(&id, &session_ids)?;
                     let replay = repo.replay_session(session_id)?;
 
                     if json {
