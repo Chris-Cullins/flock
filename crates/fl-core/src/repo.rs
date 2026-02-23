@@ -9790,7 +9790,7 @@ impl Repo {
     }
 
     /// Pull events and content from a roost.
-    pub fn pull(&self, roost_name: &str, branch: Option<&str>) -> Result<fl_storage::PullReport> {
+    pub fn pull(&self, roost_name: &str, branch: Option<&str>, force: bool) -> Result<fl_storage::PullReport> {
         self.assert_initialized()?;
         let config = fl_storage::load_roosts(self.root())?;
         let entry = fl_storage::find_roost(&config, roost_name)
@@ -9801,7 +9801,7 @@ impl Repo {
         let depth = entry.clone_depth;
         let lazy = entry.lazy;
 
-        let report = self.pull_with_options(roost_name, branch, depth, &sparse, lazy)?;
+        let report = self.pull_with_options(roost_name, branch, depth, &sparse, lazy, force)?;
 
         // Restore working directory from the latest pulled checkpoint so that
         // the workspace reflects the updated HEAD after pull.
@@ -9866,7 +9866,7 @@ impl Repo {
         }
 
         // Pull with options.
-        let pull_report = repo.pull_with_options("origin", None, depth, &final_sparse, lazy)?;
+        let pull_report = repo.pull_with_options("origin", None, depth, &final_sparse, lazy, false)?;
 
         // Detect native mode from the pulled Init event and switch layout.
         let events = repo.list_events()?;
@@ -9911,6 +9911,7 @@ impl Repo {
         depth: Option<usize>,
         sparse_patterns: &[String],
         lazy: bool,
+        force: bool,
     ) -> Result<fl_storage::PullReport> {
         self.assert_initialized()?;
         let mut config = fl_storage::load_roosts(self.root())?;
@@ -9944,6 +9945,30 @@ impl Repo {
         }
 
         let events_pulled = resp.events.len();
+
+        // Divergence check: if local has checkpoint events after the last sync
+        // point AND the remote is sending new events, the repos have diverged.
+        if !force {
+            let local_events = AutoEventLog::for_root(self.root()).read_all()?;
+            let local_after_sync: Vec<&Event> = if let Some(last_synced) = entry.last_synced_event {
+                let pos = local_events.iter().position(|e| e.id == last_synced);
+                match pos {
+                    Some(idx) => local_events[idx + 1..].iter().collect(),
+                    None => local_events.iter().collect(),
+                }
+            } else {
+                local_events.iter().collect()
+            };
+            let has_local_checkpoints = local_after_sync.iter().any(|e| {
+                matches!(e.kind, EventKind::Checkpoint(_))
+            });
+            if has_local_checkpoints {
+                anyhow::bail!(
+                    "local and remote have diverged: you have local commit(s) that the remote \
+                     does not. Push your local changes first, or use --force to overwrite local state."
+                );
+            }
+        }
 
         // Download missing snapshots (unless lazy).
         let mut blocks_downloaded = 0;
@@ -10226,7 +10251,7 @@ impl Repo {
         // Pull with the new expanded depth.
         let sparse = entry.sparse_patterns.clone();
         let lazy = entry.lazy;
-        let report = self.pull_with_options(roost_name, None, Some(new_depth), &sparse, lazy)?;
+        let report = self.pull_with_options(roost_name, None, Some(new_depth), &sparse, lazy, false)?;
 
         // Update the stored depth.
         let mut config = fl_storage::load_roosts(self.root())?;

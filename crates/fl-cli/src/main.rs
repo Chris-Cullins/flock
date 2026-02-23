@@ -415,6 +415,9 @@ enum Command {
         roost: Option<String>,
         /// Branch to pull
         branch: Option<String>,
+        /// Force pull even if local and remote have diverged (overwrites local state)
+        #[arg(long)]
+        force: bool,
     },
     /// Clone a remote repository
     #[command(alias = "hatch")]
@@ -4020,10 +4023,10 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Command::Pull { roost, branch } => {
+        Command::Pull { roost, branch, force } => {
             let repo = Repo::discover(cwd)?;
             let roost_name = roost.as_deref().unwrap_or("origin");
-            let report = repo.pull(roost_name, branch.as_deref())?;
+            let report = repo.pull(roost_name, branch.as_deref(), force)?;
             if report.events_pulled == 0 {
                 println!("already up to date with '{}'", report.roost_name);
             } else {
