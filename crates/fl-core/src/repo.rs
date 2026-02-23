@@ -3657,7 +3657,14 @@ impl Repo {
                 }
             }
             UndoRequest::To(_) | UndoRequest::Since(_) => {
-                self.undo_by_event_target(&events, &request)
+                // For Since/To with checkpoint-level undo, resolve to the
+                // first checkpoint in the target window so we can properly
+                // restore the workspace to the previous checkpoint's state.
+                if self.latest_checkpoint().is_some() {
+                    self.undo_checkpoints_by_target(&events, &request)
+                } else {
+                    self.undo_by_event_target(&events, &request)
+                }
             }
         }
     }
@@ -3825,6 +3832,82 @@ impl Repo {
 
         Ok(UndoResult {
             target_event_id: target.id,
+            restored_checkpoint_event,
+        })
+    }
+
+    /// Checkpoint-level undo for `--since` and `--to` requests.
+    ///
+    /// Resolves the target to the first checkpoint in the time/id window,
+    /// then restores the workspace to the checkpoint immediately before it.
+    /// This avoids the issue where `resolve_target_event` returns a
+    /// non-checkpoint event (e.g. Init) and the generic undo path cannot
+    /// find a predecessor checkpoint.
+    fn undo_checkpoints_by_target(
+        &self,
+        events: &[Event],
+        request: &UndoRequest,
+    ) -> Result<UndoResult> {
+        // Find the first event in the target window.
+        let raw_target = resolve_target_event(events, request)?;
+
+        // Find the first checkpoint at or after the raw target.
+        let raw_target_idx = events
+            .iter()
+            .position(|e| e.id == raw_target.id)
+            .unwrap_or(0);
+
+        let first_checkpoint_in_window = events[raw_target_idx..]
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::Checkpoint(_)));
+
+        let target_checkpoint = match first_checkpoint_in_window {
+            Some(cp) => cp,
+            None => bail!("no checkpoints to undo in the given range"),
+        };
+
+        // Find the checkpoint before the target checkpoint.
+        let prev = previous_checkpoint_before(events, target_checkpoint.id);
+        let Some(ancestor) = prev else {
+            bail!(
+                "cannot undo checkpoint {}: no earlier checkpoint exists",
+                &target_checkpoint.id.to_string()[..8]
+            );
+        };
+
+        let EventKind::Checkpoint(ref ancestor_payload) = ancestor.kind else {
+            bail!("expected checkpoint payload");
+        };
+
+        self.restore_workspace_from_snapshot(ancestor_payload.snapshot_id)?;
+
+        let checkpoint_event = self.create_checkpoint_with_exact_lineage(
+            format!("undo-restore-{}", ancestor.id.simple()),
+            Some(format!("undo: restore to checkpoint {}", ancestor.id)),
+            ancestor_payload.parent_checkpoint_event,
+        )?;
+        let restored_checkpoint_event = Some(checkpoint_event.id);
+
+        // Target the undo at the first event after the ancestor (same logic
+        // as undo_by_chain_walk) so replay rewinds past intermediate file events.
+        let ancestor_idx = events.iter().position(|e| e.id == ancestor.id);
+        let undo_target_id = ancestor_idx
+            .and_then(|idx| events.get(idx + 1))
+            .map(|e| e.id)
+            .unwrap_or(target_checkpoint.id);
+
+        let mode = to_undo_mode(request, undo_target_id);
+
+        self.append_event(EventKind::Undo(UndoEvent {
+            target_event_id: undo_target_id,
+            mode,
+            restored_checkpoint_event,
+            file_scope: None,
+            undo_scope: None,
+        }))?;
+
+        Ok(UndoResult {
+            target_event_id: undo_target_id,
             restored_checkpoint_event,
         })
     }
