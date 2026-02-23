@@ -970,6 +970,22 @@ impl Repo {
             bail!("latest checkpoint event had unexpected kind");
         };
 
+        // In Native mode, use hash-based comparison via the file index and
+        // replayed file_states. This avoids materializing the snapshot directory
+        // and reading every file's content from disk — O(1) per file instead of
+        // O(file_size).
+        if self.repo_mode()? == RepoMode::Native {
+            return self.status_native_fast(
+                branch,
+                checkpoint_id,
+                payload.snapshot_id,
+                &current_files,
+                symlinks,
+            );
+        }
+
+        // GitColocated mode: fall back to file-content comparison since
+        // snapshot_working_directory() is a no-op in this mode.
         let snapshot_root = self.ensure_snapshot_available(payload.snapshot_id)?;
         let (snapshot_files, _) = collect_all_files_with_mode(&snapshot_root, false, false)?;
 
@@ -1001,6 +1017,76 @@ impl Repo {
         for file in &snapshot_files {
             if !current_files.contains(file) {
                 deleted_files.push(file.clone());
+            }
+        }
+
+        Ok(StatusReport {
+            branch,
+            checkpoint_id: Some(checkpoint_id),
+            new_files,
+            modified_files,
+            deleted_files,
+            ignored_symlinks: symlinks,
+        })
+    }
+
+    /// Fast status for Native mode: compare hashes from the replayed file_states
+    /// (populated by snapshot_working_directory) against the snapshot index,
+    /// avoiding all file I/O for the comparison.
+    fn status_native_fast(
+        &self,
+        branch: String,
+        checkpoint_id: String,
+        snapshot_id: Uuid,
+        current_files: &BTreeSet<String>,
+        symlinks: Vec<String>,
+    ) -> Result<StatusReport> {
+        // Get current file hashes from replayed state (populated by
+        // snapshot_working_directory which must be called before status).
+        let state = self.replay_state()?;
+        let file_states = &state.file_states;
+
+        // Load the snapshot index to get file hashes at checkpoint time.
+        let file_index = FileIndex::for_root(self.root());
+        let snapshot_index = file_index.read(snapshot_id)?;
+        let snapshot_files = &snapshot_index.files;
+
+        let mut new_files = Vec::new();
+        let mut modified_files = Vec::new();
+        let mut deleted_files = Vec::new();
+
+        for file in current_files {
+            match snapshot_files.get(file) {
+                None => {
+                    // File exists on disk but not in checkpoint snapshot = new.
+                    new_files.push(file.clone());
+                }
+                Some(snapshot_entry) => {
+                    // File exists in both — compare hashes.
+                    if let Some(current_state) = file_states.get(file) {
+                        if current_state.content_hash != snapshot_entry.file_hash {
+                            modified_files.push(file.clone());
+                        }
+                    } else {
+                        // File is on disk but not in file_states — hash it directly
+                        // as a fallback (shouldn't normally happen after snapshot_working_directory).
+                        let current_path = self.root().join(file);
+                        let contents = fs::read(&current_path).ok();
+                        if let Some(contents) = contents {
+                            let hash = blake3::hash(&contents).to_hex().to_string();
+                            if hash != snapshot_entry.file_hash {
+                                modified_files.push(file.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Files in snapshot but not on disk = deleted.
+        for path in snapshot_files.keys() {
+            if !current_files.contains(path) {
+                deleted_files.push(path.clone());
             }
         }
 
@@ -7048,7 +7134,7 @@ impl Repo {
             .map(|e| e.into_path())
             .collect();
 
-        let mut events_emitted = 0usize;
+        let mut pending_kinds: Vec<EventKind> = Vec::new();
         let mut new_mtime_cache: HashMap<String, u128> = HashMap::new();
 
         // Check each file on disk
@@ -7093,7 +7179,7 @@ impl Repo {
                 }
             }
 
-            // File is new or modified — chunk, store, and emit FileWrite
+            // File is new or modified — chunk, store, and collect FileWrite
             let chunks = chunk_data(&contents, &chunk_config);
             let mut block_refs = Vec::with_capacity(chunks.len());
             for chunk in &chunks {
@@ -7112,24 +7198,65 @@ impl Repo {
 
             current_file_states.remove(&rel_key);
 
-            self.append_event(EventKind::FileWrite(FileWriteEvent {
+            pending_kinds.push(EventKind::FileWrite(FileWriteEvent {
                 path: rel_key,
                 content_hash: file_hash,
                 blocks: block_refs,
                 size: contents.len() as u64,
                 previous_file_event,
-            }))?;
-
-            events_emitted += 1;
+            }));
         }
 
         // Remaining entries in current_file_states are files that were deleted
         for (path, file_state) in &current_file_states {
-            self.append_event(EventKind::FileDelete(FileDeleteEvent {
+            pending_kinds.push(EventKind::FileDelete(FileDeleteEvent {
                 path: path.clone(),
                 previous_file_event: Some(file_state.event_id),
-            }))?;
-            events_emitted += 1;
+            }));
+        }
+
+        let events_emitted = pending_kinds.len();
+
+        // Batch-append all events under a single lock acquisition.
+        if !pending_kinds.is_empty() {
+            self.ensure_signing_key()?;
+            let signing_key = self.load_signing_key()?;
+            let exploration_id = self.active_exploration_id();
+            let session_id = self.active_session_id();
+            let actor = current_actor();
+
+            let mut events: Vec<Event> = pending_kinds
+                .into_iter()
+                .map(|kind| {
+                    Ok(Event {
+                        id: Uuid::new_v4(),
+                        timestamp: unix_timestamp_nanos()?,
+                        actor: actor.clone(),
+                        parent_id: None, // resolved by append_batch_with_finalize
+                        signer_public_key: None,
+                        signature: None,
+                        prev_event_hash: None,
+                        exploration_id,
+                        session_id,
+                        workspace_name: None,
+                        kind,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let pub_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+            AutoEventLog::for_root(self.root()).append_batch_with_finalize(
+                &mut events,
+                |ev| {
+                    let payload = fl_storage::event_signing_payload(ev)?;
+                    let signature = signing_key.sign(&payload);
+                    ev.signer_public_key = Some(pub_key_hex.clone());
+                    ev.signature = Some(hex::encode(signature.to_bytes()));
+                    Ok(())
+                },
+            )?;
+
+            self.maybe_auto_materialize();
         }
 
         // Save mtime cache

@@ -133,6 +133,52 @@ impl AutoEventLog {
         Ok(())
     }
 
+    /// Append a batch of events, resolving parent_ids and calling a finalize
+    /// callback on each event under a single lock acquisition.
+    ///
+    /// This is much faster than calling `append` in a loop when emitting many
+    /// events (e.g. during snapshot_working_directory with thousands of files),
+    /// because the lock is acquired only once.
+    pub fn append_batch_with_finalize(
+        &self,
+        events: &mut [Event],
+        mut finalize: impl FnMut(&mut Event) -> Result<()>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let _lock = FileLock::acquire(&LockPaths::event_log(&self.root))
+            .context("failed to acquire event log lock")?;
+
+        // Resolve first event's parent_id from the log tail.
+        let mut parent_id = if self.use_segmented() {
+            self.segmented().latest_event_id()?
+        } else {
+            self.monolithic().latest_event_id()?
+        };
+
+        // Chain parent_ids and finalize (sign) each event.
+        for event in events.iter_mut() {
+            event.parent_id = parent_id;
+            finalize(event)?;
+            parent_id = Some(event.id);
+        }
+
+        // Write the batch.
+        if self.use_segmented() {
+            let seg = self.segmented();
+            for event in events.iter() {
+                seg.append(event)?;
+            }
+            return Ok(());
+        }
+
+        self.monolithic().append_batch(events)?;
+        self.maybe_migrate_event_log()?;
+        Ok(())
+    }
+
     /// Append a batch of events from a remote pull.
     ///
     /// The first event's `parent_id` may not match the local log's tail because
