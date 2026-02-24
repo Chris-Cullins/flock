@@ -28,6 +28,13 @@ pub struct RoostEntry {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_synced_event: Option<Uuid>,
+    /// The server's latest known event ID. Used as `last_known_remote_event`
+    /// in push requests. After a diverged force-pull this advances to the
+    /// server's tip while `last_synced_event` stays at its pre-pull value so
+    /// that push can still find the local-only events that precede the pulled
+    /// remote events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_tip_event: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// Shallow clone depth (number of checkpoint events).
@@ -86,6 +93,7 @@ pub fn add_roost(config: &mut RoostsConfig, name: &str, url: &str, token: Option
         name: name.to_string(),
         url: url.to_string(),
         last_synced_event: None,
+        remote_tip_event: None,
         token: token.map(|t| t.to_string()),
         clone_depth: None,
         sparse_patterns: Vec::new(),

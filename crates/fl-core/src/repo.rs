@@ -9892,6 +9892,13 @@ impl Repo {
         let transport = transport_for_url(&url, resolved_token.as_deref())?;
 
         // Collect events since last sync.
+        // Use remote_tip_event (if set) as the hint to the server about what
+        // it already has. This is important after a diverged force-pull: in
+        // that case last_synced_event was intentionally kept at the pre-pull
+        // value so we collect the local-only events, but the server's actual
+        // tip is remote_tip_event.
+        let last_known_remote_event = entry.remote_tip_event.or(entry.last_synced_event);
+
         let all_events = self.list_events()?;
         let events_to_push = if let Some(last_synced) = entry.last_synced_event {
             let pos = all_events.iter().position(|e| e.id == last_synced);
@@ -10012,13 +10019,20 @@ impl Repo {
         let resp = transport.push_events(&fl_storage::EventPushRequest {
             events: events_to_push.clone(),
             refs: refs_to_push,
-            last_known_remote_event: entry.last_synced_event,
+            // Use remote_tip_event when available (set after a diverged
+            // force-pull). The server checks that its tip matches this value,
+            // so we must send what the server actually has, not the local
+            // last_synced_event which may lag behind.
+            last_known_remote_event,
         })?;
 
         let report = if resp.accepted {
-            // Update last_synced_event.
+            // Update sync state. last_synced_event advances to the last
+            // pushed event; remote_tip_event is cleared because we are now
+            // in sync with the server (or set to the server's reported tip).
             let entry = fl_storage::find_roost_mut(&mut config, roost_name).unwrap();
             entry.last_synced_event = events_to_push.last().map(|e| e.id);
+            entry.remote_tip_event = resp.server_tip_event;
             fl_storage::save_roosts(self.root(), &config)?;
 
             // Record sync event.
@@ -10334,7 +10348,16 @@ impl Repo {
                 ref_store.upsert(r.clone())?;
             }
             let entry = fl_storage::find_roost_mut(&mut config, roost_name).unwrap();
-            entry.last_synced_event = resp.events.last().map(|e| e.id);
+            let remote_tip = resp.events.last().map(|e| e.id);
+            // Always record the server's tip so push can use it as
+            // last_known_remote_event. Only advance last_synced_event when
+            // there is no local divergence — if we have diverged checkpoints
+            // we must keep last_synced_event at its pre-pull value so that
+            // push will still collect the local-only events.
+            entry.remote_tip_event = remote_tip;
+            if !has_local_diverged_checkpoints {
+                entry.last_synced_event = remote_tip;
+            }
             fl_storage::save_roosts(self.root(), &config)?;
 
             self.append_event(EventKind::RemoteSync(crate::event::RemoteSyncEvent {
@@ -10409,9 +10432,19 @@ impl Repo {
             ref_store.upsert(r.clone())?;
         }
 
-        // Update last_synced_event.
+        // Update sync state.
+        // remote_tip_event always advances to the server's latest event so
+        // that push can send it as last_known_remote_event.
+        // last_synced_event only advances when the repos have NOT diverged;
+        // when diverged it stays at its pre-pull value so that push will
+        // still find and send the local-only events that precede the pulled
+        // remote events.
         let entry = fl_storage::find_roost_mut(&mut config, roost_name).unwrap();
-        entry.last_synced_event = resp.events.last().map(|e| e.id);
+        let remote_tip = resp.events.last().map(|e| e.id);
+        entry.remote_tip_event = remote_tip;
+        if !has_local_diverged_checkpoints {
+            entry.last_synced_event = remote_tip;
+        }
         fl_storage::save_roosts(self.root(), &config)?;
 
         // Record sync event.
