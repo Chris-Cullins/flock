@@ -420,7 +420,7 @@ Features the Flock CLI needs to fully support the Roost server coordination mode
 - [ ] Property tests for event replay invariants
 - [ ] Fuzzing for parsers and merge engine
 - [ ] Large-repo benchmarks and regression thresholds
-- [ ] Concurrency stress tests (10+ agents)
+- [x] Concurrency stress tests (10+ agents)
 - [ ] Compatibility tests across macOS/Linux/Windows
 
 ## 14. Documentation and Adoption
