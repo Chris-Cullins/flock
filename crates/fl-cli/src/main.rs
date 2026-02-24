@@ -4555,30 +4555,35 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Format a nanosecond timestamp string into a human-readable date.
+/// Format a nanosecond timestamp string into a human-readable UTC date.
 fn format_timestamp(ts: &str) -> String {
     let nanos: u128 = match ts.parse() {
         Ok(n) => n,
         Err(_) => return ts.to_string(),
     };
-    let secs = (nanos / 1_000_000_000) as u64;
+    let secs = (nanos / 1_000_000_000) as i64;
 
-    // Format using libc localtime to get proper timezone
-    let secs_i64 = secs as i64;
-    let tm = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs_i64 as *const i64, &mut tm);
-        tm
-    };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec,
-    )
+    // Convert epoch seconds to UTC date/time using civil-time arithmetic.
+    // Algorithm from Howard Hinnant's date algorithms (public domain).
+    let days = secs.div_euclid(86400);
+    let day_secs = secs.rem_euclid(86400);
+    let hour = day_secs / 3600;
+    let min = (day_secs % 3600) / 60;
+    let sec = day_secs % 60;
+
+    // Days since 0000-03-01 (era-based algorithm)
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097); // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month offset from March [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}")
 }
 
 /// Format a nanosecond-epoch timestamp string as a human-readable relative age.

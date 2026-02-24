@@ -19,6 +19,5 @@ colored.workspace = true
 ctrlc.workspace = true
 diffy.workspace = true
 fl-core = { path = "../fl-core" }
-libc = "0.2"
 serde_json.workspace = true
 uuid.workspace = true
