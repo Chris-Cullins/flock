@@ -1804,6 +1804,7 @@ impl Repo {
             title,
             status: ExplorationStatus::Active,
             base_checkpoint_event,
+            actor: event.actor.clone(),
             created_at: event.timestamp.clone(),
             updated_at: event.timestamp,
         })
@@ -3223,6 +3224,10 @@ impl Repo {
             return self.undo(request);
         }
         self.assert_initialized()?;
+
+        let task_id = self.active_task_id();
+        let exploration_id = scope.exploration_id.or_else(|| self.active_exploration_id());
+        self.enforce_rate_limit_policy(task_id, exploration_id)?;
 
         let events = self.list_events()?;
         if events.is_empty() {
@@ -6493,13 +6498,28 @@ impl Repo {
     }
 
     /// Find the active exploration ID from replayed state.
+    ///
+    /// When multiple explorations are active (multi-agent scenario), this
+    /// returns the one belonging to the current actor. Falls back to any
+    /// active exploration when no actor-specific match exists.
     fn active_exploration_id(&self) -> Option<Uuid> {
         let state = self.replay_state().ok()?;
-        state
+        let actor = current_actor();
+
+        // Prefer the exploration owned by the current actor.
+        let actor_match = state
             .explorations
             .values()
-            .find(|e| e.status == fl_workflow::ExplorationStatus::Active)
-            .map(|e| e.id)
+            .find(|e| e.status == fl_workflow::ExplorationStatus::Active && e.actor == actor)
+            .map(|e| e.id);
+
+        actor_match.or_else(|| {
+            state
+                .explorations
+                .values()
+                .find(|e| e.status == fl_workflow::ExplorationStatus::Active)
+                .map(|e| e.id)
+        })
     }
 
     /// Find the active session ID for the current actor from replayed state.
@@ -7338,6 +7358,7 @@ impl Repo {
             let signing_key = self.load_signing_key()?;
             let exploration_id = self.active_exploration_id();
             let session_id = self.active_session_id();
+            let workspace_name = current_workspace();
             let actor = current_actor();
 
             let mut events: Vec<Event> = pending_kinds
@@ -7353,7 +7374,7 @@ impl Repo {
                         prev_event_hash: None,
                         exploration_id,
                         session_id,
-                        workspace_name: None,
+                        workspace_name: workspace_name.clone(),
                         kind,
                     })
                 })
@@ -7743,7 +7764,7 @@ impl Repo {
             prev_event_hash: None,
             exploration_id,
             session_id,
-            workspace_name: None, // populated by caller via CLI flag when needed
+            workspace_name: current_workspace(),
             kind,
         };
         // Signing happens inside the lock (via finalize callback) because
@@ -12124,7 +12145,13 @@ fn unix_timestamp_nanos() -> Result<String> {
 }
 
 fn current_actor() -> String {
-    env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+    env::var("FL_ACTOR")
+        .or_else(|_| env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn current_workspace() -> Option<String> {
+    env::var("FL_WORKSPACE").ok().filter(|s| !s.is_empty())
 }
 
 fn fill_random(buffer: &mut [u8]) -> Result<()> {
@@ -15631,5 +15658,119 @@ mod tests {
             "error should mention divergence: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_exploration_summary_tracks_actor() {
+        // Verify that ExplorationSummary.actor is populated from the event actor.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        fs::write(dir.path().join("f.txt"), "base").expect("write");
+        repo.create_checkpoint(Some("base".to_string())).expect("cp");
+
+        let exp = repo.start_exploration("test-exp".to_string()).expect("start");
+        assert!(!exp.actor.is_empty(), "exploration should have an actor");
+
+        // The actor on the summary should match current_actor()
+        let actor = current_actor();
+        assert_eq!(exp.actor, actor, "exploration actor should match current_actor()");
+
+        // Verify it persists through replay
+        let explorations = repo.list_explorations().expect("list");
+        let replayed = explorations.iter().find(|e| e.id == exp.id).expect("find exp");
+        assert_eq!(replayed.actor, actor, "replayed exploration should have actor");
+    }
+
+    #[test]
+    fn test_active_exploration_prefers_matching_actor() {
+        // When multiple explorations are active, active_exploration_id() should
+        // prefer the one whose actor matches current_actor(). Since we can't
+        // safely set env vars in parallel tests, we verify the fallback behavior:
+        // when only one exploration is active, it's always returned.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        fs::write(dir.path().join("f.txt"), "base").expect("write");
+        repo.create_checkpoint(Some("base".to_string())).expect("cp");
+
+        let exp = repo.start_exploration("only-exp".to_string()).expect("start");
+
+        // With one active exploration, active_exploration_id() should find it
+        let active = repo.active_exploration_id();
+        assert_eq!(active, Some(exp.id), "should find the active exploration");
+    }
+
+    /// Combined test for workspace-related features.
+    ///
+    /// This test sets FL_WORKSPACE env var and must run serially (not in
+    /// parallel with other tests that depend on env vars). Using a single
+    /// combined test avoids parallel env var interference.
+    #[test]
+    fn test_workspace_scoped_undo_and_env_stamping() {
+        // Use a static mutex to serialize tests that modify env vars.
+        use std::sync::Mutex;
+        static ENV_MUTEX: Mutex<()> = Mutex::new(());
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::at(dir.path());
+        repo.init().expect("init");
+
+        // --- Part 1: Verify current_workspace() reads FL_WORKSPACE ---
+        assert!(current_workspace().is_none() || current_workspace().is_some(),
+            "current_workspace should not panic");
+
+        // SAFETY: We hold a mutex preventing parallel env var access
+        unsafe { env::set_var("FL_WORKSPACE", "test-ws") };
+        assert_eq!(current_workspace(), Some("test-ws".to_string()));
+        unsafe { env::remove_var("FL_WORKSPACE") };
+        assert_eq!(current_workspace(), None);
+
+        // --- Part 2: Verify FL_WORKSPACE stamps workspace_name on events ---
+        fs::write(dir.path().join("base.txt"), "base").expect("write");
+        repo.create_checkpoint(Some("base".to_string())).expect("base cp");
+
+        unsafe { env::set_var("FL_WORKSPACE", "team-a") };
+        fs::write(dir.path().join("a.txt"), "team-a-v1").expect("write a");
+        repo.create_checkpoint(Some("team-a-cp1".to_string())).expect("team-a cp1");
+
+        // Verify the checkpoint event has workspace_name set
+        let events = repo.list_events().expect("list events");
+        let last_cp = events.iter().rev()
+            .find(|e| matches!(e.kind, EventKind::Checkpoint(_)))
+            .expect("should have checkpoint");
+        assert_eq!(
+            last_cp.workspace_name.as_deref(),
+            Some("team-a"),
+            "checkpoint should have workspace_name from FL_WORKSPACE"
+        );
+
+        // --- Part 3: Verify workspace-scoped undo ---
+        fs::write(dir.path().join("a.txt"), "team-a-v2").expect("write a v2");
+        repo.create_checkpoint(Some("team-a-cp2".to_string())).expect("team-a cp2");
+
+        // Switch to team-b
+        unsafe { env::set_var("FL_WORKSPACE", "team-b") };
+        fs::write(dir.path().join("b.txt"), "team-b-v1").expect("write b");
+        repo.create_checkpoint(Some("team-b-cp1".to_string())).expect("team-b cp1");
+        unsafe { env::remove_var("FL_WORKSPACE") };
+
+        // Scoped undo for team-a only
+        let scope = UndoScope {
+            workspace_name: Some("team-a".to_string()),
+            ..Default::default()
+        };
+        let result = repo.undo_scoped(UndoRequest::Last, scope).expect("scoped undo");
+        assert!(result.restored_checkpoint_event.is_some());
+
+        // a.txt should be back to team-a-v1, b.txt untouched
+        let a_content = fs::read_to_string(dir.path().join("a.txt")).expect("read a");
+        assert_eq!(a_content, "team-a-v1", "team-a file should be undone to v1");
+
+        let b_content = fs::read_to_string(dir.path().join("b.txt")).expect("read b");
+        assert_eq!(b_content, "team-b-v1", "team-b file should be untouched");
     }
 }

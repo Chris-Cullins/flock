@@ -40,6 +40,7 @@ pub struct ExplorationSummary {
     pub title: String,
     pub status: ExplorationStatus,
     pub base_checkpoint_event: Option<Uuid>,
+    pub actor: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -465,6 +466,7 @@ impl ReplayAccumulator {
                             title: exploration.title.clone(),
                             status: ExplorationStatus::Active,
                             base_checkpoint_event: exploration.base_checkpoint_event,
+                            actor: event.actor.clone(),
                             created_at: event.timestamp.clone(),
                             updated_at: event.timestamp.clone(),
                         },
